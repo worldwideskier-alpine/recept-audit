@@ -1,0 +1,13 @@
+{
+  "languages": [
+    {
+      "name": "php",
+      "ext": ["php"],
+      "lint_cmd": ["php", "-l"],
+      "literal_normalize": [],
+      "support_api": {
+        "no_store_headers": "\\App\\Support\\Response::applyNoStoreHeaders"
+      }
+    }
+  ]
+}

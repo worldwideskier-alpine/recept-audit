@@ -1,0 +1,18 @@
+# BNORM-safe rewrite (subdirectory proof)
+Options -Indexes -MultiViews
+RewriteEngine On
+
+# Pass through existing files/dirs
+RewriteCond %{REQUEST_FILENAME} -f [OR]
+RewriteCond %{REQUEST_FILENAME} -d
+RewriteRule ^env-lite$ env-lite.php [L]
+RewriteRule ^health-lite$ health-lite.php [L]
+
+# (Optional) static pass-through
+RewriteRule ^assets/ - [L]
+
+# Everything else to this directory's app.php
+RewriteRule ^ app.php [L,QSA]
+
+# NOTE: Do not set "RewriteBase /".
+# If you must: RewriteBase /<your-subdir>/   (and keep "app.php" relative)

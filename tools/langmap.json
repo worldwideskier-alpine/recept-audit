@@ -1,0 +1,4 @@
+{
+  "php": {"ext": ["php"], "templates": ["src/Pages"]},
+  "html": {"ext": ["html","htm"], "templates": ["src/Pages"]}
+}
