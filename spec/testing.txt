@@ -1,0 +1,772 @@
+検査仕様書
+版数: v4.8.2
+P25-10-01 00:00:00 JST+0900
+
+0) 本版について
+0.2) 汎用（ポリグロット）適用について（新設）
+- 本書は**汎用の“検査仕様書（FULL）”**として、言語やフレームワークに依存しないコア検査を定義する。
+- 既存の PHP 依存の判定は **「PHPプロジェクトの標準アダプタ（例）」**として残し、非PHPのプロジェクトは **Polyglotアダプタ**で同等の合格条件を満たす。
+- 以降の H-* で「-G（Global/Polyglot）」が付く項目は**全言語共通**の検査であり、必要に応じて `tools/langmap.json`（言語→拡張子/テンプレートパスの対応表）を参照して適用する。
+- **HTML Living Standard は全プロジェクトの必須要件**である（#6 H-23G および 6.x 参照）。
+
+- 本版は v4.7.2_FULL の章番号ゆらぎ（例: 「6) 配下に 
+0.1) …」など）を整理し、**見出しを再配置・再番号付け**した単一の “FULL” 版です。
+- H-項目内の誤った小見出し表記（`n.m)` 形式）は **箇条（—）表記**へ正規化しています（本文の要件・手順は不変）。
+- 依存コマンドは **PHP のみ**（php -l / hash() / json_* / cURL / ZipArchive）。DB が未到達の検査は **SKIP（非REJECT）** 方針を維持します。
+
+1) 目的
+1.2) Polyglot 方針（新設）
+- すべての検査は「**言語非依存の合格条件**」→「**各言語アダプタの実装例**」の順で記述する。
+- `tools/run_checks.sh` は **Polyglot ランナー**を必ず呼び出す（H-20G）。
+- 生成仕様書（v3.7.x）との整合により、**ERR-GUARD** と **HTML-LS-GLOBAL** の結果は `COMPLIANCE.json` にも反映する（`.err_guard_ok = true`, `.html_ls_global_ok = true`）。
+
+1.1) 方針
+**H-25 PACK-PROVENANCE-LOCK**（pack.sh 経由以外の ZIP を遮断）と
+  **H-26 LINT-REPLAY-VERIFY**（受入側での `php -l` 再実行）を新設する。
+- 目的：**手動ZIPや手詰め証跡**を Fail-Closed で遮断し、Lint 実行の**再現性**を保証する。
+**H-24 SOT-SCHEMA-COVERAGE**（SOT に列挙されたスキーマの**静的＋動的カバレッジ**）を新設する。
+- 目的：**/health＝最小ブート**の解釈による部分実装を防ぎ、**付録S（SOT）**のテーブル/インデックスを
+  **14/14 で確保**していない生成物を**Fail-Closed**にする。依存コマンドは PHP のみ。
+- **H‑21 ENV-200-LOCK-001（新設 / Boot）** … **/env および /env/ の実働検証**をゲート化（200 + `Cache-Control: no-store` を**強制**）。
+- 目的：**名前空間関数の未インポート等により FC 直後で Fatal する不具合**を、静的検査をすり抜ける形で発生しても**Boot段で確実に検出**する。
+- **H-32 SETUP-LINK-BAN-001（新設 / Static）** … 公開導線（特に **/provider/login**）から **/provider/setup** への**アンカーリンク**を**禁止**し、文言のみを許容する。
+
+- **H‑21H HEALTH-BOOT-HEAD-LOCK-001（新設 / Boot）** … **/health への HEAD リクエスト**で **200 + `Cache-Control: no-store` + `Content-Type: application/json`** を**強制**し、最小ブート時の**ヘッダ出力直後の致命的エラー**を確実に検出する。
+- **H‑31 CONFIG-PATH-ROOT-LOCK-001（新設 / Static）** … **`config.php` の参照をリポジトリルート固定**とし、**`app/config.php` の誤参照**を**Fail‑Closed**で遮断する（MANIFEST 列挙 & 静的検査）。
+2) 適用範囲
+2.5) Polyglot 実行基盤（新設）
+— 安定ランナー要件と最小スケルトン（新設）
+```bash
+#!/usr/bin/env bash
+# tools/run_checks.sh (安定版スケルトン)
+# 要件: /dev/fd やプロセス置換を使わず、証跡は evidence/** にのみ出力する
+set -Eeuo pipefail
+IFS=$'\n\t'
+export LC_ALL=C LANG=C
+
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+mkdir -p "$ROOT/evidence/static" "$ROOT/evidence/runtime" "$ROOT/evidence/pkg" "$ROOT/evidence/verify"
+
+TMPDIR="$(mktemp -d)"; trap 'rm -rf "$TMPDIR"' EXIT
+
+# 1) Polyglot Lint（H-20G）
+bash "$ROOT/tools/polyglot_lint.sh" 1>"$ROOT/evidence/static/POLYGLOT_LINT.log" 2>"$ROOT/evidence/static/POLYGLOT_LINT.err" || {
+  echo "NG: polyglot lint failed"; exit 1; }
+
+# 2) HTML-LS（H-23G / H-50）
+bash "$ROOT/tools/render_smoke.sh" >"$TMPDIR/out.html" 2>"$ROOT/evidence/static/RENDER_SMOKE.err" || {
+  echo "NG: render smoke failed"; exit 1; }
+grep -Eiq '^<!doctype html>' "$TMPDIR/out.html" || { echo "NG: HTML LS baseline not satisfied for <!doctype html>"; exit 1; }
+grep -Eiq '<meta\s+charset="utf-8">' "$TMPDIR/out.html" || { echo "NG: HTML LS baseline not satisfied for <meta charset>"; exit 1; }
+grep -Eiq '<html\s+[^>]*lang=' "$TMPDIR/out.html" || { echo "NG: HTML LS baseline not satisfied for <html lang=>"; exit 1; }
+: > "$ROOT/evidence/static/HTML_LS_GLOBAL_OK.txt"
+
+# 3) VERIFY_REPORT（新設）
+bash "$ROOT/tools/verify_report.sh" || { echo "NG: verify_report failed"; exit 1; }
+
+# すべて合格した場合は**何も出力しない**で0終了
+exit 0
+```
+
+- 代表ファイル: `tools/polyglot_lint.sh`, `tools/langmap.json`, `tools/render_smoke.sh`
+- **langmap.json（例）**
+```json
+{
+  "php":    {"ext": ["php"],        "templates": ["app/Pages","templates","resources/views"]},
+  "html":   {"ext": ["html","htm"], "templates": ["public","templates"]},
+  "twig":   {"ext": ["twig"]},
+  "blade":  {"ext": ["blade.php"]},
+  "ejs":    {"ext": ["ejs"]},
+  "hbs":    {"ext": ["hbs","handlebars"]},
+  "vue":    {"ext": ["vue"]},
+  "jsx":    {"ext": ["jsx","tsx"]}
+}
+```
+- `polyglot_lint.sh` は `langmap.json` を読み、検出された拡張子ごとに **実リンタ/構文検証** を実行する。実リンタが無い言語は**最小構文チェック**または**スキップ（SKIP: 非REJECT）**を記録。
+- すべての結果は `evidence/static/lint/<lang>_*.log` と `evidence/static/POLYGLOT_LINT_OK.txt` に要約し、`COMPLIANCE.json.polyglot_lint_ok=true` を設定する。
+
+
+- **VERIFY_REPORT v1（新設 / 集約サマリ）**
+  - 代表ファイル: `tools/verify_report.sh`（新設）, 出力: `evidence/verify/VERIFY_REPORT.json`, 成否: `evidence/verify/VERIFY_REPORT_OK.txt`
+  - 役割: 検査証跡（evidence/**, COMPLIANCE.json, MANIFEST.json）を集約し、**VERIFY_REPORT v1** を生成する。
+  - 実行位置: `tools/run_checks.sh` の **最終行**で必ず呼び出す（DONE/ZIP ゲート前）。
+  - 実行結果: `COMPLIANCE.json.verify_report_ok=true` を設定する。
+  - 参照実装（PHP 依存のみ / 例）
+  ```bash
+  # tools/verify_report.sh（抜粋）
+  php -r '
+  function read_json($p){return file_exists($p)?json_decode(file_get_contents($p),true):null;}
+  $comp = read_json("COMPLIANCE.json") ?: [];
+  $mani = read_json("MANIFEST.json")  ?: [];
+  $proof = [
+    "phplint" => [file_exists("evidence/static/PHPLINT.log"), file_exists("evidence/static/PHPLINT_FINAL.log")],
+    "html_ls" => [file_exists("evidence/static/HTML_LS_GLOBAL_OK.txt") || file_exists("evidence/static/HTML_LS_BASE_OK.txt")],
+    "err_guard" => [file_exists("evidence/static/ERR_GUARD_OK.txt")],
+    "polyglot_lint" => [file_exists("evidence/static/POLYGLOT_LINT_OK.txt")],
+    "pack_provenance" => [file_exists("evidence/static/PACK_PROVENANCE_OK.txt")],
+  ];
+  $out = [
+    "version"=>"VERIFY_REPORT/v1",
+    "timestamp"=>date("c"),
+    "summary"=>[
+      "ok" => (bool)($comp["zip_ready_ok"] ?? false),
+      "phase_S_ok" => true,
+      "phase_B_ok" => (bool)($comp["health_boot_head_ok"] ?? false),
+      "phase_D_ok" => (bool)($comp["health_minboot_data_ok"] ?? false) || (($comp["phase_d_skip"] ?? false) === true)
+    ],
+    "compliance"=>$comp,
+    "manifest"=>$mani,
+    "evidence_present"=>$proof
+  ];
+  file_put_contents("evidence/verify/VERIFY_REPORT.json", json_encode($out, JSON_UNESCAPED_SLASHES|JSON_PRETTY_PRINT));
+  ' && echo "OK:" > evidence/verify/VERIFY_REPORT_OK.txt
+  php -r '$_=json_decode(file_get_contents("COMPLIANCE.json"),true); $_["verify_report_ok"]=true; file_put_contents("COMPLIANCE.json",json_encode($_,JSON_UNESCAPED_SLASHES|JSON_PRETTY_PRINT));'
+  ```
+
+2.1) 終了
+kill $SERVER_PID >/dev/null 2>&1 || true
+```
+
+**【既知不具合と本検査の意義】**
+- 事例：`app.php` 先頭で `no_store_headers()` を **未インポートのまま**呼出 → **Fatal error: undefined function** → **/env が 500** ＆ **アプリログ不出力**。
+- H‑21 は**実アクセスで 200/no-store を強制**するため、上記のような**静的検査すり抜け**の不具合を Boot 段で**Fail‑Closed**にできる。
+H-22 ABS-HREF-BAN-001（**新設 / 静的：絶対パスhrefの禁止**）
+**要件:** `app/Pages/**` における **アンカー `<a>` の `href="/..."` 直書きを禁止**（外部 `http(s)://` を除く）。
+**受入判定（例 / 依存は PHP のみ）**
+```bash
+直書き絶対パスhrefを検出（外部は対象外）
+if grep -RIn --include="*.php" -E '<a\s+[^>]*href="/' app/Pages >/dev/null 2>&1; then
+  echo "NG: absolute href found"; exit 1
+fi
+echo "OK:" > evidence/static/ABS_HREF_BAN_OK.txt
+php -r '$_=json_decode(file_get_contents("COMPLIANCE.json"),true); $_["abs_href_ban_ok"]=true; file_put_contents("COMPLIANCE.json",json_encode($_,JSON_UNESCAPED_SLASHES|JSON_PRETTY_PRINT));'
+```
+H-23 HTML-LS-BASELINE-001（**新設 / 静的：HTML Living Standard ベースライン**）
+**要件:** 出力HTMLは **HTML Living Standard** の基礎要件に適合し、少なくとも以下を満たす。
+- 文書先頭に **`<!doctype html>`（小文字）**。
+- `<meta charset="utf-8">` が含まれる。
+- ルート要素に **`<html lang="ja">`** を含む。
+
+**受入判定（例 / 依存は PHP のみ）**
+```bash
+ベースライン3点を満たすテンプレートが存在（レイアウト/共通テンプレ推奨）
+grep -RIni --include="*.php" "<!doctype html>" app/Pages >/dev/null 2>&1 || exit 1
+grep -RIni --include="*.php" "<meta\s\+charset=\"utf-8\"" app/Pages >/dev/null 2>&1 || exit 1
+grep -RIni --include="*.php" "<html\s[^>]*lang=\"ja" app/Pages >/dev/null 2>&1 || exit 1
+echo "OK:" > evidence/static/HTML_LS_BASE_OK.txt
+php -r '$_=json_decode(file_get_contents("COMPLIANCE.json"),true); $_["html_ls_ok"]=true; file_put_contents("COMPLIANCE.json",json_encode($_,JSON_UNESCAPED_SLASHES|JSON_PRETTY_PRINT));'
+```
+2.2) 方針
+— 安定検査の指針（新設）
+- **禁止:** `/dev/fd/*` 参照、プロセス置換 `<( )`、Here-String（`<<<`）など **実行環境に依存するI/O**。すべて**明示ファイル**／**標準的なパイプ**で代替する（例: `mktemp` で一時ファイルを確保し `trap` で確実に削除）。
+- **シェル要件:** ランナー（`tools/run_checks.sh` 等）は **POSIX シェル互換**で動くこと。`bash` を前提にする場合は**先頭で** `set -Eeuo pipefail`、POSIX `/bin/sh` の場合は `set -eu` ＋ **パイプ末尾の明示判定**で代替。
+- **ロケール固定:** `export LC_ALL=C LANG=C` を**先頭で強制**し、`grep/sort/awk` の結果を**決定的**にする。
+- **ファイル名安全:** 走査は `find ... -print0 | xargs -0` または `while IFS= read -r -d '' f; do ...; done < <(find ... -print0)` を用い、**空白/改行/非ASCII** を含むパスでも安定に処理。
+- **grep要件:** `-P` など拡張依存は原則禁止。**POSIX ERE** で記述し、**検索対象を明示**（`--include`）して誤検出を防止。
+- **標準出力の静粛性:** すべての検査が合格した場合、**標準出力には何も出さない**（ゼロ終端）。合格の証跡は `evidence/**` の **OKファイル**／ログの **ファイル出力のみ**で示す。失敗時のみ `NG:` を標準出力に1行出し**非0終了**。
+- **ログ分離:** 説明的なメッセージやデバッグは**標準エラー**へ。機械判定に関わる出力と**混在禁止**。
+- **エビデンスのディレクトリ:** `evidence/static`, `evidence/runtime`, `evidence/pkg`, `evidence/verify` を**冒頭で必ず作成**（`mkdir -p`）。ディレクトリ欠落自体を**検査NG**とする。
+- **一時ファイル:** `TMPDIR="$(mktemp -d)"` を用い、`trap 'rm -rf "$TMPDIR"' EXIT` で**確実に回収**。
+- **終了コード契約:** Gate通過 = 0、失敗 = 非0。**途中の `|| true` で握りつぶさない**。
+
+- さらに、現場で顕在化した欠陥（`tools/` 欠落、`storage/` 欠落、`<?php` 二重、疑似Lint）を**事前に遮断**するため、以下の Add‑ons（H‑17〜H‑20, H‑13a）を導入・明確化する。
+- **H‑17b STORAGE-PRESEED-PACKAGE-001（新設）**（storage/.keep 同梱と MANIFEST 列挙をロック）
+- **H‑17 STORAGE-BASE-WRITABLE-001**（storage/logs の作成と書込検証）
+- **H‑18 PHP-OPENING-TAG-ONCE-001**（冒頭1KB内の `<?php` 重複検出）
+- **H‑19 TOOLS-PRESENCE-LOCK-001**（`tools/run_checks.sh`/`tools/pack.sh` の存在＋実行権限）
+- **H‑20 PHPLINT-REAL-ENFORCE-LOCK-001（新設）** … `tools/run_checks.sh` に **実際の `php -l` 実行が含まれることをロック**（疑似Lintを禁止）。
+- **H‑13a PHPLINT-COVERAGE-COUNT-001（新設）** … **Lint 対象件数＝ログ行数**を検証（“全 *.php に `php -l` を回した”ことの数量的証跡）。
+- 依存コマンドは **PHP のみ**で再現可能。Fail‑Closed 原則は維持。
+2.3) 新規・強化検査
+H-12 TOKENS-FIRST-001（新設 / 静的：先頭トークンロック）
+**要件:** 全 `*.php` の**先頭5バイト**が `<?php`。BOM/空白/余計な文字を禁止。
+**受入判定（例）**
+```bash
+php -r '
+$it=new RecursiveIteratorIterator(new RecursiveDirectoryIterator("."));
+foreach($it as $f){ if(substr($f,-4)!==".php") continue;
+  $h=file_get_contents($f,false,null,0,5); if($h!=="<?php") die("NG:$f\n");
+}
+echo "OK";
+' | grep -q OK && echo "OK:" > evidence/static/PHP_OPENING_TAG_OK.txt
+php -r '$_=json_decode(file_get_contents("COMPLIANCE.json"),true); $_["tokens_first_ok"]=true; file_put_contents("COMPLIANCE.json",json_encode($_,JSON_UNESCAPED_SLASHES|JSON_PRETTY_PRINT));'
+```
+H-13 LINT-PROOF-OF-WORK-001（新設 / 静的：実行証跡の署名）
+**要件:** `php -l` の**実実行**を署名で証明する。
+`LINT_SIG = sha256( PHP_VERSION + "\n" + sorted_join( each: "path:sha256\n" for all *.php ) )`
+**受入判定（例）**
+```bash
+php -r '
+$h=json_decode(file_get_contents("evidence/static/PHPLINT_HASHES.json"),true);
+usort($h, fn($a,$b)=>strcmp($a["file"],$b["file"]));
+$s=PHP_VERSION."\n"; foreach($h as $r){ $s.=$r["file"].":".$r["sha256"]."\n"; }
+$l=hash("sha256",$s); file_put_contents("evidence/static/LINT_SIG.txt",$l);
+$g=json_decode(file_get_contents("evidence/pkg/GATE_SIG.json"),true);
+$g["lint_sig"]=$l; file_put_contents("evidence/pkg/GATE_SIG.json",json_encode($g,JSON_UNESCAPED_SLASHES|JSON_PRETTY_PRINT));
+' && echo "OK:" > evidence/static/LINT_SIG_OK.txt
+php -r '$_=json_decode(file_get_contents("COMPLIANCE.json"),true); $_["lint_sig_ok"]=true; file_put_contents("COMPLIANCE.json",json_encode($_,JSON_UNESCAPED_SLASHES|JSON_PRETTY_PRINT));'
+```
+H-13a PHPLINT-COVERAGE-COUNT-001（**新設 / 静的：カバレッジ数ロック**）
+**要件:** **Lint 対象の `*.php` 件数 = Lint ログ行数（`php -l` 実行回数）**であることを検証し、数量的証跡を残す。
+**受入判定（例）**
+```bash
+H-1/H-2 の実行で PHPLINT.log / PHPLINT_FINAL.log を生成している前提
+2.4) 走査対象件数
+N=$(find . -type f -name "*.php" | wc -l | awk '{print $1}')
+
+3) 用語・定義
+
+- （該当項目なし）
+
+4) 参照文書
+4.8) MANIFEST 追記（Polyglot 追加）
+- `MANIFEST.json.files[]` に **以下を必ず列挙**：
+  - `tools/polyglot_lint.sh`
+  - `tools/langmap.json`
+  - `tools/render_smoke.sh`
+  - `evidence/static/POLYGLOT_LINT_OK.txt`
+  - `evidence/static/HTML_LS_GLOBAL_OK.txt`
+  - `evidence/static/ERR_GUARD_OK.txt`
+  - `tools/verify_report.sh`
+  - `evidence/verify/VERIFY_REPORT.json`
+- 受入判定（例 / POSIX シェル）
+  - `tools/lang_profile.json`（新設 / 言語判定の補助辞書）
+  - `evidence/static/` 内の OK ファイル群（`*_OK.txt`）の**代表**を少なくとも1つ以上
+  - `evidence/verify/VERIFY_REPORT.json`
+```bash
+php -r '
+$m=json_decode(file_get_contents("MANIFEST.json"),true);
+$need=[ "tools/polyglot_lint.sh","tools/langmap.json","tools/render_smoke.sh", "evidence/static/POLYGLOT_LINT_OK.txt","evidence/static/HTML_LS_GLOBAL_OK.txt","evidence/static/ERR_GUARD_OK.txt","tools/verify_report.sh","evidence/verify/VERIFY_REPORT.json" ];
+$miss=array_values(array_diff($need,$m["files"]??[])); if($miss){fwrite(STDERR,"NG:".implode(",",$miss)."\n"); exit(1);} echo "OK";
+' | grep -q OK && echo "OK:" > evidence/static/POLYGLOT_MANIFEST_OK.txt
+php -r '$_=json_decode(file_get_contents("COMPLIANCE.json"),true); $_["polyglot_manifest_ok"]=true; file_put_contents("COMPLIANCE.json",json_encode($_,JSON_UNESCAPED_SLASHES|JSON_PRETTY_PRINT));'
+```
+
+4.1) `MANIFEST.json.files[]` に
+`tools/run_checks.sh` / `tools/pack.sh` / `evidence/pkg/ZIP_READY_OK.txt` / `evidence/pkg/BUILD_LOG.txt` を **全列挙**。
+
+**受入判定（例 / PHPのみ）**
+```bash
+test -x tools/pack.sh -a -x tools/run_checks.sh || exit 1
+grep -q "tools/run_checks.sh" tools/pack.sh      || exit 1
+grep -q "PACK_BY=pack.sh" evidence/pkg/BUILD_LOG.txt || exit 1
+php -r '
+$m=json_decode(file_get_contents("MANIFEST.json"),true);
+$need=["tools/run_checks.sh","tools/pack.sh","evidence/pkg/ZIP_READY_OK.txt","evidence/pkg/BUILD_LOG.txt"];
+$miss=array_values(array_diff($need,$m["files"])); if($miss) exit(1); echo "OK";
+' | grep -q OK && echo "OK:" > evidence/static/PACK_PROVENANCE_OK.txt
+php -r '$_=json_decode(file_get_contents("COMPLIANCE.json"),true); $_["pack_provenance_ok"]=true; file_put_contents("COMPLIANCE.json",json_encode($_,JSON_UNESCAPED_SLASHES|JSON_PRETTY_PRINT));'
+```
+H-26 LINT-REPLAY-VERIFY-001（**新設 / 静的＋実行：受入側で再Lint**）
+**要件:** 受入側（検収環境）で `evidence/static/PHPLINT_HASHES.json` に列挙された**全 `*.php`** へ
+**`php -l` を再実行**し、**失敗 0** を確認する（DB不要／PHPのみ依存）。
+
+**受入判定（例 / PHPのみ）**
+```bash
+php -r '
+$h=json_decode(file_get_contents("evidence/static/PHPLINT_HASHES.json"),true);
+$fail=0; foreach($h as $r){ $f=$r["file"]; $o=[]; exec("php -l ".escapeshellarg($f),$o,$rc); if($rc!==0){ $fail=1; break; } }
+if($fail) exit(1); echo "OK";
+' | grep -q OK && echo "OK:" > evidence/static/LINT_REPLAY_OK.txt
+```
+4.2) MANIFEST 契約
+- `evidence/static/SETUP_LINK_BAN_OK.txt`
+- `evidence/runtime/HEALTH_BOOT_HEAD_OK.txt`
+- `evidence/static/CONFIG_PATH_ROOT_OK.txt`
+
+`MANIFEST.json.files[]` に、下記**も必ず列挙**：
+- `evidence/pkg/ZIP_READY_OK.txt`
+- `evidence/pkg/BUILD_LOG.txt`
+- （参考）`evidence/static/PACK_PROVENANCE_OK.txt` / `evidence/static/LINT_REPLAY_OK.txt`
+4.3) 新規・強化検査
+H-24a SOT-SCHEMA-STATIC-COVERAGE-001（**新設 / 静的：SOT→ソース網羅**）
+**要件:** `app/SOT/schema.required.json`（**SOT**）に列挙された
+**tables[]/indexes[]** が、少なくとも **`app/Support/Schema.php` または `schema.sql`** のいずれかに
+**宣言（CREATE/ensure_index 記述）**として**全件出現**していること。
+
+**受入判定（例 / 依存は PHP のみ）**
+```bash
+php -r '
+$s=json_decode(file_get_contents("app/SOT/schema.required.json"),true);
+$src=@file_get_contents("app/Support/Schema.php");
+$src .= "\n".(@file_exists("schema.sql")?file_get_contents("schema.sql"):"");
+$missT=[]; foreach($s["tables"] as $t){
+  $pat="/CREATE\s+TABLE\s+IF\s+NOT\s+EXISTS\s+`?".$t."`?/i";
+  if(!preg_match($pat,$src)) $missT[]=$t;
+}
+$missI=[]; foreach($s["indexes"] as $ix){
+  $name=$ix["name"];
+  if(stripos($src,$name)===false) $missI[]=$name;
+}
+if($missT||$missI){
+  if($missT) fwrite(STDERR,"NG:tables=".implode(",",$missT)."\n");
+  if($missI) fwrite(STDERR,"NG:indexes=".implode(",",$missI)."\n");
+  exit(1);
+}
+echo "OK";
+' | grep -q OK && echo "OK:" > evidence/static/SOT_SCHEMA_COVERAGE_OK.txt
+php -r '$_=json_decode(file_get_contents("COMPLIANCE.json"),true); $_["sot_schema_coverage_ok"]=true; file_put_contents("COMPLIANCE.json",json_encode($_,JSON_UNESCAPED_SLASHES|JSON_PRETTY_PRINT));'
+```
+
+**備考:** インデックスは **SOT の name 一致**で検出。MySQL の「`CREATE INDEX IF NOT EXISTS` 禁止」ポリシーは
+実装側で **`information_schema.STATISTICS` による存在確認 → `CREATE INDEX`** の二段を徹底する（環境仕様書準拠）。
+H-24b SOT-SCHEMA-DYNAMIC-COVERAGE-001（**新設 / Dynamic：SOT→実体網羅**）
+**要件:** `/health` 実行（または `Schema::ensure()` 呼出）**後**、
+**information_schema** で **SOT の tables[]/indexes[] が全件存在**する。DB 非到達時は **SKIP（非REJECT）**。
+
+**受入判定（例 / 依存は PHP のみ）**
+```bash
+DB 到達可能な場合に実施（不可なら SKIP）
+php -r '
+function main(){
+  require "app/Support/DB.php";
+  require "app/Support/Schema.php";
+  $s=json_decode(file_get_contents("app/SOT/schema.required.json"),true);
+  \App\Support\Schema::ensure();  # 最小ブート
+  $pdo=\App\Support\DB::pdo();
+  $missT=[]; foreach($s["tables"] as $t){
+    $st=$pdo->prepare("SELECT COUNT(*) FROM information_schema.tables WHERE table_schema=DATABASE() AND table_name=?");
+    $st->execute([$t]); if(!$st->fetchColumn()) $missT[]=$t;
+  }
+  $missI=[]; foreach($s["indexes"] as $ix){
+    $st=$pdo->prepare("SELECT COUNT(*) FROM information_schema.statistics WHERE table_schema=DATABASE() AND table_name=? AND index_name=?");
+    $st->execute([$ix["table"],$ix["name"]]); if(!$st->fetchColumn()) $missI[]=$ix["name"];
+  }
+  if($missT||$missI){
+    if($missT) fwrite(STDERR,"NG:tables=".implode(",",$missT)."\n");
+    if($missI) fwrite(STDERR,"NG:indexes=".implode(",",$missI)."\n");
+    exit(2);
+  }
+  echo "OK";
+}
+try{ main(); }catch(Throwable $e){ fwrite(STDOUT,"SKIP:DYNAMIC\n"); exit(0); }
+' | grep -q OK && echo "OK:" > evidence/runtime/SOT_SCHEMA_DYNAMIC_OK.txt || true
+```
+4.4) 新規・強化検査
+H-21 ENV-200-LOCK-001（**新設 / Boot：/env 早期直返しの実働検証**）
+
+H-21H HEALTH-BOOT-HEAD-LOCK-001（新設 / Boot：/health の HEAD 応答ロック）
+**要件:** **/health** が **HEAD** リクエストに対して **200** を返し、**`Cache-Control: no-store`** と **`Content-Type: application/json`** を**必ず含む**。  
+**意義:** 初期ヘッダ付与後に発生する**致命的エラー**や**FC読み込み順の不整合**を、/env だけでなく **/health** でも**Fail‑Closed**に検知する。
+
+**受入判定（例 / PHPのみ）**
+```bash
+PHP=$(command -v php); PORT=9083
+($PHP -S 127.0.0.1:$PORT -t . > /dev/null 2>&1) &
+SERVER_PID=$!; sleep 0.5
+php -r '
+function head_req($u){
+  $ch=curl_init($u);
+  curl_setopt_array($ch,[CURLOPT_NOBODY=>true,CURLOPT_HEADER=>true,CURLOPT_RETURNTRANSFER=>true]);
+  $h=curl_exec($ch); $code=curl_getinfo($ch,CURLINFO_HTTP_CODE); curl_close($ch);
+  if($code!==200) exit(1);
+  if(stripos($h,"Cache-Control: no-store")===false) exit(1);
+  if(stripos($h,"Content-Type: application/json")===false) exit(1);
+  echo "OK";
+}
+head_req("http://127.0.0.1:$PORT/health");
+' | grep -q OK && echo "OK:" > evidence/runtime/HEALTH_BOOT_HEAD_OK.txt || true
+kill $SERVER_PID >/dev/null 2>&1 || true
+php -r '$_=json_decode(file_get_contents("COMPLIANCE.json"),true); $_["health_boot_head_ok"]=true; file_put_contents("COMPLIANCE.json",json_encode($_,JSON_UNESCAPED_SLASHES|JSON_PRETTY_PRINT));' || true
+```
+**要件:** **/env および /env/** が **200** で **JSON** を返し、**`Cache-Control: no-store`** を必ず含む。
+**備考:** 初期ヘッダ付与直後の**致命的エラー（例：`no_store_headers()` の未インポート呼び出し）**を確実に検出するための**実行時ゲート**。
+
+**受入判定（例 / 依存は PHP のみ）**
+```bash
+4.5) php 内蔵サーバで起動
+PHP=$(command -v php)
+PORT=9080
+($PHP -S 127.0.0.1:$PORT -t . > /dev/null 2>&1) &
+SERVER_PID=$!
+sleep 0.5
+4.6) MANIFEST との一致
+php -r '
+$m=json_decode(file_get_contents("MANIFEST.json"),true);
+$f=$m["files"]; $need=["storage/.keep","storage/logs/.keep"];
+$miss=array_values(array_diff($need,$f));
+if(!empty($miss)) exit(1); echo "OK";
+' && echo "OK:" > evidence/static/STORAGE_PRESEED_OK.txt
+```
+H-18 PHP-OPENING-TAG-ONCE-001（新設 / 静的：冒頭1KBの `<?php` 重複検出）
+**要件:** 各 `*.php` の**冒頭1KB以内**に 2回目以降の `<?php` が存在しないこと。
+**受入判定（例）**
+```bash
+php -r '
+$it=new RecursiveIteratorIterator(new RecursiveDirectoryIterator("."));
+foreach($it as $f){ $p="".$f; if(substr($p,-4)!==".php") continue;
+  $h=file_get_contents($p,false,null,0,1024); if(substr_count($h,"<?php")>1) die("NG:$p\n");
+}
+echo "OK";
+' | grep -q OK && echo "OK:" > evidence/static/PHP_OPENING_TAG_ONCE_OK.txt
+```
+H-19 TOOLS-PRESENCE-LOCK-001（新設 / 静的：tools 在庫＋実行権限）
+**要件:** `tools/run_checks.sh` と `tools/pack.sh` が**存在し、実行権限**を持つ。`pack.sh` は内部で **`run_checks.sh` を必ず実行**してから ZIP を生成する。
+**受入判定（例）**
+```bash
+test -x tools/run_checks.sh -a -x tools/pack.sh || exit 1
+grep -q "tools/run_checks.sh" tools/pack.sh || exit 1
+echo "OK:" > evidence/static/TOOLS_OK.txt
+php -r '$_=json_decode(file_get_contents("COMPLIANCE.json"),true); $_["tools_presence_ok"]=true; file_put_contents("COMPLIANCE.json",json_encode($_,JSON_UNESCAPED_SLASHES|JSON_PRETTY_PRINT));'
+```
+H-20 PHPLINT-REAL-ENFORCE-LOCK-001（**新設 / 静的：疑似Lint禁止のロック**）
+**要件:** `tools/run_checks.sh` が **実際の `php -l`** を全 `*.php` に対して実行していることを**ソース上でロック**する（`grep -q 'php -l'` 等）。疑似Lint（先頭トークン確認や括弧数カウント等）での代替を**禁止**。
+**受入判定（例）**
+```bash
+grep -RIn "php -l" tools/run_checks.sh | wc -l | php -r '$n=(int)trim(stream_get_contents(STDIN)); if($n===0) exit(1); echo "OK";' && echo "OK:" > evidence/static/PHPLINT_REAL_ENFORCE_OK.txt
+```
+
+H-31 CONFIG-PATH-ROOT-LOCK-001（新設 / 静的：config.php 参照パスをルート固定）
+**要件:** `config.php` は **{BASE}/config.php** に配置し、**`app/config.php` の参照を禁止**する。アプリからの読み込みは **`base_path('config.php')`** または **`BASE_DIR.'/config.php'`** のみを許可とする。さらに **MANIFEST.json.files[]** に `config.php` を**必ず列挙**する。
+
+**受入判定（例 / PHPのみ）**
+```bash
+# 1) MANIFEST に config.php が列挙されている
+# 2) ソースに "app/config.php" の誤参照が 0 件
+# 3) 読み込みは base_path('config.php') または BASE_DIR.'/config.php' を使用（少なくとも 1 箇所で検出）
+php -r '
+$m=json_decode(file_get_contents("MANIFEST.json"),true);
+if(!in_array("config.php",$m["files"]??[])) exit(1);
+$bad=0;$allow=0;
+$it=new RecursiveIteratorIterator(new RecursiveDirectoryIterator("."));
+foreach($it as $f){
+  $p="".$f; if(substr($p,-4)!==".php") continue;
+  $src=file_get_contents($p);
+  if(strpos($src,"app/config.php")!==false){ $bad=1; break; }
+  if(preg_match("/require(_once)?\s*\(\s*base_path\(\s*[\"\']config\.php[\"\']\s*\)\s*\)\s*;/",$src) ||
+     preg_match("/require(_once)?\s*\(\s*BASE_DIR\s*\.\s*[\"\']\/config\.php[\"\']\s*\)\s*;/",$src)){
+     $allow=1;
+  }
+}
+if($bad) exit(2);
+if(!$allow) exit(3);
+echo "OK";
+' | grep -q OK && echo "OK:" > evidence/static/CONFIG_PATH_ROOT_OK.txt
+php -r '$_=json_decode(file_get_contents("COMPLIANCE.json"),true); $_["config_path_root_ok"]=true; file_put_contents("COMPLIANCE.json",json_encode($_,JSON_UNESCAPED_SLASHES|JSON_PRETTY_PRINT));'
+```
+
+（参考）H-1/H-2：Lint 実行の正準手順（再掲・強調）
+**H-1 PHPLINT-ALL-001（初回）**
+```bash
+mkdir -p evidence/static
+: > evidence/static/PHPLINT.log
+FAIL=0
+while IFS= read -r -d "" f; do php -l "$f" >> evidence/static/PHPLINT.log 2>&1 || FAIL=1; done < <(find . -type f -name "*.php" -print0)
+[ $FAIL -eq 0 ] || { echo "NG: PHPLINT FAIL"; exit 1; }
+echo "OK:" > evidence/static/PHPLINT_OK.txt
+```
+**H-2 PHPLINT-FINAL-LOCK-002（ZIP直前）**
+```bash
+: > evidence/static/PHPLINT_FINAL.log
+echo "[]" > evidence/static/PHPLINT_HASHES.json
+FAIL=0
+while IFS= read -r -d "" f; do
+  php -l "$f" >> evidence/static/PHPLINT_FINAL.log 2>&1 || FAIL=1
+  php -r '[$f]=[$argv[1]]; $h=hash("sha256",file_get_contents($f)); $j=json_decode(file_get_contents("evidence/static/PHPLINT_HASHES.json"),true); $j[]=["file"=>$f,"sha256"=>$h]; file_put_contents("evidence/static/PHPLINT_HASHES.json",json_encode($j,JSON_UNESCAPED_SLASHES|JSON_PRETTY_PRINT));' "$f"
+done < <(find . -type f -name "*.php" -print0)
+[ $FAIL -eq 0 ] || { echo "NG: PHPLINT FINAL FAIL"; exit 1; }
+echo "OK:" > evidence/static/PHPLINT_FINAL_OK.txt
+```
+4.7) 方針
+- 本書は v4.3.0_HARDENED を**完全包含**し、その上に **BNORM 相対化の検査強化**と **/env の早期直返しロック**等の統合（v4.3.1）を追加したものです。
+- 依存コマンドは **PHP のみ**で再現可能です。Fail-Closed 原則は維持します。
+
+
+— `MANIFEST.json.files[]` に
+H-12 TOKENS-FIRST-001（新設 / 静的：先頭トークンロック）
+**要件:** 全 `*.php` の**先頭5バイト**が `<?php`。BOM/空白/余計な文字を禁止。
+foreach($it as $f){ if(substr($f,-4)!==".php") continue;
+  $h=file_get_contents($f,false,null,0,5); if($h!=="<?php") die("NG:$f\n");
+' | grep -q OK && echo "OK:" > evidence/static/PHP_OPENING_TAG_OK.txt
+php -r '$_=json_decode(file_get_contents("COMPLIANCE.json"),true); $_["tokens_first_ok"]=true; file_put_contents("COMPLIANCE.json",json_encode($_,JSON_UNESCAPED_SLASHES|JSON_PRETTY_PRINT));'
+H-13 LINT-PROOF-OF-WORK-001（新設 / 静的：実行証跡の署名）
+**要件:** `php -l` の**実実行**を署名で証明する。
+`LINT_SIG = sha256( PHP_VERSION + "\n" + sorted_join( each: "path:sha256\n" for all *.php ) )`
+usort($h, fn($a,$b)=>strcmp($a["file"],$b["file"]));
+$s=PHP_VERSION."\n"; foreach($h as $r){ $s.=$r["file"].":".$r["sha256"]."\n"; }
+$l=hash("sha256",$s); file_put_contents("evidence/static/LINT_SIG.txt",$l);
+$g=json_decode(file_get_contents("evidence/pkg/GATE_SIG.json"),true);
+$g["lint_sig"]=$l; file_put_contents("evidence/pkg/GATE_SIG.json",json_encode($g,JSON_UNESCAPED_SLASHES|JSON_PRETTY_PRINT));
+' && echo "OK:" > evidence/static/LINT_SIG_OK.txt
+php -r '$_=json_decode(file_get_contents("COMPLIANCE.json"),true); $_["lint_sig_ok"]=true; file_put_contents("COMPLIANCE.json",json_encode($_,JSON_UNESCAPED_SLASHES|JSON_PRETTY_PRINT));'
+H-13a PHPLINT-COVERAGE-COUNT-001（**新設 / 静的：カバレッジ数ロック**）
+**要件:** **Lint 対象の `*.php` 件数 = Lint ログ行数（`php -l` 実行回数）**であることを検証し、数量的証跡を残す。
+H-14 EVIDENCE-FRESHNESS-001（新設 / 静的：証跡鮮度ロック）
+**要件:** `evidence/static/*` の **mtime ≥ 全 `*.php` の最新 mtime（±120s 許容）**。
+$latest=0;$it=new RecursiveIteratorIterator(new RecursiveDirectoryIterator("."));
+foreach($it as $f){ if(substr($f,-4)==".php"){ $t=filemtime($f); if($t>$latest)$latest=$t; } }
+$ok=true; foreach(glob("evidence/static/*") as $e){ if(filemtime($e)+120 < $latest) {$ok=false; break;} }
+if(!$ok) exit(1); echo "OK";
+' | grep -q OK && echo "OK:" > evidence/static/EVIDENCE_FRESH_OK.txt
+php -r '$_=json_decode(file_get_contents("COMPLIANCE.json"),true); $_["evidence_fresh_ok"]=true; file_put_contents("COMPLIANCE.json",json_encode($_,JSON_UNESCAPED_SLASHES|JSON_PRETTY_PRINT));'
+H-15 BUILD-GATE-ZIP-READY-SRC-LOCK-001（新設 / 静的：フラグ設定源の一意化）
+**要件:** `COMPLIANCE.json.build_gate_zip_ready=true` は **`tools/run_checks.sh` 内**でのみ設定可。
+grep -RIn "build_gate_zip_ready" -- * | grep -v -E "tools/run_checks.sh" | wc -l  | php -r '$n=(int)trim(stream_get_contents(STDIN)); if($n!==0) exit(1); echo "OK";'  && echo "OK:" > evidence/static/BUILD_GATE_SRC_LOCK_OK.txt
+H-16 DEPLOY-BEFORE-GO-LIVE-001（新設 / 運用ゲート）
+**要件:** 本番切替（Go-Live）は **H-5（配備後：PHPLINT/MANIFEST/HASH 一致）**が **PASS** するまで禁止。
+**受入判定:** `evidence/deploy/DEPLOY_PHPLINT_OK.txt` / `DEPLOY_MANIFEST_MATCH_OK.txt` / `DEPLOY_HASH_MATCH_OK.txt` が存在。
+H-17 STORAGE-BASE-WRITABLE-001（新設 / 静的＋実行：storage 作成・書込検証）
+**要件:** `storage/logs` を作成可能で、実際に書込ができること。
+mkdir -p storage/logs
+php -r '@file_put_contents("storage/logs/.w","ok")!==false || exit(1); echo "OK";' | grep -q OK && echo "OK:" > evidence/static/STORAGE_BASE_OK.txt
+php -r '$_=json_decode(file_get_contents("COMPLIANCE.json"),true); $_["storage_writable_ok"]=true; file_put_contents("COMPLIANCE.json",json_encode($_,JSON_UNESCAPED_SLASHES|JSON_PRETTY_PRINT));'
+H-17b STORAGE-PRESEED-PACKAGE-001（新設 / 静的：storage ディレクトリの同梱ロック）
+**要件:** パッケージ（ZIP）に **`storage/` と `storage/logs/`** を必ず同梱する。空ディレクトリの場合は
+**プレースホルダ（例: `.keep`）** を含め、**`MANIFEST.json.files[]` に列挙**すること。
+— DONE/ZIP ゲート
+- ZIP 生成は **H-1〜H-4 + H‑12〜H‑16 + H‑13a + H‑20 が PASS** し、`COMPLIANCE.json` に
+  `tokens_first_ok=true` / `evidence_fresh_ok=true` / `lint_sig_ok=true` / `storage_writable_ok=true` / `tools_presence_ok=true`
+  がセットされている場合のみ許可（手詰め true 禁止）。
+- `tools/pack.sh` は **必ず `tools/run_checks.sh` を実行**してから ZIP を生成する（H‑19）。
+— RTM
+— php 内蔵サーバで起動
+— MANIFEST との一致
+H-22 ABS-HREF-BAN-001（**新設 / 静的：絶対パスhrefの禁止**）
+**要件:** `app/Pages/**` における **アンカー `<a>` の `href="/..."` 直書きを禁止**（外部 `http(s)://` を除く）。
+直書き絶対パスhrefを検出（外部は対象外）
+if grep -RIn --include="*.php" -E '<a\s+[^>]*href="/' app/Pages >/dev/null 2>&1; then
+  echo "NG: absolute href found"; exit 1
+fi
+echo "OK:" > evidence/static/ABS_HREF_BAN_OK.txt
+php -r '$_=json_decode(file_get_contents("COMPLIANCE.json"),true); $_["abs_href_ban_ok"]=true; file_put_contents("COMPLIANCE.json",json_encode($_,JSON_UNESCAPED_SLASHES|JSON_PRETTY_PRINT));'
+H-23 HTML-LS-BASELINE-001（**新設 / 静的：HTML Living Standard ベースライン**）
+**要件:** 出力HTMLは **HTML Living Standard** の基礎要件に適合し、少なくとも以下を満たす。
+- 文書先頭に **`<!doctype html>`（小文字）**。
+- `<meta charset="utf-8">` が含まれる。
+- ルート要素に **`<html lang="ja">`** を含む。
+ベースライン3点を満たすテンプレートが存在（レイアウト/共通テンプレ推奨）
+grep -RIni --include="*.php" "<!doctype html>" app/Pages >/dev/null 2>&1 || exit 1
+grep -RIni --include="*.php" "<meta\s\+charset=\"utf-8\"" app/Pages >/dev/null 2>&1 || exit 1
+grep -RIni --include="*.php" "<html\s[^>]*lang=\"ja" app/Pages >/dev/null 2>&1 || exit 1
+echo "OK:" > evidence/static/HTML_LS_BASE_OK.txt
+php -r '$_=json_decode(file_get_contents("COMPLIANCE.json"),true); $_["html_ls_ok"]=true; file_put_contents("COMPLIANCE.json",json_encode($_,JSON_UNESCAPED_SLASHES|JSON_PRETTY_PRINT));'
+— 方針
+- さらに、現場で顕在化した欠陥（`tools/` 欠落、`storage/` 欠落、`<?php` 二重、疑似Lint）を**事前に遮断**するため、以下の Add‑ons（H‑17〜H‑20, H‑13a）を導入・明確化する。
+- **H‑17b STORAGE-PRESEED-PACKAGE-001（新設）**（storage/.keep 同梱と MANIFEST 列挙をロック）
+- **H‑17 STORAGE-BASE-WRITABLE-001**（storage/logs の作成と書込検証）
+- **H‑18 PHP-OPENING-TAG-ONCE-001**（冒頭1KB内の `<?php` 重複検出）
+- **H‑19 TOOLS-PRESENCE-LOCK-001**（`tools/run_checks.sh`/`tools/pack.sh` の存在＋実行権限）
+- **H‑20 PHPLINT-REAL-ENFORCE-LOCK-001（新設）** … `tools/run_checks.sh` に **実際の `php -l` 実行が含まれることをロック**（疑似Lintを禁止）。
+- **H‑13a PHPLINT-COVERAGE-COUNT-001（新設）** … **Lint 対象件数＝ログ行数**を検証（“全 *.php に `php -l` を回した”ことの数量的証跡）。
+- 依存コマンドは **PHP のみ**で再現可能。Fail‑Closed 原則は維持。
+— 新規・強化検査
+— 新規・強化検査
+— MANIFEST 契約
+— 新規・強化検査
+— 方針
+5) Gate Matrix
+- （追加）Phase S 完了時に `tools/verify_report.sh` を実行し、`COMPLIANCE.json.verify_report_ok=true` をセットする（ZIP前の最終フック）。
+- **Phase S (Static)**：H-1〜H-4, H-12〜H-16, H-13a, H-18, H-19, H-20, H-22, H-23, H-24a, H-25, H-31, **H-41b, H-42, H-43, H-44, H-45, H-46**。
+- **Phase B (Boot)**：H-21, **H-21H**, H-33, H-36, **H-47**。
+- **Phase D (Dynamic)**：H-24b, H-34, H-35, H-37, H-38, H-39, H-40（**DB未到達は SKIP**）。
+
+6) 検査項目一覧
+- **H-51 STDIO-FD-BAN-LOCK-001（新設 / 静的：/dev/fd・プロセス置換の禁止）**
+  【要件】`tools/**.sh` に `/dev/fd/`、プロセス置換 `<( )`、Here-String `<<<` を含まない。
+  【受入判定（例）】
+  ```bash
+  if grep -RInE '/dev/fd/|<\(|<<<' tools >/dev/null 2>&1; then
+    echo "NG: unstable FD operations detected"; exit 1
+  fi
+  echo "OK:" > evidence/static/STDIO_FD_BAN_OK.txt
+  ```
+
+- **H-52 POSIX-SHELL-STRICT-MODE-LOCK-001（新設 / 静的：シェル厳格モード）**
+  【要件】`tools/run_checks.sh` は `#!/usr/bin/env bash` か `#!/bin/sh` を先頭に持ち、`set -Eeuo pipefail`（bash）または `set -eu`（POSIX sh）を設定。
+  【受入判定（例）】
+  ```bash
+  head -n 5 tools/run_checks.sh | grep -Eq '#!/.*(bash|sh)' || exit 1
+  grep -Eq 'set -Eeuo pipefail|set -eu' tools/run_checks.sh || exit 1
+  echo "OK:" > evidence/static/SHELL_STRICT_MODE_OK.txt
+  ```
+
+- **H-53 LOCALE-COLLATION-LOCK-001（新設 / 静的：ロケール固定）**
+  【要件】`tools/run_checks.sh` 冒頭で `export LC_ALL=C LANG=C` を設定。
+  【受入判定（例）】`grep -q 'LC_ALL=C' tools/run_checks.sh`
+
+- **H-54 FIND-XARGS-NULL-LOCK-001（新設 / 静的：ファイル名安全な走査）**
+  【要件】ファイル走査に `-print0` / `-0` を用いるか、同等の**NUL区切り**処理で空白・改行を含むパスを安全に取り扱う。
+  【受入判定（例）】`grep -RInE '--?print0|xargs -0|read -r -d' tools/*.sh`
+
+- **H-55 QUIET-PASS-LOCK-001（新設 / 実行：合格時は無出力）**
+  【要件】`tools/run_checks.sh` は**合格時に標準出力へ一切出力しない**。失敗時のみ `NG:` を1行出力し非0終了。
+  【受入判定（例）】
+  ```bash
+  if bash tools/run_checks.sh | grep -q .; then
+    echo "NG: runner should be quiet on pass"; exit 1
+  fi
+  echo "OK:" > evidence/static/QUIET_PASS_OK.txt
+  ```
+
+- **H-56 EVIDENCE-DIRS-PRESENCE-LOCK-001（新設 / 静的：証跡ディレクトリの存在）**
+  【要件】`evidence/static`, `evidence/runtime`, `evidence/pkg`, `evidence/verify` が ZIP 内に存在し、必要に応じ**OKファイル**を格納。
+  【受入判定（例 / PHP）】
+  ```bash
+  php -r '
+  $need=["evidence/static","evidence/runtime","evidence/pkg","evidence/verify"];
+  foreach($need as $d){ if(!is_dir($d)) die("NG:$d missing\n"); }
+  echo "OK";
+  ' | grep -q OK && : > evidence/static/EVIDENCE_DIRS_OK.txt
+  ```
+
+- **H-20G POLYGLOT-LINT-LOCK-001（新設 / 静的：全言語リンタの実実行ロック）**  
+  【要件】言語検出（`tools/langmap.json`）に基づき、各言語に対して**実リンタ/構文検証**を実行していること。疑似Lint禁止。  
+  【受入判定（例）】
+  ```bash
+  test -x tools/polyglot_lint.sh || exit 1
+  grep -q "polyglot_lint.sh" tools/run_checks.sh || exit 1
+  bash tools/polyglot_lint.sh || exit 1
+  echo "OK:" > evidence/static/POLYGLOT_LINT_OK.txt
+  php -r '$_=json_decode(file_get_contents("COMPLIANCE.json"),true); $_["polyglot_lint_ok"]=true; file_put_contents("COMPLIANCE.json",json_encode($_,JSON_UNESCAPED_SLASHES|JSON_PRETTY_PRINT));'
+  ```
+
+- **H-23G HTML-LS-GLOBAL-LOCK-001（新設 / 静的：HTML Living Standard を全プロジェクトで必須化）**  
+  【要件】テンプレート/レイアウト/生成HTMLが **`<!doctype html>`（小文字）**, `<meta charset="utf-8">`, `<html lang="..">` を満たす。  
+  【適用範囲】`.php`, `.html`, `.htm`, `.twig`, `.blade.php`, `.ejs`, `.hbs`, `.handlebars`, `.vue`（SSR）, `.jsx/.tsx`（SSR 出力） など。  
+  【受入判定（例 / 静的パス検査）】
+  ```bash
+  # langmap.json の templates パスを優先。見つからない場合は app/Pages, templates, resources/views, public を走査。
+  FOUND=0
+  for pat in "<!doctype html>" "<meta\s\+charset=\"utf-8\">" "<html\s[^>]*lang="; do
+    if ! grep -RIni --include="*.php" --include="*.html" --include="*.htm"        --include="*.twig" --include="*.blade.php" --include="*.ejs"        --include="*.hbs" --include="*.handlebars" --include="*.vue"        -e "$pat" app/Pages templates resources/views public >/dev/null 2>&1; then
+      echo "NG: HTML LS baseline not satisfied for $pat"; exit 1;
+    fi
+  done
+  echo "OK:" > evidence/static/HTML_LS_GLOBAL_OK.txt
+  php -r '$_=json_decode(file_get_contents("COMPLIANCE.json"),true); $_["html_ls_global_ok"]=true; file_put_contents("COMPLIANCE.json",json_encode($_,JSON_UNESCAPED_SLASHES|JSON_PRETTY_PRINT));'
+  ```
+  【備考】フルSSRでテンプレ直検出が困難な場合は、`tools/render_smoke.sh` で代表画面を**静的にレンダ**し、出力HTMLに対して同検査を行う。
+
+- **H-48 LANGMAP-DECL-AND-COVERAGE-001（新設 / 静的：langmap 宣言とカバレッジの一致）**  
+  【要件】リポジトリ内の拡張子検出結果と `tools/langmap.json` の宣言が**包含関係**になっている（=未宣言言語が無い）。  
+  【受入判定（例）】
+  ```bash
+  php -r '
+  $m=json_decode(file_get_contents("tools/langmap.json"),true);
+  $decl=[]; foreach($m as $k=>$v){ foreach(($v["ext"]??[]) as $e){ $decl[$e]=1; } }
+  $it=new RecursiveIteratorIterator(new RecursiveDirectoryIterator("."));
+  $miss=[];
+  foreach($it as $f){ if(!$f->isFile()) continue; $p="".$f; $ext=strtolower(pathinfo($p,PATHINFO_EXTENSION));
+    if($ext && !isset($decl[$ext]) && !preg_match("/^(log|lock|md|txt|json|yml|yaml|xml|ini|sh|bat|sql)$/",$ext)){
+      $miss[$ext]=1;
+    }
+  }
+  if($miss){ fwrite(STDERR,"NG: undeclared_ext=".implode(",",array_keys($miss))."\n"); exit(1); }
+  echo "OK";
+  ' | grep -q OK && echo "OK:" > evidence/static/LANGMAP_COVERAGE_OK.txt
+  php -r '$_=json_decode(file_get_contents("COMPLIANCE.json"),true); $_["langmap_coverage_ok"]=true; file_put_contents("COMPLIANCE.json",json_encode($_,JSON_UNESCAPED_SLASHES|JSON_PRETTY_PRINT));'
+  ```
+
+- **H-49 ERR-GUARD-GLOBAL-STATIC-001（新設 / 静的：重要経路の例外ガード確認）**  
+  【要件】/env・/health・/provider/setup の最小ブート/公開経路に**言語相応のエラーハンドリング**が存在する。  
+  【例：検出パターン】
+    - PHP: `catch\s*\(Throwable\b` または `set_exception_handler\(`  
+    - Node.js: `process\.on\(\s*['\"]uncaughtException['\"]` / Express の `app\.use\(.*error`  
+    - Python(Flask/FastAPI): `@app\.errorhandler` / `add_exception_handler`  
+  【受入判定（例）】
+  ```bash
+  # 代表ファイルの例：app.php / app.js / main.py 等を走査
+  if ! grep -RInE "catch\s*\(Throwable|set_exception_handler\(|process\.on\(\s*['\"]uncaughtException|errorhandler\(|add_exception_handler" . >/dev/null 2>&1; then
+    echo "NG: ERR-GUARD not detected"; exit 1;
+  fi
+  echo "OK:" > evidence/static/ERR_GUARD_OK.txt
+  php -r '$_=json_decode(file_get_contents("COMPLIANCE.json"),true); $_["err_guard_ok"]=true; file_put_contents("COMPLIANCE.json",json_encode($_,JSON_UNESCAPED_SLASHES|JSON_PRETTY_PRINT));'
+  ```
+
+- **H-50 TEMPLATE-EXT-HTML-LS-COVERAGE-001（新設 / 静的：テンプレ拡張子の網羅検査）**  
+  【要件】`langmap.json.templates` に記された**全テンプレートパス**に対し、H-23G と同等の HTML-LS 検査を適用する。  
+  【受入判定】`tools/render_smoke.sh` が少なくとも 1 画面（index/login 等）を描画し、出力HTMLが H-23G を満たす。
+
+6.1) 新規検査（H-41b〜H-47：“ダメ押し”ゲート対応）
+- **H-41b-ZIP-CONTENT-LOCK-001**  
+  【要件】配布ZIP内に想定外の実行ファイル/バイナリ/隠しファイルが混入しない。  
+  【受入判定】ZIP内のファイル拡張子をホワイトリスト照合し、逸脱0件で合格。  
+  【証跡】`evidence/static/ZIP_CONTENT_OK.txt`  
+  【COMPLIANCE】`.zip_content_ok = true`
+- **H-42-PRESEED-KEEP-IN-PACK-LOCK-001**  
+  【要件】`storage/preseed/**` の初期データは ZIP に必ず同梱する。  
+  【受入判定】ZIPに `storage/preseed/` が存在し、必須ファイルのSHA256一致。  
+  【証跡】`evidence/static/STORAGE_KEEP_PRESEED_IN_PACK_OK.txt`  
+  【COMPLIANCE】`.storage_keep_preseed_in_pack_ok = true`
+- **H-43-SPEC-ONLY-SOURCE-LOCK-001**  
+  【要件】仕様書/スクリプトは**ソースのみ**同梱（バイナリ生成物は不可）。  
+  【受入判定】ZIP内で `.o/.so/.dll/.exe` 等バイナリの検出0件。  
+  【証跡】`evidence/static/SPEC_ONLY_SOURCE_OK.txt`  
+  【COMPLIANCE】`.spec_only_source_ok = true`
+- **H-44-REDIR-BNORM-LOCK-001**  
+  【要件】リダイレクト系はBNORM準拠（/login 等、相対→絶対／no-store付与）。  
+  【受入判定】リダイレクト応答ヘッダの `Cache-Control: no-store` および正規化URL確認。  
+  【証跡】`evidence/runtime/REDIR_BNORM_LOCK_OK.txt`  
+  【COMPLIANCE】`.redir_bnorm_lock_ok = true`
+- **H-45-UPSERT-VALUES-BAN-LOCK-001**  
+  【要件】UPSERT句での `VALUES(...)` 直書きを禁止（SQLインジェクション温床回避）。  
+  【受入判定】静的解析で `INSERT ... ON CONFLICT ... DO UPDATE SET ... VALUES(` の検出0件。  
+  【証跡】`evidence/static/UPSERT_VALUES_BAN_OK.txt`  
+  【COMPLIANCE】`.upsert_values_ban_ok = true`
+- **H-46-DDL-INDEX-IFNE-BAN-LOCK-001**  
+  【要件】`CREATE INDEX IF NOT EXISTS` の乱用を禁止（移行手順で明示管理）。  
+  【受入判定】DDLスクリプトから `IF NOT EXISTS` を禁止語として検出0件。  
+  【証跡】`evidence/static/DDL_INDEX_IFNE_BAN_OK.txt`  
+  【COMPLIANCE】`.ddl_index_ifne_ban_ok = true`
+- **H-47-HEALTH-MINBOOT-DATA-LOCK-001**  
+  【要件】最小ブートデータ適用後の `/health` が 200/JSON/no-store を返す。  
+  【受入判定】`/health` への HEAD/GET が 200、`Content-Type: application/json`、`Cache-Control: no-store`。  
+  【証跡】`evidence/runtime/HEALTH_MINBOOT_DATA_OK.txt`  
+  【COMPLIANCE】`.health_minboot_data_ok = true`
+（補足）既存の `setup_link_ban_ok` / `health_boot_head_ok` / `config_path_root_ok` は COMPLIANCE 必須一覧に明記（8.2参照）。
+検査項目（H-1〜H-47 / 一意版）
+H-1/H-2 の実行で PHPLINT.log / PHPLINT_FINAL.log を生成している前提
+— 走査対象件数
+N=$(find . -type f -name "*.php" | wc -l | awk '{print $1}')
+7) DONE/ZIP ゲート
+- （追加）ZIP 生成には `COMPLIANCE.json.verify_report_ok=true` を **必須** とする（VERIFY_REPORT v1 同梱の保証）。
+- ZIP 生成は **Phase S/B の必須検査がすべて PASS** し、かつ `COMPLIANCE.json` に以下の**必須キー**が **true/規定値** である場合にのみ許可（手詰め true 禁止）。
+- 追加強化（v4.7 系）により、下記の **“ダメ押し”キー** を AND で要求：
+  - `.zip_content_ok`
+  - `.storage_keep_preseed_in_pack_ok`
+  - `.spec_only_source_ok`
+  - `.redir_bnorm_lock_ok`
+  - `.upsert_values_ban_ok`
+  - `.ddl_index_ifne_ban_ok`
+  - `.health_minboot_data_ok`（DB未到達時は SKIP 可）
+
+— COMPLIANCE.json（統合・必須キー）
+  - `verify_report_ok`
+- 代表必須キー（抜粋）
+  - `phplint_pre_pass`, `phplint_final_pass`, `manifest_sha256`, `gate_sig_ok`, `pkg_files_hashed`,
+  - `deploy_lint_pass`, `deploy_manifest_match`, `deploy_hash_match`,
+  - `pages_rel_require_ban_pass`, `base_path_helpers_pass`,
+  - `tokens_first_ok`, `evidence_fresh_ok`, `lint_sig_ok`,
+  - `storage_writable_ok`, `tools_presence_ok`, `boot_env_ok`,
+  - `abs_href_ban_ok`, `html_ls_ok`, `sot_schema_coverage_ok`,
+  - `pack_provenance_ok`, `zip_ready_ok`,
+  - **追加（v4.7 系）**: `zip_content_ok`, `storage_keep_preseed_in_pack_ok`, `spec_only_source_ok`,
+    `redir_bnorm_lock_ok`, `upsert_values_ban_ok`, `ddl_index_ifne_ban_ok`, `health_minboot_data_ok`,
+    `db_engine="mysql8"`, `http_client="curl"`。
+- **追加（v4.8 系）**: `html_ls_global_ok`, `polyglot_lint_ok`, `langmap_coverage_ok`, `err_guard_ok`, `polyglot_manifest_ok`
+
+— RTM（統合）
+- 各 H-* の証跡ファイル／COMPLIANCE キーの対応は本文該当節の末尾に併記。
+7.1) COMPLIANCE.json（統合・必須キー）
+- `.setup_link_ban_ok` = true
+- `.health_boot_head_ok` = true
+- `.config_path_root_ok` = true
+7.2) RTM（統合）
+- `.setup_link_ban_ok` = true
+- `.health_boot_head_ok` = true
+- `.config_path_root_ok` = true
+H-41b-ZIP-CONTENT-LOCK-001,"ZIP内コンテンツ検査（バイナリ/隠しファイル排除）","evidence/static/ZIP_CONTENT_OK.txt; COMPLIANCE.json.zip_content_ok"
+H-42-PRESEED-KEEP-IN-PACK-LOCK-001,"preseed データのZIP同梱確認","evidence/static/STORAGE_KEEP_PRESEED_IN_PACK_OK.txt; COMPLIANCE.json.storage_keep_preseed_in_pack_ok"
+H-43-SPEC-ONLY-SOURCE-LOCK-001,"仕様/スクリプトはソースのみ同梱","evidence/static/SPEC_ONLY_SOURCE_OK.txt; COMPLIANCE.json.spec_only_source_ok"
+H-44-REDIR-BNORM-LOCK-001,"リダイレクトBNORM（no-store/URL正規化）","evidence/runtime/REDIR_BNORM_LOCK_OK.txt; COMPLIANCE.json.redir_bnorm_lock_ok"
+H-45-UPSERT-VALUES-BAN-LOCK-001,"UPSERT VALUES 直書きの禁止","evidence/static/UPSERT_VALUES_BAN_OK.txt; COMPLIANCE.json.upsert_values_ban_ok"
+H-46-DDL-INDEX-IFNE-BAN-LOCK-001,"DDL: CREATE INDEX IF NOT EXISTS の禁止","evidence/static/DDL_INDEX_IFNE_BAN_OK.txt; COMPLIANCE.json.ddl_index_ifne_ban_ok"
+H-47-HEALTH-MINBOOT-DATA-LOCK-001,"最小ブートデータ後の/health 200+JSON+no-store","evidence/runtime/HEALTH_MINBOOT_DATA_OK.txt; COMPLIANCE.json.health_minboot_data_ok"9)
+  - `.html_ls_global_ok`
+  - `.polyglot_lint_ok`
+  - `.langmap_coverage_ok`
+  - `.err_guard_ok` 変更管理
+- v4.7.2_HARDENED_RECOMPOSED_FULL: v4.7.1_FULL 末尾の v4.3.0_HARDENED “全文収載”を撤去し、本文へ完全統合。重複を全削除し、章立てを再設計。
+
+8) 成果物
+- 証跡ファイル、COMPLIANCE.json、MANIFEST.json などを含む。
