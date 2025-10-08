@@ -1,0 +1,507 @@
+機能仕様書
+版数: v1.2.4 
+P25-09-30 17:27:21 JST
+
+1) 対象・前提（MUST）
+
+- PHP 8.3（CLI/CGI同一）。フレームワーク不使用、PSR 任意。
+- Web: Apache + mod_rewrite（.htaccess 有効、RewriteBase 任意、END 禁止）。
+- DB: MySQL 8.0.19+（MariaDB 非対象）、文字コード utf8mb4、照合 utf8mb4_0900_ai_ci（不可時は utf8mb4_unicode_ci に自動フォールバックしログ記録）。
+- フロントコントローラ（FC）: {BASE}/app.php（サブディレクトリ配備に非依存／BNORM）。
+- HTTP クライアントは cURL のみ（file_get_contents 等のネット取得禁止）。
+- ログ（L2）必須、AUTH-REALM-SPLIT（/provider 専用ログインと一般 /login の分離）必須。
+- 配備における DB 実値は環境仕様書の付録A（SOT）に一致（config.php に文字列そのままでベタ書き）。
+
+2) URL / 早期ハンドラ / BNORM（MUST）
+
+- /env：FC内最上流で JSON を直返し（no-store）。/env/ も 200。判定より前の require/include/autoload/session_start/ob_start 禁止。
+- /env-lite /health-lite：物理ファイル直返し（直返し＝FC特有ヘッダ無し）。Rewrite は -f/-d 優先素通し。
+- /health：**最小ブート（スキーマのみ）**。schema.sql を冪等に適用し、必須テーブル・インデックス・固定行を整備。**データの流し込み（診療科・ルール含む）は行わない**。
+- /：302 → /login（no-store、301 禁止）。
+- 全応答 Cache-Control: no-store を付与（3xx 含む、301 禁止）。
+- BNORM：dirname($_SERVER['SCRIPT_NAME']) を用い、$path = rtrim(_path(), '/')。末尾スラ有無で経路解釈を変えない（/env と /env/ が 200）。
+
+3) AUTH-REALM-SPLIT（MUST）
+
+- Provider Realm
+  - /provider（末尾スラ問わず）→ 302 /provider/login（no-store）。
+  - /provider/login：Provider 専用ログイン。
+  - **/provider/setup（SetupForm 明確化）**：
+    - **公開条件**：`users=0` の**初回のみ** GET を 200 で公開。`users>0` は 302 → /provider/login（no-store）。
+    - **GET の動作**：**無副作用**。初期ユーザー作成フォーム（email + password）を**HTMLで表示**するのみ。
+    - **POST の動作**：**POST のみ**ユーザー作成を実行。作成時は `role='provider'`、`force_reset=1` を**必ず**付与。成功後は **302 → /provider/login（no-store）**。
+    - **ログ（L2）**：GET 公開時に `setup_allowed`、作成成功時に `setup_created`、`users>0` でのアクセスは `setup_redirected` を 1 行 JSON で出力。
+  - /provider/*（login/setup 除外）各ブロック先頭〜10行以内に require_provider_login() を必須。
+- General Realm
+  - 入口は /login。成功後はロール（admin/clerk）を UI に明示。
+  - /admin/* /clerk/* は require_login() 必須（未ログインは 302 → /login）。
+- 禁止：/health 等でのユーザー/テナント自動作成。
+
+3.1) /provider/setup ポリシー（厳格）
+**要件（/provider/setup の GET/POST ポリシーの強調）:**
+  - **GET（初回のみ公開）:** `users=0` の**初回のみ** 200 を返し、**無副作用の HTML フォーム**（email, password）を表示する。**DB 書込・セッション変更・Cookie 設定**などの副作用を持たせない。**HEAD** も 200 + `Cache-Control: no-store` を返す。**301 禁止**。
+  - **POST（作成のみ）:** 初期ユーザーを**作成のみ**実行する。作成時は `role='provider'`、`force_reset=1` を**必須**で付与。成功後は **302 → /provider/login**（**`Cache-Control: no-store` 必須／**301 禁止**）。
+  - **2回目以降（users>0）:** **GET/POST ともに** 302 → /provider/login（**no-store 必須**）。フォームは表示しない（**無公開**）。
+  - **実装上の注意:** `/provider/login` を含む **公開画面に /provider/setup のアンカーリンクを出さない**（文言のみ可）。`X-Robots-Tag: noindex, nofollow, noarchive` を推奨。
+【受入判定】A) `users=0` 環境で GET を連続2回実行して**200 + 無副作用（`users` 件数不変）**を確認。B) POST 実行後、**1 行作成**・`force_reset=1` を確認し、**302 → /provider/login（no-store）** を検証。C) `users>0` 環境で **GET/POST とも 302** を確認（**301 が 0 件**）。
+
+4) データモデル（DDLの明文化 / MUST）
+
+- `users` に **`tenant_id INT NULL`** を追加（**FK: tenants.id**）。**Provider（role='provider'）は NULL、Admin/Clerk は作成テナントの ID を必須設定**。  
+- 既存の **`email UNIQUE`** 制約はテナント横断で一意（全体ユニーク）を維持。  
+- **移行DDL（参考）**  
+  ```sql
+  ALTER TABLE `users` ADD COLUMN `tenant_id` INT NULL AFTER `id`;
+  ALTER TABLE `users` ADD CONSTRAINT `fk_users_tenant_id` FOREIGN KEY (`tenant_id`) REFERENCES `tenants`(`id`) ON DELETE SET NULL;
+  ```
+- **受入試験（列存在検査の追補）**: `users.tenant_id` 列の存在を静的/動的検査に追加する。
+- 予約語回避ポリシー：**DBの識別子（テーブル/列/インデックス/制約名）に予約語を使用しない**。入力データのキー名が予約語であっても **DB列名へ転用しない**（明示マッピング）。
+- **必須テーブルと主要列（規範）**
+  - `tenants` … `id(PK)`, `name(VARCHAR)`, `created_at(TIMESTAMP DEFAULT CURRENT_TIMESTAMP)`
+  - `users` … `id(PK)`,  `email(VARCHAR)`, `password_hash(VARCHAR)`, `role(VARCHAR)`, **`force_reset(TINYINT)`**, `password_reset_token(VARCHAR NULL)`, `password_reset_expires(DATETIME NULL)`, `created_at(TIMESTAMP)`
+  - `departments` … `id(PK)`, **`code(VARCHAR UNIQUE)`**, `name(VARCHAR)`
+  - `provider_rules` … `id(PK)`, **`title(VARCHAR UNIQUE)`**, **`rule_condition(TEXT)`**, **`rule_action(TEXT)`**, `version(VARCHAR)`, `source_date(DATE)`, `created_at(TIMESTAMP)`
+    - **マッピング規則**：入力JSONの `condition` → **`rule_condition`**、`action` → **`rule_action`**。
+  - `patients` … `id(PK)`
+  - `claims` … `id(PK)`, `patient_id(FK)`
+  - `claim_items` … `id(PK)`, `claim_id(FK)`
+  - `audit_rules` … `id(PK)`, `keyname(VARCHAR)`
+  - `tenant_rule_overrides` … `id(PK)`, `tenant_id(FK)`, `rule_id(FK)`, `enabled(TINYINT DEFAULT 1)`
+  - `sync_commands` … `id(PK)`, **`status(VARCHAR)`**, **`requested_at(DATETIME)`**
+    - **インデックス**：`ix_sc_status_requested(status, requested_at, id)`（IF NOT EXISTS 禁止 → 存在確認後に作成）
+  - 固定行（固定IDの存在を保証）
+    - `rules_sync_state(id=1 固定)` … `id(PK)`, `last_sha256(CHAR(64) NULL)`
+    - `sync_runner_state(id=1 固定)` … `id(PK)`, `backoff_seconds(INT DEFAULT 0)`
+  - `import_runs` … `id(PK)`, `pack_name(VARCHAR)`, `pack_sha256(CHAR(64))`, `inserted(INT)`, `updated(INT)`, `failed(INT)`, `lines_read(INT)`, `created_at(TIMESTAMP)`
+  - `job_runs` … `id(PK)`, `name(VARCHAR)`, `status(VARCHAR)`, `created_at(TIMESTAMP)`
+
+- **UPSERT 方式（固定規範 / MUST）**
+  - **採用**：`INSERT ... VALUES (...) AS new ON DUPLICATE KEY UPDATE col = new.col`（**AS new 方式**）
+  - **禁止**：`... UPDATE col = VALUES(col)`（`/* FORBIDDEN: VALUES() */` 参照の禁止）
+  - **適用範囲**：`provider_rules`, `departments`, `users`（/provider/setup 作成時）ほか、全UPSERT。
+
+- **移行指針（参考）**
+  - 既存環境の `provider_rules(condition, action)` は
+    - `ALTER TABLE provider_rules RENAME COLUMN \`condition\` TO \`rule_condition\`;`
+    - `ALTER TABLE provider_rules RENAME COLUMN \`action\`     TO \`rule_action\`;`
+
+4) データモデル（DDLの動作要件 / MUST）
+
+- **変更（本版）**: `users.username` は廃止。`users.email` は **UNIQUE**。ログイン識別子は **email** のみ。
+- 必須テーブル：tenants, users, departments, provider_rules（title 一意）, patients, claims, claim_items, audit_rules, tenant_rule_overrides, sync_commands, rules_sync_state（ID=1 固定行）, sync_runner_state（ID=1 固定行）, import_runs, job_runs。
+- users 追加列：force_reset, password_reset_token, password_reset_expires（無ければ追加）。
+  - **初期作成（/provider/setup の POST）では `force_reset=1` を必須**（初回ログイン時にパスワード変更を強制）。
+- インデックス：sync_commands に ix_sc_status_requested(status, requested_at, id)（無ければ作成）。
+- 固定行：rules_sync_state(ID=1), sync_runner_state(ID=1) を保証。
+- Upsert：MySQL 標準（AS new … ON DUPLICATE KEY UPDATE）。UPDATE 句で /* FORBIDDEN: VALUES() */ 禁止。INSERT…SET は不可。
+
+5) ΔDATA-SOURCES（データ供給の前提 / MUST）
+
+- 本仕様は**データの実値のみ**を対象とする。生成方法（配列埋め込み・ファイル同梱可否など）には言及しない。
+- ルールデータ（provider_rules）および診療科（departments）の**実値**は、環境仕様書の SOT と運用に従って提供される。
+- アプリは**提供された実データ**を、/provider/db（または等価 CLI）により冪等に upsert する。
+- データ到達性・件数下限（rules≥208 / departments≥35）は本仕様の受入試験で検証する。
+
+6) 取込（アプリ内エンドポイント / MUST）
+
+- **/provider/db**
+  - 役割：**(1) ルール（provider_rules）の適用** と **(2) 診療科（departments）の冪等投入** を**明示操作**で実行する**唯一のアプリ内エンドポイント**。
+  - 要件：Provider ログイン必須（/provider/login）。未ログインは 302→/provider/login（no-store）。
+  - 入力：
+    - GET /provider/db（引数なし＝内包ルールを適用）＋ **診療科を付録Cで upsert**
+    - `GET /provider/db?packs=/path/to.jsonl`（外部ルールパック）＋ **診療科を付録Cで upsert**
+  - 挙動：
+    - トランザクション境界は**適用単位**で行う。ルール適用は「ファイル（内包/外部）単位」で 1 つのトランザクション。診療科 upsert は別トランザクションで冪等実行。
+    - いずれかでエラーが発生した場合は当該トランザクションをロールバックし、`ok:false` を返す（成功分のコミットは維持）。
+    - import_runs へ pack_name/sha256/inserted/updated/failed/lines_read を記録（ルール適用時）。
+    - ログ（L2）：`rules_packs_apply_start/ok/failed`、**`departments_seed_apply_start/ok/failed`** を 1行JSONで出力。
+  - 成功時応答：200 JSON（no-store）
+    `{ ok:true, applied:true, counts:{provider_rules: N, departments: M}, pack:{name,sha256} }`
+  - 件数要件：
+    - ルール：**最終 N ≥ 208**（Base25 + A〜D）。追加バッチを内包する場合は `N ≥ 208 + add_batch_count`。
+    - 診療科：**最終 M ≥ 35**（付録Cの codes v1.1 ≒40件を想定。重複は更新）。
+  - 冪等性：再実行しても N/M は**増え続けない**（同一データは更新または無変更）。
+
+7) CLI（併存 / MUST）
+
+- cli/sync.php：実ネット取得（cURL）。SYNC_SEED_URLS 未設定で exit=3（seed_missing）。--cycle は EmptyDB Auto-Fetch を実装。
+- cli/build_rules.php：テンプレ到達性検査／--strict 到達0件は exit=2。
+- cli/import_db.php：**/provider/db と同等ロジック**（互換目的）。引数なし＝内包／--packs 指定＝外部。実行時に**診療科 upsert も併せて実施**。
+
+8) cron（単一cron + EmptyDB Auto-Fetch / MUST）
+
+- 例（Asia/Tokyo）
+  */10 * * * * cd {BASE} && php cli/sync.php --cycle >> storage/logs/cron.sync.log 2>&1
+- 空判定：コア表欠落／provider_rules=0 または ENV 最小値未満（min 25）／departments<35。空なら force 取得→build_rules→**import（/provider/db 同等：ルール＋診療科）**。
+
+9) UI / RBAC（MUST）
+
+- **GET /provider/tenants/new**：200（no-store）。フォーム項目  
+  - `tenant_name`（必須, maxlength≒128）  
+  - `admin_email`（必須, email形式, 重複不可）, `admin_password`（必須, 強度基準：最小8文字/英大小/数字の組合せを推奨）  
+  - `csrf_token`（hidden）  
+- **POST /provider/tenants/new**：CSRF必須。**1トランザクション**で `tenants` 作成 → `users(admin|clerk)` 作成（`tenant_id` 紐付け, `force_reset=1`）を実行。  
+  成功時 **201** または **302→/provider/tenants**、失敗時 **422/400**。部分作成は禁止（ロールバック）。
+- Provider：/provider/tenants（一覧）／/provider/tenants/new（新規）…ほか。各画面でロール名（provider/admin/clerk）を明示。
+- /provider/db：UI から到達する管理メニューには**非掲載（直叩き想定／限定メニュー）**でもよいが、認可は厳格に行う。
+- UI-E2E（抜粋）：
+  - GET /provider/tenants/new = 200（name required + CSRF hidden）
+  - POST /provider/tenants/new（name=テスト医療機関, CSRF OK）= 201 または 302→一覧
+  - GET /provider/tenants に新規行が表示
+
+9.1) Provider Dashboard（最小要件）
+`/provider/dashboard` はログイン後ランディング。見出し（「Provider Dashboard」）と**クイックリンク**（Tenants `/provider/tenants`、ルール適用 `/provider/db`、グローバルルール `/provider/rules`、ジョブ `/provider/jobs`、ログアウト）を持つ。
+【受入判定】ログイン後に当該要素が検出できる。**機能が 0 件でも 200 を返す**。
+
+9.2) Provider Global Rules 画面（一覧/検索/詳細）
+`/provider/rules` は provider_rules を**一覧/検索/詳細の閲覧**で提供する（編集は MUST）。表示項目：title, version, source_date, created_at、詳細は rule_condition / rule_action（要約可）。
+【受入判定】一覧 200（最低限表示）。
+
+9.3) /provider/tenants/new（admin 単独作成）
+`/provider/tenants/new` は **テナント名**と **テナント管理者（admin）** の **email / password** を受け付け、**1トランザクション**で以下を実行する。
+  1) `tenants` に新規テナントを作成  
+  2) `users` に `role='admin'` のユーザーを**作成**（`tenant_id` に作成テナントのIDを設定、`force_reset=1` を必須付与、`email` は全体ユニーク、`password_hash` は安全なハッシュ）  
+  3) いずれかが失敗した場合は**全体をロールバック**  
+
+  **フォーム項目（GET /provider/tenants/new）:**  
+  - `tenant_name`（必須）  
+  - `admin_email`（必須）, `admin_password`（必須）  
+  - `csrf_token`（hidden）  
+
+  **応答:** 成功時は **201** または **302→/provider/tenants**（いずれも `Cache-Control: no-store`）。バリデーションエラー/ユニーク制約違反は **422/400** を返し、**部分作成はしない**。  
+【受入判定】A) フォームに上記項目が存在。B) 成功POST後、`tenants` に1行・`users` に**1行（admin）**が作成され、`tenant_id` と `force_reset=1` が正しく付与。C) `admin_email` 重複で**0行追加**（ロールバック）を確認。
+
+9.4) /admin/clerk/new（adminによる clerk 作成）
+**Admin ロール**でログイン済みであることを前提に、同一テナント配下の **事務員（clerk）** を作成する。
+  - **GET /admin/clerk/new**：200（no-store）。フォーム項目  
+    - ` `（必須, email形式, 全体ユニーク）, ` `（必須, 強度基準）  
+    - `csrf_token`（hidden）  
+  - **POST /admin/clerk/new**：CSRF必須。**1トランザクション**で `users(role='clerk', tenant_id=<adminのtenant_id>, force_reset=1)` を作成。  
+    成功時 **201** または **302→/admin/users**（no-store）、失敗時 **422/400**。重複時は**ロールバック**。  
+
+【受入判定】A) GET フォーム項目の存在。B) POST 成功後、`users` に**1行（clerk）**が作成され、`tenant_id` は管理者と同一、`force_reset=1`。C) ` ` 重複時は 0 行追加。
+（以下、**v1.1.4 本文を原文のまま全文収載**）
+
+本版は v1.1.3（正本）を**全文継承**し、以下の変更点を**統合**した確定版です（差分ではなく本書のみで完結します）。
+- データモデルの**列名を明文化**：`provider_rules` は **`rule_condition` / `rule_action`** 列を採用（予約語 `CONDITION` / `ACTION` の回避）。
+- ルール入力(JSON/JSONL)の `condition` / `action` は、**DB列 `rule_condition` / `rule_action` にマッピング**することを明記。
+- UPSERT 方式は **AS new … ON DUPLICATE KEY UPDATE** に**固定**（`/* FORBIDDEN: VALUES() */` 参照は禁止）。
+- 受入試験（E2E）に **列存在検査**（provider_rules.rule_condition / rule_action）を追加。
+
+本版の §4（データモデル）は**上位優先**で、旧版本文に同名/近接の記述がある場合でも**本版の記述が正**とする（生成/検査仕様の規範に従う）。
+
+10) ログ / 監査（L2 / MUST）
+
+- `tenants_create_start` / `tenants_create_ok` / `tenants_create_failed`  
+- `tenant_admin_created` / `tenant_clerk_created`  
+（各イベントは 1行JSON：timestamp, level, event, tenant_id, user_id, email など）
+- 1行JSON（timestamp, level, event, file, line 必須）。
+- 代表イベント：db_connect_failed, schema_bootstrap_ok/failed, seed_upsert_fallback,
+  rules_packs_apply_start/ok/failed, **departments_seed_apply_start/ok/failed**, auth_login/logout/guard_blocked,
+  **setup_allowed/setup_created/setup_redirected**。
+
+11) 受入試験（E2E / MUST）
+
+H) **テナント新規（管理者作成）**  
+   1. GET /provider/tenants/new = 200。フォームに `tenant_name`, `admin_email/password`, `csrf_token` が存在。
+   2. POST /provider/tenants/new（valid）= **201** または **302→/provider/tenants**。受入判定: tenants に 1 行、users に 1 行（admin）。users.tenant_id は作成テナントID、`force_reset=1` が付与されていること。
+   3. POST（`admin_email` 既存・重複など）= **422/400**。`tenants`/`users` に**追加がない**（完全ロールバック）こと。
+A) 最小ブート：/health 実行後、JSONに `ok:true, db_ok:true, initialized:true` を含む（**データ件数は不問**）。
+B) 取込（内包）：/provider/login → /provider/db（引数なし）= 200 かつ
+   `counts.provider_rules ≥ 208` **かつ** `counts.departments ≥ 35`。
+C) 取込（外部 packs）：/provider/db?packs=out/rules_packs.jsonl = 200 かつ
+   ルール件数が増分（または同数で冪等）**かつ** `counts.departments ≥ 35` を維持。
+D) CLI 互換：php cli/import_db.php（引数なし）= 0、再実行で件数不変（冪等）。
+E) ネガティブ：seed_missing（sync.php exit=3）/ download_failed（exit=2）。
+F) UI-E2E（Provider Tenants）3点（前版どおり）。
+G) **セットアップ（SetupForm）**：
+   1. 事前に `users=0` を確認した環境で、**GET /provider/setup** を 2 回連続実行して**200 + 無副作用（`users` 件数不変）**を確認。
+   2. **POST /provider/setup**（email + password 指定）後、**1 行作成**され、**302 → /provider/login（no-store）** を確認。
+   3. 作成ユーザーの `force_reset=1` を確認（初回ログインでパスワード変更を要求）。
+
+I) Clerk 新規作成（/admin/clerk/new）
+  前提: RBAC=admin のみ、CSRF 必須、no-store、副作用はPOSTのみ。
+  1. GET /admin/clerk/new = 200。フォーム項目: clerk_email, clerk_password, csrf_token を表示。
+  2. POST /admin/clerk/new（valid）= 201（または 302→/admin/users）。
+     受入判定: users に 1 行（role='clerk'）, tenant_id は当該 admin と同一, force_reset=1, email は重複禁止。
+  3. 重複メール・invalid は 4xx（422/400）でロールバック（users に挿入なし）。
+12) パッケージ / COMPLIANCE（MUST）
+
+- ZIP （必須）：.htaccess, app.php, config.php, schema.sql（任意）, assets/theme.css, /app/Support/*.php, /app/Pages/**, /cli/*, /tools/*, /storage/**, README.txt, INSTALL.txt, MANIFEST.json, STATE.json。
+- 追加（）：
+  - ルール：,
+  - **診療科（任意）：**
+- COMPLIANCE.json 必須キー（本機能分）：
+  - "http_client":"curl"
+  - "rules_": true
+  - "provider_db_seeded_min": ">=208"
+  - （参考）本版では departments の件数下限は**試験基準**で担保し、COMPLIANCE のキー追加は任意。
+- 301 禁止／no-store 準拠。
+
+13) 運用（MUST）
+
+- ログローテーション（推奨：10MB or 7世代）。storage/logs/app.log, php_error.log。
+- /health は“常時200”（エラーも JSON で返す／5xx フォールバック禁止）。副作用はスキーマ確保以外に持たせない。
+- 取込は /provider/db（または CLI）で**明示操作**。本版では /provider/db 実行で診療科投入も完了する。
+- **/provider/setup は GET 無副作用・POST 作成のみ**を厳守。
+
+14) 移行指針（MUST）
+
+- 既存の `users.username` は**廃止**。推奨 DDL: `ALTER TABLE users DROP COLUMN username;`
+- 互換上すぐに DROP できない場合でも、**アプリは username を参照しない**こと（未使用）。将来バージョンでの DROP を前提とする。
+- ログインは **email + password** のみ。既存の `/provider/login` クライアントは POST パラメータを `email`, `password` に合わせて更新する。
+
+付録C：標準診療科コード（codes v1.1 / 約40件）
+GEN, INT, SUR, PED, OBG, ORT, DER, NEU, CAR, RES, GAS, END, NEP, HEM, ONC, PSY, NEC, ENT, OPH, URO, PLA, RAD, ANM, REA, DEN, DIA, EME, CVS, THO, HBP, BRE, DMN, GER, STR, PAL, ALL, RHE, ID, PAT, LAB, PDS, OTH
+
+付録E：共通ルール SEED（Base v1.0 / タイトル一覧）
+- 基本:患者IDが未設定
+- 基本:性別が未設定
+- 基本:生年月日が未設定
+- 基本:保険者番号が未設定
+- 基本:負担割合が未設定
+- 日付:請求日が未来日
+- 日付:入院退院日の不整合
+- 重複:同一日・同一項目が複数
+- 重複:用法/投薬の重複
+- 重複:検査パネルと個別検査の重複
+- 整合:男性に妊娠関連項目
+- 整合:年齢に不適合な小児向け項目
+- 整合:年齢に不適合な高齢者向け項目
+- 範囲:数量が0または負数
+- 範囲:点数が負数
+- 範囲:薬剤日数が過大
+- 組合せ:同日に初診と再診は不可の可能性
+- 組合せ:入院基本料と外来再診の同日算定
+- 組合せ:検査前処置と当該検査の算定間隔不足
+- 適用:適用外コードの疑い
+- 適用:自費と保険の混在
+- 論理:患者情報と請求のテナント不一致
+- 論理:同一請求内で患者が複数
+- 頻度:同一検査の高頻度実施
+- 頻度:画像検査の同日複数部位
+- 入力:桁誤りの疑い（点数が桁あふれ）
+- 入力:日付フォーマット不正
+- 必須:入院には病棟/病床情報が必要
+- 必須:麻酔には術式の関連付けが必要
+- 併用:同時併用が想定されない処方
+- 形式:記号番号の形式不正
+
+付録F：拡張ルール（本文内に内包）— タイトル一覧（全172件）
+- ER: 破傷風ハイリスク創でトキソイド/HTIG未算定
+- ER: 同日CT造影多重算定(24h以内重複)
+- ER: 小児患者に成人用用量のアセトアミノフェン
+- ER: 外傷でテタノス未接種履歴・未記録
+- ER: 同日トリアージと高度処置の時刻順不整合
+- ICU: 鎮静持続投与でDAILY AWAKENING未実施
+- ICU: ストレス潰瘍予防の適応外投与
+- ICU: 重複昇圧薬併用で漸減計画なし
+- ICU: 人工呼吸中のVTE予防欠落
+- ICU: AKI中の造影検査で腎保護未介入
+- 麻酔: ASA分類未記録で全身麻酔算定
+- 麻酔: 抗凝固中の脊椎麻酔実施
+- 麻酔: 術後鎮痛オピオイドMME過量
+- 麻酔: PONV高リスクで予防未実施
+- 麻酔: 気道困難予測スコア未記録
+- 感染症: 無尿/Cr高値でアミノグリコシド常用量
+- 感染症: 肺炎で抗菌薬日数過長(>14d)
+- 感染症: C. difficile疑いで広域抗菌薬継続
+- 感染症: 血液培養採取前の抗菌薬投与
+- 感染症: MRSA肺炎でバンコマイシンTDM未実施
+- 輸血: Hb>10g/dLでRBC輸血算定
+- 輸血: 1単位投与で再評価記録なし
+- 輸血: 交差適合検査未実施で製剤投与
+- 輸血: 同種抗体陽性でIgA欠損製剤未選択
+- 輸血: 凍結血漿が凝固異常なしで投与
+- 横断: 性別と妊娠関連算定の不一致
+- 横断: 年齢に不適合な小児用加算の算定
+- 横断: 自費と保険の同一請求内混在
+- 横断: 同一日・同一項目の多重算定
+- 横断: 点数桁あふれの疑い
+- 老年: Beers基準不適薬（ベンゾジアゼピン）
+- 老年: 抗コリン負荷が高い併用
+- 老年: eGFR<30でメトホルミン継続
+- 老年: 多剤併用(≧10薬)レビュー未実施
+- 老年: 転倒リスク薬×フレイル指標
+- リハ: 重複領域(PT/OT/ST)同時算定
+- リハ: 低強度患者で高強度プロトコル算定
+- リハ: 心不全急性期で過負荷セッション
+- リハ: 目標到達後の継続算定
+- CKD非透析: 造影検査で腎保護未介入
+- CKD非透析: 禁忌薬(メトホルミン)継続
+- CKD非透析: 高K血症でACE/ARB増量
+- CKD非透析: リン吸着薬併用重複
+- CKD非透析: eGFR<45で造影MRIガドリニウム反復
+- 産婦: 妊婦に禁忌薬(ACE/ARB)
+- 産婦: 帝王切開前抗菌薬予防の未実施
+- 産婦: Rh陰性妊婦で抗D未投与
+- 産婦: 産褥期以降の分娩加算算定
+- 産婦: 妊娠糖尿病で栄養指導未実施
+- 皮膚: イソトレチノインで妊娠検査未実施
+- 皮膚: 外用ステロイド超高力価の長期連用
+- 皮膚: 抗菌薬外用と全身投与の重複
+- 皮膚: 生物学的製剤で結核スクリーニング未記録
+- 皮膚: 光線療法の照射量漸増なし
+- リウマチ: MTXで葉酸補充未実施
+- リウマチ: 生物学的製剤と生ワクチン同時
+- リウマチ: ステロイド高用量長期(>20mg/3か月)
+- リウマチ: DMARD重複(作用機序重複)
+- リウマチ: MTX腎機能低下で減量なし
+- 歯科: 感染性心内膜炎ハイリスクで予防抗菌薬未投与
+- 歯科: 局所麻酔リドカイン最大量超過
+- 歯科: 同部位のX線撮影短期重複
+- 歯科: 抜歯後鎮痛オピオイド>3日分
+- 歯科: 周術期抗菌薬多剤重複
+- IVR: 抗凝固中の穿刺手技で中止計画なし
+- IVR: 造影超過(累積量>300mL/入院)
+- IVR: エンボ化塞栓で抗生剤予防未投与
+- IVR: ドレーン留置後の抜去計画未記録
+- IVR: ステント留置後の抗血小板二剤期間超過
+- 緩和: 急速なオピオイド用量増(>50%/24h)
+- 緩和: 便秘予防未併用(オピオイド開始)
+- 緩和: 腎不全でモルヒネ持続投与
+- 緩和: DNAR/ACP未整備で化学療法継続
+- 緩和: breakthrough疼痛でBT処方欠落
+- NST: 重度低栄養で栄養計画未作成
+- NST: 経管栄養で誤嚥リスク評価なし
+- NST: 高リフィーディングリスクで補正なし
+- NST: 静脈栄養で血糖モニタ不足
+- NST: 蛋白/エネルギー目標未達のまま継続
+- 高影響: 高額抗菌薬と培養陰性・炎症低値
+- 高影響: 同日2種の高度画像(CT+MRI)
+- 高影響: ICUで無益治療の継続疑い
+- タイミング: 周術期抗菌薬投与が切皮>60分前
+- タイミング: 術後48hを超える予防抗菌薬継続
+- タイミング: DVT予防が術後24h以降開始
+- タイミング: 透析当日に造影検査未調整
+- タイミング: ワクチンと免疫抑制開始が同日
+- 整合性: 診断なしの手技算定
+- 整合性: 男性に産科処置算定
+- 整合性: 小児禁忌薬の算定
+- 整合性: 院外処方と院内投与の同日重複
+- 整合性: 在宅酸素とSpO2持続正常
+- 整合性: 併用禁忌薬の同時処方
+- 整合性: 画像検査と造影アレルギー歴
+- 整合性: 妊娠可能年齢でX線腹骨盤照射に遮蔽なし
+- 整合性: 麻薬処方の二重発行
+- 整合性: 禁食指示と経口投薬の同時記録
+- 整合性: 透析患者のカリウム製剤投与
+- 整合性: DNR下で蘇生関連加算算定
+- 循環器: 心不全増悪で退院7日以内再入院
+- 循環器: 心房細動で抗凝固未処方(CHA2DS2-VASc≧2)
+- 呼吸器: 在宅酸素でSpO2≧96%継続・再評価なし
+- 内分泌: 糖尿病でSGLT2/GLP1適応に未導入(合併症あり)
+- 腎臓: 造影検査後の透析患者でKモニタ未実施
+- 消化器: 上部消化管出血でPPI静注未使用
+- 整形外科: 人工関節術後VTE予防未算定
+- 整形外科: 骨粗鬆症骨折で骨粗鬆症治療未導入
+- 脳神経: 脳梗塞急性期でtPA評価未記録
+- 精神科: 高用量抗精神病薬の二剤併用>12週
+- 小児: フルオロキノロン全身投与(年齢<12)
+- 小児: 体重更新>6か月なしで用量固定
+- 産婦人科: 妊娠高血圧でMgSO4未投与(重症所見)
+- 泌尿器: 尿路感染で培養感受性と不一致抗菌薬継続
+- 眼科: 緑内障でβ遮断薬点眼と喘息併存
+- 耳鼻科: 抗ヒスタミン＋抗コリン重複で高齢者
+- 皮膚科: 生物学的製剤でB型肝炎再活性化スクリーニング未記録
+- 放射線科: 造影CTと腎機能評価48h超過
+- 麻酔科: OSA高リスクで術後モニタ不足
+- 救急: 外傷CT多部位でIV造影腎機能未確認
+- ICU: 抗菌薬デエスカレーション48h遅延
+- リハ: 休日連続で未実施(>3日)の算定継続
+- NST: TPNと経腸栄養の二重算定
+- 緩和: オピオイドとベンゾ同時高用量併用
+- 血液: 好中球減少時にG-CSF適応未評価
+- 感染症: 抗菌薬培養未採取で長期投与(>7日)
+- 感染症: 結核疑いで標準隔離未実施
+- 腫瘍: 化学療法前の血算/肝腎機能未チェック
+- 放射線治療: 照射中の妊娠判定未確認(妊娠可能年齢)
+- 外科: 術式と麻酔種別の不整合
+- 一般: 自費と保険の同日別件名請求
+- タイミング: 末梢血培養で左右2セット間隔<15分
+- 整合性: ICD/手術コードと主診断の矛盾
+- 透析: 週3回スケジュールで未実施日数>2（14日内）
+- 透析: 体重増加率>5%でドライウェイト未更新
+- 透析: カリウム>6.0でも透析前補正なし
+- 透析: 抗凝固薬未使用で回路凝固繰り返し
+- 透析: カテーテル留置>90日で入路評価なし
+- 周産期: GBS陽性で分娩時抗菌薬予防未投与
+- 周産期: 妊娠糖尿病で血糖自己測定記録不足
+- 周産期: 帝王切開で術後VTE予防未算定
+- 周産期: 妊娠高血圧で分娩後MgSO4早期中止(<24h)
+- 周産期: 早産既往で17-OHPC/頚管管理なし
+- 周術期: 抗菌薬選択が術式推奨と不一致
+- 周術期: 体温維持不良(術中<36.0℃)対策なし
+- 周術期: 術野剃毛でカミソリ使用
+- 周術期: 術後血糖管理未実施(糖尿病/心臓手術)
+- 周術期: クロルヘキシジン禁忌患者に同剤使用
+- ASP: 広域抗菌薬の適応理由未記録
+- ASP: 抗菌薬静注→経口切替遅延(>72h)
+- ASP: デエスカレーション未実施で培養陰性
+- ASP: 重複抗菌薬同系統併用(>48h)
+- ASP: アミノグリコシドTDM未実施
+- 精神科: 代謝モニタ不足（抗精神病薬）
+- 一般: 禁食指示中の経口造影剤投与
+- 一般: 自費再診と保険再診の同日二重算定
+
+付録S：Schema SOT（唯一のSOT／機械可読 JSON）
+（本付録の**そのままの内容**を `app/SOT/schema.required.json` としてパッケージに同梱すること）
+---- JSON 開始 ----
+{
+  "version": "1.1",
+  "tables": [
+    "tenants",
+    "users",
+    "departments",
+    "provider_rules",
+    "patients",
+    "claims",
+    "claim_items",
+    "audit_rules",
+    "tenant_rule_overrides",
+    "sync_commands",
+    "rules_sync_state",
+    "sync_runner_state",
+    "import_runs",
+    "job_runs"
+  ],
+  "fixed_rows": [
+    {
+      "table": "rules_sync_state",
+      "pk": "id",
+      "value": 1
+    },
+    {
+      "table": "sync_runner_state",
+      "pk": "id",
+      "value": 1
+    }
+  ],
+  "indexes": [
+    {
+      "table": "sync_commands",
+      "name": "ix_sc_status_requested",
+      "columns": [
+        "status",
+        "requested_at",
+        "id"
+      ]
+    }
+  ]
+}
+---- JSON 終了 ----
+
+# ENV依存マトリクス
+機能トグルと必要ENVキーの関係を機械可読で定義する。生成・検査は本表を参照して動的試験の要否を判断する。
+
+```json
+{
+  "FEATURE_MAIL": ["SMTP_HOST","SMTP_PORT","SMTP_USER","SMTP_PASS"],
+  "FEATURE_STORAGE": ["STORAGE_DRIVER","STORAGE_BUCKET","STORAGE_REGION"],
+  "FEATURE_DB": ["DB_HOST","DB_NAME","DB_USER","DB_PASS","DB_PORT"],
+  "FEATURE_PROVIDER_MULTI_TENANT": ["TENANT_SALT"]
+}
+```
+
+- いずれかのトグルが `true` の場合、列挙キーは **必須** とみなす。
+- 必須キー不足は **生成のREJECT条件ではなく** `/tools/apply_env` の `missing_keys` に反映され、Phase D を **SKIP** する根拠となる。
