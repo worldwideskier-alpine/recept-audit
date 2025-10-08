@@ -1,15 +1,16 @@
-name: "Codex Generate"
+name: "Codex Generate (auto, ordered specs)"
 
 on:
+  push:
+    branches: ["**"]
+    paths: ["spec/**", "AGENTS.md"]
+  pull_request:
+    paths: ["spec/**", "AGENTS.md"]
   workflow_dispatch:
     inputs:
       model:
-        description: "使用するモデル名（未指定なら既定）"
+        description: "（任意）使用するモデル名（未指定＝既定）"
         required: false
-      mode:
-        description: "実行モード（既定: full / 選択肢: full, incremental）"
-        required: false
-        default: "full"
 
 permissions:
   contents: write
@@ -24,6 +25,12 @@ jobs:
     runs-on: "ubuntu-latest"
 
     env:
+      # ← 結合“優先順”を明示（実在ファイル名に合わせて自由に変更可）
+      #   例：日本語名にするなら
+      #   spec/生成仕様書.txt
+      #   spec/検査仕様書.txt
+      #   spec/環境仕様書.txt
+      #   spec/機能仕様書.txt
       SPEC_FILES: |
         spec/generation.txt
         spec/testing.txt
@@ -33,8 +40,7 @@ jobs:
     steps:
       - name: "Checkout"
         uses: "actions/checkout@v4"
-        with:
-          fetch-depth: 0
+        with: { fetch-depth: 0 }
 
       - name: "Set Git identity (CI)"
         shell: "bash"
@@ -44,78 +50,133 @@ jobs:
           git config --global user.name  "CI Bot"
           git config --global --add safe.directory "$GITHUB_WORKSPACE"
 
-      - name: "Build composite prompt"
+      - name: "Build composite prompt (ordered + wildcard append)"
+        id: "prompt"
         shell: "bash"
         run: |
           set -eu
-          mkdir -p ai
-          cat > ai/prompt.md <<'HEADER'
+          PROMPT_FILE="$RUNNER_TEMP/prompt.md"
+          INCLUDED="$RUNNER_TEMP/included.list"
+          : > "$PROMPT_FILE"; : > "$INCLUDED"
+
+          # 実装を即時完了させるための明示ルール
+          cat >> "$PROMPT_FILE" <<'PRELUDE'
           # TASK (実装を即実行)
           - Clarification（質問・保留）を行わず、仕様の不足は合理的に補完して実装を完了する。
           - 出力はパッチ（ファイルの追加/更新）で行い、説明文は不要。
-          - 生成先は `src/**`（アプリ本体） と `tests/**`（テスト）。必要に応じてルート直下の
-            `app.php`, `.htaccess`, `env-lite.php`, `health-lite.php`, `tools/`, `storage/`, `logs/`
-            も作成してよい。
-          - 1 回の実行でアプリとテスト一式を完成させること（mode が incremental でも同様）。
-          - 既存ファイルは安全に上書きする。ファイルが無ければ新規作成する。
-          - すべての生成物は Git にコミット可能なテキストとして出力する。
+          - 生成先: `src/**`（アプリ）、`tests/**`（テスト）。必要なら `app.php`, `.htaccess`,
+            `env-lite.php`, `health-lite.php`, `tools/`, `storage/`, `logs/` も作成してよい。
+          - 1 回の実行でアプリとテスト一式を完成させること。
+          - 既存は安全に上書き／無ければ新規作成。テキストのみ。
+          PRELUDE
 
-          # SPEC（以下に結合）
-          HEADER
+          # AGENTS.md（あれば先頭に）
+          if [ -f "AGENTS.md" ]; then
+            printf "\n\n---\n\n# AGENTS.md\n\n" >> "$PROMPT_FILE"
+            sed -e 's/\r$//' "AGENTS.md" >> "$PROMPT_FILE"
+          fi
 
+          # 1) 明示順（SPEC_FILES）で取り込む
+          CLEANED="$(printf "%s\n" "$SPEC_FILES" | sed -e 's/\r//g')"
           while IFS= read -r f; do
-            [ -f "$f" ] || continue
-            printf "\n\n---\n\n# %s\n\n" "$f" >> ai/prompt.md
-            cat "$f" >> ai/prompt.md
-          done <<< "$SPEC_FILES"
+            f="$(printf "%s" "$f" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+            [ -z "$f" ] && continue
+            if [ -f "$f" ]; then
+              printf "\n\n---\n\n# %s\n\n" "$f" >> "$PROMPT_FILE"
+              sed -e 's/\r$//' "$f" >> "$PROMPT_FILE"
+              echo "$f" >> "$INCLUDED"
+            fi
+          done <<< "$CLEANED"
+
+          # 2) SPEC_FILES に無い spec/*.txt をワイルドカードで“後ろに”追加
+          if ls -1 spec/*.txt >/dev/null 2>&1; then
+            while IFS= read -r f; do
+              if ! grep -Fxq "$f" "$INCLUDED"; then
+                printf "\n\n---\n\n# %s\n\n" "$f" >> "$PROMPT_FILE"
+                sed -e 's/\r$//' "$f" >> "$PROMPT_FILE"
+              fi
+            done < <(ls -1 spec/*.txt | sort)
+          else
+            echo "::warning::No spec/*.txt found."
+          fi
+
+          echo "file=$PROMPT_FILE" >> "$GITHUB_OUTPUT"
 
       - name: "Preflight: check OPENAI_API_KEY"
-        env:
-          OPENAI_API_KEY: "${{ secrets.OPENAI_API_KEY }}"
+        env: { OPENAI_API_KEY: "${{ secrets.OPENAI_API_KEY }}" }
         shell: "bash"
         run: |
           set -eu
-          if [ -z "${OPENAI_API_KEY:-}" ]; then
-            echo "::error::OPENAI_API_KEY missing"; exit 1
-          fi
+          [ -n "${OPENAI_API_KEY:-}" ] || { echo "::error::OPENAI_API_KEY missing"; exit 1; }
           echo "OPENAI_API_KEY present"
 
-      # 初回はゲート無効（安定後に有効化してOK）
-      # - name: "Gate diffs to allowed paths"
-      #   if: ${{ false }}
-      #   run: echo "skip gates"
-
-      - name: "Run Codex (workspace-write, chosen model)"
+      # 手動で model 指定があればそれを使用、無ければ既定
+      - name: "Run Codex (with model)"
+        if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.model }}
+        id: "codex_with_model"
         uses: "openai/codex-action@main"
+        env: { OPENAI_API_KEY: "${{ secrets.OPENAI_API_KEY }}" }
         with:
           openai-api-key: "${{ secrets.OPENAI_API_KEY }}"
-          prompt-file: "ai/prompt.md"
-          sandbox: "workspace-write"
+          prompt-file: "${{ steps.prompt.outputs.file }}"
           model: "${{ github.event.inputs.model }}"
-        env:
-          SPEC_FILES: "${{ env.SPEC_FILES }}"
-          EXEC_MODE: "${{ github.event.inputs.mode }}"
+          sandbox: "workspace-write"
 
-      - name: "Show diff summary"
+      - name: "Run Codex (default model)"
+        if: ${{ github.event_name != 'workflow_dispatch' || !github.event.inputs.model }}
+        id: "codex_default"
+        uses: "openai/codex-action@main"
+        env: { OPENAI_API_KEY: "${{ secrets.OPENAI_API_KEY }}" }
+        with:
+          openai-api-key: "${{ secrets.OPENAI_API_KEY }}"
+          prompt-file: "${{ steps.prompt.outputs.file }}"
+          sandbox: "workspace-write"
+
+      - name: "Discard workflow edits (safety)"
         shell: "bash"
         run: |
           set -eu
-          echo "---- git status ----"
-          git status --porcelain=v1 || true
-          echo "---- diff stat ----"
-          git diff --stat || true
+          if git status --porcelain | grep -E '^[AMDR].*\.github/workflows/'; then
+            echo "::warning::Discarding changes under .github/workflows/"
+            git checkout -- ".github/workflows" || true
+            git restore --staged ".github/workflows" || true
+          fi
 
-      - name: "Create Pull Request"
+      - name: "Detect changes"
+        id: "diff"
+        shell: "bash"
+        run: |
+          set -eu
+          if git diff --quiet; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "No changes."
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            echo "Changed files:"
+            git diff --name-only || true
+          fi
+
+      - name: "Choose token (PAT > GITHUB_TOKEN)"
+        id: "tok"
+        shell: "bash"
+        run: |
+          if [ -n "${{ secrets.GH_PAT_WORKFLOWS }}" ]; then
+            echo "val=${{ secrets.GH_PAT_WORKFLOWS }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "val=${{ github.token }}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: "Create Pull Request (only if changed)"
+        if: ${{ steps.diff.outputs.changed == 'true' }}
         uses: "peter-evans/create-pull-request@v7"
         with:
-          token: "${{ secrets.GH_PAT_WORKFLOWS || github.token }}"
-          title: "feat: generate app and tests (Codex)"
+          token: "${{ steps.tok.outputs.val }}"
+          title: "AI: apply ordered specs"
           body: |
-            Automated changes generated by Codex based on the combined specs.
-            Mode: `${{ github.event.inputs.mode || 'full' }}`
-            Model: `${{ github.event.inputs.model || 'default' }}`
-          commit-message: "chore(ai): apply Codex changes"
+            Automated changes by Codex.
+            Sources (ordered first, then others):
+            ${{ env.SPEC_FILES }}
+          commit-message: "chore(ai): apply Codex changes (ordered specs)"
           branch: "ai/codex/batch-${{ github.run_id }}"
+          base: "main"
           delete-branch: true
-          commit-options: "--allow-empty"
-          # add-paths は指定しない：変更されたものを丸ごとコミット
