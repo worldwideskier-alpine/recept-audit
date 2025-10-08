@@ -1,4 +1,4 @@
-name: "Codex Generate (gen+test common, env+func write-back)"
+name: "Codex Generate (gen+test common, env+func selected + write-back + deliverables)"
 
 on:
   push:
@@ -33,7 +33,8 @@ jobs:
     steps:
       - name: "Checkout"
         uses: "actions/checkout@v4"
-        with: { fetch-depth: 0 }
+        with:
+          fetch-depth: 0
 
       - name: "Set Git identity (CI)"
         shell: "bash"
@@ -102,7 +103,7 @@ jobs:
           echo "  environment: ${pick_env:-'(none)'}"
           echo "  functional:  ${pick_func:-'(none)'}"
 
-      - name: "Build composite prompt (with write-back policy)"
+      - name: "Build composite prompt (write-back + deliverables)"
         id: "prompt"
         shell: "bash"
         run: |
@@ -111,7 +112,7 @@ jobs:
           TODAY="$(date -u +%Y-%m-%d)"
           : > "$PROMPT_FILE"
 
-          # 実装方針 + 仕様書“書き戻し”ポリシーを明示
+          # 実装方針 + 仕様書“書き戻し”ポリシー + 成果物を明示
           cat >> "$PROMPT_FILE" <<PRELUDE
           # TASK（実装を即実行）
           - Clarification（質問・保留）を行わず、仕様の不足は合理的に補完して実装を完了する。
@@ -119,6 +120,17 @@ jobs:
           - 生成先: \`src/**\`（アプリ本体）、\`tests/**\`（テスト）。必要に応じて \`app.php\`, \`.htaccess\`,
             \`env-lite.php\`, \`health-lite.php\`, \`tools/\`, \`storage/\`, \`logs/\` も作成可。
           - 1 回の実行でアプリとテスト一式を完成させる。既存は安全に上書き、無ければ新規作成。
+
+          ## DELIVERABLES（必ず生成）
+          - app.php
+          - src/Kernel.php
+          - src/Routing.php
+          - src/Controllers/EnvLiteController.php
+          - env-lite.php
+          - health-lite.php
+          - tests/Feature/EnvLiteTest.php   # 期待JSON {"ok":true,"kind":"env-lite"} を検証
+          - ai/CHANGELOG_AI.md
+          - （必要に応じて）tools/**, storage/**, logs/**
 
           # SPEC WRITE-BACK POLICY（仕様書に書き戻す）
           - 共通化できるルール／非機能・生成規約・テスト戦略は **spec/generation.txt** と **spec/testing.txt** に書き戻す。
@@ -158,30 +170,36 @@ jobs:
           echo "file=$PROMPT_FILE" >> "$GITHUB_OUTPUT"
 
       - name: "Preflight: check OPENAI_API_KEY"
-        env: { OPENAI_API_KEY: "${{ secrets.OPENAI_API_KEY }}" }
+        env:
+          OPENAI_API_KEY: "${{ secrets.OPENAI_API_KEY }}"
         shell: "bash"
         run: |
           set -eu
-          [ -n "${OPENAI_API_KEY:-}" ] || { echo "::error::OPENAI_API_KEY missing"; exit 1; }
+          if [ -z "${OPENAI_API_KEY:-}" ]; then
+            echo "::error::OPENAI_API_KEY missing"; exit 1
+          fi
           echo "OPENAI_API_KEY present"
 
-      # 手動指定があればそのモデル、無ければ既定モデル
+      # 手動入力で model があればそれを使用
       - name: "Run Codex (with model)"
         if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.model }}
         id: "codex_with_model"
         uses: "openai/codex-action@main"
-        env: { OPENAI_API_KEY: "${{ secrets.OPENAI_API_KEY }}" }
+        env:
+          OPENAI_API_KEY: "${{ secrets.OPENAI_API_KEY }}"
         with:
           openai-api-key: "${{ secrets.OPENAI_API_KEY }}"
           prompt-file: "${{ steps.prompt.outputs.file }}"
           model: "${{ github.event.inputs.model }}"
           sandbox: "workspace-write"
 
+      # それ以外は既定モデルで実行
       - name: "Run Codex (default model)"
         if: ${{ github.event_name != 'workflow_dispatch' || !github.event.inputs.model }}
         id: "codex_default"
         uses: "openai/codex-action@main"
-        env: { OPENAI_API_KEY: "${{ secrets.OPENAI_API_KEY }}" }
+        env:
+          OPENAI_API_KEY: "${{ secrets.OPENAI_API_KEY }}"
         with:
           openai-api-key: "${{ secrets.OPENAI_API_KEY }}"
           prompt-file: "${{ steps.prompt.outputs.file }}"
@@ -226,7 +244,7 @@ jobs:
         uses: "peter-evans/create-pull-request@v7"
         with:
           token: "${{ steps.tok.outputs.val }}"
-          title: "AI: apply specs (write-back: common→gen/test, specific→env/func)"
+          title: "AI: code + spec write-back (gen/test common, env/func selected)"
           body: |
             Automated changes by Codex.
 
@@ -238,8 +256,8 @@ jobs:
             - env:  ${{ steps.resolve.outputs.env || '(none)' }}
             - func: ${{ steps.resolve.outputs.func || '(none)' }}
 
-            This PR includes code updates and spec write-back (AI Amendments).
-          commit-message: "chore(ai): code + spec write-back (gen/test common, env/func specific)"
+            Includes code generation and spec write-back (AI Amendments).
+          commit-message: "chore(ai): code + spec write-back (common+selected)"
           branch: "ai/codex/batch-${{ github.run_id }}"
           base: "main"
           delete-branch: true
