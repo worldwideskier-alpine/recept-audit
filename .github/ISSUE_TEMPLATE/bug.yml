@@ -1,0 +1,46 @@
+name: "🐞 Bug"
+description: "バグ報告（最小フォーム）"
+title: "[Bug] /env-lite が期待 JSON を返さない"
+labels: ["bug"]
+
+body:
+  - type: input
+    id: endpoint
+    attributes:
+      label: "対象エンドポイント"
+      value: "/medical/recept_audit/env-lite"
+    validations: { required: true }
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: "再現手順"
+      value: |
+        1) 次を実行
+           curl -sS https://beautifulsnow.co.jp/medical/recept_audit/env-lite
+    validations: { required: true }
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: "実際の結果"
+      value: |
+        {"ok":false,"error":"not_found"}
+    validations: { required: true }
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: "期待する結果"
+      value: |
+        HTTP 200
+        {"ok":true,"kind":"env-lite"}
+    validations: { required: true }
+
+  - type: textarea
+    id: done
+    attributes:
+      label: "受け入れ条件（Done）"
+      value: |
+        - 200で上記の**完全一致**JSON `{"ok":true,"kind":"env-lite"}` を返す
+        - 必要なら tests/ に1件追加（GET /env-lite の検証）
