@@ -6,6 +6,13 @@ on:
       model:
         description: "（任意）使用するモデル名（未指定なら既定）"
         required: false
+        default: "GPT-5-Codex"
+  push:
+    branches: ["main"]
+    paths:
+      - "spec/**"
+      - "AGENTS.md"
+      - ".github/workflows/codex.yml"
 
 permissions:
   contents: write
@@ -19,14 +26,22 @@ jobs:
   codex:
     runs-on: "ubuntu-latest"
 
+    env:
+      # ── 読み込む仕様書ファイル（存在するものだけ取り込まれます）
+      SPEC_FILES: |
+        spec/generation.txt
+        spec/testing.txt
+        spec/environment.txt
+        spec/functional.txt
+
     steps:
       - name: "Checkout"
         uses: "actions/checkout@v4"
 
-      - name: "Set up git identity"
+      - name: "Git identity (CI)"
         shell: "bash"
         run: |
-          set -euo pipefail
+          set -eu
           git config --global user.email "ci-bot@example.invalid"
           git config --global user.name  "CI Bot"
           git config --global --add safe.directory "$GITHUB_WORKSPACE"
@@ -34,48 +49,50 @@ jobs:
       - name: "Build composite prompt"
         shell: "bash"
         run: |
-          set -euo pipefail
-          mkdir -p "ai"
-          {
-            echo "# Project specification (composite)"
-            if [ -f "AGENTS.md" ]; then
-              echo
-              echo "## AGENTS.md"
-              cat "AGENTS.md"
+          set -eu
+          mkdir -p "ai" "spec" "tools" "logs" || true
+          : > "ai/prompt.md"
+
+          if [ -f "AGENTS.md" ]; then
+            printf "# AGENTS.md（方針）\n\n" >> "ai/prompt.md"
+            cat "AGENTS.md" >> "ai/prompt.md"
+            printf "\n\n---\n\n" >> "ai/prompt.md"
+          fi
+
+          echo "::group::Collect spec files"
+          CLEANED="$(printf "%s\n" "$SPEC_FILES" | sed -e 's/\r//g')"
+          while IFS= read -r f; do
+            f="$(printf "%s" "$f" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+            [ -z "$f" ] && continue
+            if [ -f "$f" ]; then
+              echo "Including: $f"
+              printf "# %s\n\n" "$f" >> "ai/prompt.md"
+              cat "$f" >> "ai/prompt.md"
+              printf "\n\n---\n\n" >> "ai/prompt.md"
+            else
+              echo "Skip (not found): $f"
             fi
-            for f in \
-              "spec/generation.txt" \
-              "spec/testing.txt" \
-              "spec/environment.txt" \
-              "spec/functional.txt"
-            do
-              if [ -f "$f" ]; then
-                echo
-                echo "## $f"
-                cat "$f"
-              else
-                echo
-                echo "## $f"
-                echo "(missing)"
-              fi
-            done
-          } > "ai/prompt.md"
+          done <<< "$CLEANED"
+          echo "::endgroup::"
+
+          if [ ! -s "ai/prompt.md" ]; then
+            echo "::warning::No spec/AGENTS.md found. Prompt is empty; Codex may produce no changes."
+          fi
 
       - name: "Preflight: check OPENAI_API_KEY"
         env:
           OPENAI_API_KEY: "${{ secrets.OPENAI_API_KEY }}"
         shell: "bash"
         run: |
-          set -euo pipefail
+          set -eu
           if [ -z "${OPENAI_API_KEY:-}" ]; then
-            echo "::error::OPENAI_API_KEY is missing in repository secrets"; exit 1
+            echo "::error::OPENAI_API_KEY secret is missing"
+            exit 1
           fi
           echo "OPENAI_API_KEY present"
 
-      # モデル指定あり
-      - name: "Run Codex (workspace-write, with model)"
-        if: "${{ github.event.inputs.model != '' }}"
-        id: "codex_with_model"
+      - name: "Run Codex (workspace-write, chosen model)"
+        id: "codex"
         uses: "openai/codex-action@main"
         env:
           OPENAI_API_KEY: "${{ secrets.OPENAI_API_KEY }}"
@@ -85,51 +102,39 @@ jobs:
           model: "${{ github.event.inputs.model }}"
           sandbox: "workspace-write"
 
-      # モデル指定なし（既定モデル）
-      - name: "Run Codex (workspace-write, default model)"
-        if: "${{ github.event.inputs.model == '' }}"
-        id: "codex"
-        uses: "openai/codex-action@main"
-        env:
-          OPENAI_API_KEY: "${{ secrets.OPENAI_API_KEY }}"
-        with:
-          openai-api-key: "${{ secrets.OPENAI_API_KEY }}"
-          prompt-file: "ai/prompt.md"
-          sandbox: "workspace-write"
-
-      - name: "Guard: drop workflow changes (.github/workflows)"
+      - name: "Show diff summary"
         shell: "bash"
         run: |
-          set -euo pipefail
-          if git status --porcelain | grep -E '^\s?[AMDR].*\.github/workflows/' >/dev/null 2>&1; then
-            echo "::warning::Discarding changes under .github/workflows"
-            git checkout -- ".github/workflows" || true
-            git restore --staged ".github/workflows" || true
+          set -eu
+          echo "=== git status ========================="
+          git status --porcelain=v1 || true
+          echo "=== git diff (stat) ===================="
+          git diff --stat || true
+
+      - name: "Guard: reject workflow edits"
+        shell: "bash"
+        run: |
+          set -eu
+          if git status --porcelain | grep -E '^[AMDR].*\.github/workflows/'; then
+            echo "::error::Changes to .github/workflows/ detected; refusing to create PR."
+            git status --porcelain | grep -E '^[AMDR].*\.github/workflows/' || true
+            exit 1
           fi
-
-      - name: "Collect Codex message"
-        id: "collect"
-        shell: "bash"
-        run: |
-          set -euo pipefail
-          MSG="${{ steps.codex.outputs['final-message'] }}"
-          if [ -z "$MSG" ]; then MSG="${{ steps.codex_with_model.outputs['final-message'] }}"; fi
-          {
-            echo "msg<<EOF"
-            echo "${MSG:-'(no message)'}"
-            echo "EOF"
-          } >> "$GITHUB_OUTPUT"
 
       - name: "Create Pull Request"
         uses: "peter-evans/create-pull-request@v7"
         with:
-          token: "${{ secrets.GITHUB_TOKEN }}"
-          title: "AI: Codex updates (full spec)"
+          title: "AI: Codex updates (AGENTS + specs)"
           body: |
             Automated changes generated by Codex from a composite prompt.
 
-            Final message:
-            ${{ steps.collect.outputs.msg }}
-          commit-message: "chore(ai): apply Codex changes (composite prompt)"
+            Sources included:
+            - AGENTS.md (if present)
+            - Below SPEC_FILES (existing only):
+            ${{ env.SPEC_FILES }}
+
+            Model:
+            - ${{ github.event.inputs.model }}
+          commit-message: "chore(ai): apply Codex changes"
           branch: "ai/codex/batch-${{ github.run_id }}"
           base: "main"
