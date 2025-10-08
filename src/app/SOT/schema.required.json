@@ -1,0 +1,42 @@
+{
+    "version": "1.1",
+    "tables": [
+        "tenants",
+        "users",
+        "departments",
+        "provider_rules",
+        "patients",
+        "claims",
+        "claim_items",
+        "audit_rules",
+        "tenant_rule_overrides",
+        "sync_commands",
+        "rules_sync_state",
+        "sync_runner_state",
+        "import_runs",
+        "job_runs"
+    ],
+    "fixed_rows": [
+        {
+            "table": "rules_sync_state",
+            "pk": "id",
+            "value": 1
+        },
+        {
+            "table": "sync_runner_state",
+            "pk": "id",
+            "value": 1
+        }
+    ],
+    "indexes": [
+        {
+            "table": "sync_commands",
+            "name": "ix_sc_status_requested",
+            "columns": [
+                "status",
+                "requested_at",
+                "id"
+            ]
+        }
+    ]
+}
