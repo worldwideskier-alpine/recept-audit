@@ -4,15 +4,12 @@ on:
   workflow_dispatch:
     inputs:
       model:
-        description: "（任意）使用するモデル名（未指定なら既定）"
+        description: "使用するモデル名（未指定なら既定）"
         required: false
-        default: "GPT-5-Codex"
-  push:
-    branches: ["main"]
-    paths:
-      - "spec/**"
-      - "AGENTS.md"
-      - ".github/workflows/codex.yml"
+      mode:
+        description: "実行モード（既定: full / 選択肢: full, incremental）"
+        required: false
+        default: "full"
 
 permissions:
   contents: write
@@ -27,7 +24,7 @@ jobs:
     runs-on: "ubuntu-latest"
 
     env:
-      # ── 読み込む仕様書ファイル（存在するものだけ取り込まれます）
+      # 仕様書の場所（存在するものだけ連結されます）
       SPEC_FILES: |
         spec/generation.txt
         spec/testing.txt
@@ -37,8 +34,10 @@ jobs:
     steps:
       - name: "Checkout"
         uses: "actions/checkout@v4"
+        with:
+          fetch-depth: 0
 
-      - name: "Git identity (CI)"
+      - name: "Set Git identity (CI)"
         shell: "bash"
         run: |
           set -eu
@@ -46,38 +45,32 @@ jobs:
           git config --global user.name  "CI Bot"
           git config --global --add safe.directory "$GITHUB_WORKSPACE"
 
+      # A) Clarificationを封じ、生成先と完了条件を明示したヘッダを差し込む
       - name: "Build composite prompt"
         shell: "bash"
         run: |
           set -eu
-          mkdir -p "ai" "spec" "tools" "logs" || true
-          : > "ai/prompt.md"
+          mkdir -p ai
+          cat > ai/prompt.md <<'HEADER'
+          # TASK (実装を即実行)
+          - Clarification（質問・保留）を行わず、仕様の不足は合理的に補完して実装を完了する。
+          - 出力はパッチ（ファイルの追加/更新）で行い、説明文は不要。
+          - 生成先は `src/**`（アプリ本体） と `tests/**`（テスト）。必要に応じてルート直下の
+            `app.php`, `.htaccess`, `env-lite.php`, `health-lite.php`, `tools/`, `storage/`, `logs/`
+            も作成してよい。
+          - 1 回の実行でアプリとテスト一式を完成させること（mode が incremental でも同様）。
+          - 既存ファイルは安全に上書きする。ファイルが無ければ新規作成する。
+          - すべての生成物は Git にコミット可能なテキストとして出力する。
 
-          if [ -f "AGENTS.md" ]; then
-            printf "# AGENTS.md（方針）\n\n" >> "ai/prompt.md"
-            cat "AGENTS.md" >> "ai/prompt.md"
-            printf "\n\n---\n\n" >> "ai/prompt.md"
-          fi
+          # SPEC（以下に結合）
+          HEADER
 
-          echo "::group::Collect spec files"
-          CLEANED="$(printf "%s\n" "$SPEC_FILES" | sed -e 's/\r//g')"
+          # 仕様書を順に連結（存在チェック付き）
           while IFS= read -r f; do
-            f="$(printf "%s" "$f" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
-            [ -z "$f" ] && continue
-            if [ -f "$f" ]; then
-              echo "Including: $f"
-              printf "# %s\n\n" "$f" >> "ai/prompt.md"
-              cat "$f" >> "ai/prompt.md"
-              printf "\n\n---\n\n" >> "ai/prompt.md"
-            else
-              echo "Skip (not found): $f"
-            fi
-          done <<< "$CLEANED"
-          echo "::endgroup::"
-
-          if [ ! -s "ai/prompt.md" ]; then
-            echo "::warning::No spec/AGENTS.md found. Prompt is empty; Codex may produce no changes."
-          fi
+            [ -f "$f" ] || continue
+            printf "\n\n---\n\n# %s\n\n" "$f" >> ai/prompt.md
+            cat "$f" >> ai/prompt.md
+          done <<< "$SPEC_FILES"
 
       - name: "Preflight: check OPENAI_API_KEY"
         env:
@@ -86,55 +79,65 @@ jobs:
         run: |
           set -eu
           if [ -z "${OPENAI_API_KEY:-}" ]; then
-            echo "::error::OPENAI_API_KEY secret is missing"
-            exit 1
+            echo "::error::OPENAI_API_KEY missing"; exit 1
           fi
           echo "OPENAI_API_KEY present"
 
+      # B/C) 初回生成はゲートや「差分なし失敗」を無効化（安定後に有効化を推奨）
+      # - name: "Gate diffs to allowed paths"
+      #   if: ${{ false }}
+      #   run: echo "skip gates"
+
       - name: "Run Codex (workspace-write, chosen model)"
-        id: "codex"
         uses: "openai/codex-action@main"
-        env:
-          OPENAI_API_KEY: "${{ secrets.OPENAI_API_KEY }}"
         with:
           openai-api-key: "${{ secrets.OPENAI_API_KEY }}"
           prompt-file: "ai/prompt.md"
-          model: "${{ github.event.inputs.model }}"
           sandbox: "workspace-write"
+          # 指定があればそれを使い、無ければ既定（例: o3-mini / gpt-4.1-mini など）に任せる
+          model: "${{ github.event.inputs.model }}"
+          # モードもプロンプトに渡すため env として宣言（任意）
+        env:
+          SPEC_FILES: "${{ env.SPEC_FILES }}"
+          EXEC_MODE: "${{ github.event.inputs.mode }}"
 
       - name: "Show diff summary"
         shell: "bash"
         run: |
           set -eu
-          echo "=== git status ========================="
+          echo "---- git status ----"
           git status --porcelain=v1 || true
-          echo "=== git diff (stat) ===================="
+          echo "---- diff stat ----"
           git diff --stat || true
 
-      - name: "Guard: reject workflow edits"
-        shell: "bash"
-        run: |
-          set -eu
-          if git status --porcelain | grep -E '^[AMDR].*\.github/workflows/'; then
-            echo "::error::Changes to .github/workflows/ detected; refusing to create PR."
-            git status --porcelain | grep -E '^[AMDR].*\.github/workflows/' || true
-            exit 1
-          fi
+      # - name: "Fail if no changes (print last message)"
+      #   if: ${{ false }}
+      #   shell: "bash"
+      #   run: |
+      #     set -eu
+      #     if [ -z "$(git status --porcelain)" ]; then
+      #       echo "::error::No changes produced"; exit 1
+      #     fi
 
       - name: "Create Pull Request"
         uses: "peter-evans/create-pull-request@v7"
         with:
-          title: "AI: Codex updates (AGENTS + specs)"
+          token: "${{ secrets.GH_PAT_WORKFLOWS || github.token }}"
+          title: "feat: generate app and tests (Codex)"
           body: |
-            Automated changes generated by Codex from a composite prompt.
-
-            Sources included:
-            - AGENTS.md (if present)
-            - Below SPEC_FILES (existing only):
-            ${{ env.SPEC_FILES }}
-
-            Model:
-            - ${{ github.event.inputs.model }}
+            Automated changes generated by Codex based on the combined specs.
+            Mode: `${{ github.event.inputs.mode || 'full' }}`  
+            Model: `${{ github.event.inputs.model || 'default' }}`
           commit-message: "chore(ai): apply Codex changes"
           branch: "ai/codex/batch-${{ github.run_id }}"
-          base: "main"
+          delete-branch: true
+          add-paths: |
+            src/**
+            tests/**
+            app.php
+            .htaccess
+            env-lite.php
+            health-lite.php
+            tools/**
+            storage/**
+            logs/**
