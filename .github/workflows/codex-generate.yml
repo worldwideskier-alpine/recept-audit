@@ -1,19 +1,23 @@
-# .github/workflows/codex-generate.yml
-name: Codex Generate (worker)
+name: Codex Generate (spec-driven / or protect-only)
 
 on:
   workflow_call:
     inputs:
       mode:
-        description: "実行モード: full(完全生成) / incremental(差分)"
-        required: false
+        description: "実行モード: full(完全再生成) / incremental(差分)"
         type: string
         default: "full"
-      model:
-        description: "OpenAI モデル名（未指定なら既定）"
         required: false
+      model:
+        description: "OpenAI モデル名（未指定はワークフロー既定）"
         type: string
         default: ""
+        required: false
+      allow_strategy:
+        description: "allowlist の作り方: functional(既定) / protect"
+        type: string
+        default: "functional"
+        required: false
     secrets:
       OPENAI_API_KEY:
         required: true
@@ -25,20 +29,10 @@ permissions:
   pull-requests: write
 
 env:
-  # 仕様書（必要に応じて調整してください）
   SPEC_FILES: "spec/generation.txt spec/testing.txt spec/environment.txt spec/functional.txt"
-  # 生成対象のパス（PR の add-paths にも使います）
-  ALLOWED_GLOBS: |
-    src/**
-    tests/**
-    tools/**
-    storage/**
-    logs/**
-    app.php
-    env-lite.php
-    health-lite.php
-    .htaccess
-    ai/**
+  FUNCTIONAL_SPEC: "spec/functional.txt"
+  ALLOWLIST_FILE: "ai/allowlist.txt"
+  PROTECT_GLOBS: ".github/** spec/** ai/** .git/**"
 
 jobs:
   generate:
@@ -50,13 +44,13 @@ jobs:
         with:
           fetch-depth: 0
 
-      # ★ A案：キャッシュ指定を削除（ロックファイルが無い環境でも失敗しない）
       - name: Setup Node
         uses: actions/setup-node@v4
         with:
           node-version: "20"
+          cache: "none"
 
-      - name: Preflight - OPENAI_API_KEY
+      - name: Preflight - API key
         shell: bash
         run: |
           if [ -z "${{ secrets.OPENAI_API_KEY }}" ]; then
@@ -64,21 +58,112 @@ jobs:
             exit 1
           fi
 
-      - name: Make prompt directory
+      # ===== allowlist 構築 =====
+      - name: Build allowlist (functional or protect)
+        id: allow
         shell: bash
         run: |
+          set -euo pipefail
           mkdir -p ai
-          # 既存の ai/prompt.md があれば優先。なければ SPEC から合成。
-          if [ ! -f ai/prompt.md ]; then
-            echo "# Spec prompt (auto generated)" > ai/prompt.md
-            for f in $SPEC_FILES; do
-              if [ -f "$f" ]; then
-                echo -e "\n---\n# $f\n" >> ai/prompt.md
-                cat "$f" >> ai/prompt.md
-              fi
+          : > "${ALLOWLIST_FILE}"
+
+          if [ "${{ inputs.allow_strategy }}" = "protect" ]; then
+            # 保護ディレクトリを除き、全域を対象（実際のステージングで保護分を外す）
+            # allowlist はログ用にルートを一つ入れておくだけ
+            echo "** (protected: ${PROTECT_GLOBS})" > "${ALLOWLIST_FILE}"
+          else
+            f="${FUNCTIONAL_SPEC}"
+            # 1) ```paths フェンスを抽出
+            if [ -f "$f" ]; then
+              awk 'BEGIN{inblk=0} /^```paths[[:space:]]*$/{inblk=1;next} /^```[[:space:]]*$/{if(inblk){inblk=0;next}} {if(inblk)print}' "$f" >> "${ALLOWLIST_FILE}" || true
+              # 2) path/file/dir 系行から抽出（和文表記にも対応）
+              sed -nE 's/^[[:space:]]*(- )?(path|file|dir|directory|パス|ファイル|ディレクトリ)[[:space:]]*[:：][[:space:]]*//p' "$f" >> "${ALLOWLIST_FILE}" || true
+              # 3) .php 明記を拾ってディレクトリ化
+              grep -Eo '([A-Za-z0-9_./-]+\.php)\b' "$f" | sed 's|^\./||' >> ai/_functional_files.txt || true
+            fi
+
+            # 3 の dirname/** 化
+            if [ -s ai/_functional_files.txt ]; then
+              while IFS= read -r p; do
+                d=$(dirname "$p")
+                [ "$d" = "." ] && continue
+                echo "${d}/**" >> "${ALLOWLIST_FILE}"
+              done < ai/_functional_files.txt
+            fi
+
+            # 代表的トップレベル（明記されていなくても生成対象に）
+            for ftop in "app.php" "env-lite.php" "health-lite.php" ".htaccess"; do
+              echo "$ftop" >> "${ALLOWLIST_FILE}"
             done
+
+            # 整理
+            sed -e 's/#.*$//' -e 's/^[[:space:]]*//' -e '/^$/d' "${ALLOWLIST_FILE}" | sort -u > "${ALLOWLIST_FILE}.tmp"
+            mv "${ALLOWLIST_FILE}.tmp" "${ALLOWLIST_FILE}"
+
+            # フェールセーフ
+            if [ ! -s "${ALLOWLIST_FILE}" ]; then
+              echo "src/**"   >> "${ALLOWLIST_FILE}"
+              echo "tests/**" >> "${ALLOWLIST_FILE}"
+            fi
           fi
 
+          echo "----- ALLOWLIST -----"
+          cat "${ALLOWLIST_FILE}"
+
+      # ===== full の掃除 =====
+      - name: Clean (full mode)
+        if: ${{ inputs.mode == 'full' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "${{ inputs.allow_strategy }}" = "protect" ]; then
+            # 保護以外は tracked を一掃
+            git ls-files | grep -Ev '^(\.github/|spec/|ai/|\.git/)' | xargs -r git rm -f
+            # ワークツリーの非追跡ファイルも掃除（保護配下は除く）
+            find . -mindepth 1 -maxdepth 1 -not -path "./.github" -not -path "./spec" -not -path "./ai" -not -path "./.git" -exec rm -rf {} +
+          else
+            # allowlist に含まれるパスだけを対象に掃除
+            while IFS= read -r p; do
+              [ -z "$p" ] && continue
+              case "$p" in ai/**|spec/**|.github/**) continue ;; esac
+              git rm -r -f --ignore-unmatch $p 2>/dev/null || true
+              rm -rf $p || true
+            done < "${ALLOWLIST_FILE}"
+          fi
+
+      # ===== プロンプト組み立て =====
+      - name: Build prompt from specs
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p ai
+          {
+            echo "# Codex generation prompt"
+            echo
+            echo "- MODE: ${{ inputs.mode }}"
+            echo "- ALLOW_STRATEGY: ${{ inputs.allow_strategy }}"
+            echo
+            for f in $SPEC_FILES; do
+              if [ -f "$f" ]; then
+                echo
+                echo "---"
+                echo "# $(basename "$f")"
+                cat "$f"
+              fi
+            done
+            echo
+            echo "---"
+            echo "# Authoring rules"
+            cat <<'EOS'
+- 仕様書から導いた許可パスの範囲で、必要なディレクトリ／ファイルをすべて新規作成・更新する。
+- PHP の require / require_once / include の参照先は、実装ファイルを必ず生成する（ダミー不可）。
+- `spec/**`, `.github/**`, `ai/**` は変更しない（ログや補助スクリプトの追記は ai/** のみ可）。
+- ルートに app.php / env-lite.php / health-lite.php / .htaccess が必要なら生成・更新する。
+- UTF-8 LF。Composer 不要。安全に上書きできる最小差分で。
+EOS
+          } > ai/prompt.md
+
+      # ===== Codex 実行 =====
       - name: Run Codex
         uses: openai/codex-action@main
         with:
@@ -92,7 +177,7 @@ jobs:
         run: |
           echo "=== git status ==="
           git status --porcelain=v1 || true
-          echo "=== git diff (stat) ==="
+          echo "=== diff (stat) ==="
           git diff --stat || true
 
       - name: Configure git author
@@ -101,34 +186,43 @@ jobs:
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git config user.name  "github-actions[bot]"
 
-      - name: Stage allowed paths
+      # ===== ステージング：allow_strategy によって分岐 =====
+      - name: Stage changes (functional allowlist)
+        if: ${{ inputs.allow_strategy != 'protect' }}
         shell: bash
         run: |
-          # ALLOWED_GLOBS を行単位で解釈して add
+          set -euo pipefail
           while IFS= read -r p; do
             [ -z "$p" ] && continue
             git add $p 2>/dev/null || true
-          done <<< "${ALLOWED_GLOBS}"
+          done < "${ALLOWLIST_FILE}"
+          # 念のため保護系を外す
+          git reset -q spec || true
+          git reset -q .github || true
+          git reset -q ai/prompt.md || true
 
+      - name: Stage changes (protect only)
+        if: ${{ inputs.allow_strategy == 'protect' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          git add -A
+          for g in $PROTECT_GLOBS; do
+            # 既存・新規とも保護配下はステージから外す
+            git reset -q $g || true
+          done
+          git reset -q ai/prompt.md || true
+
+      # ===== PR =====
       - name: Create Pull Request
         uses: peter-evans/create-pull-request@v7
         with:
           token: "${{ secrets.GH_PAT_WORKFLOWS || github.token }}"
           branch: "ai/codex/batch-${{ github.run_id }}"
-          title: "AI: generate code (mode=${{ inputs.mode }})"
+          title: "AI: ${{ inputs.mode }} generation (${% raw %}{{% endraw %}} inputs.allow_strategy ${% raw %}}}{% endraw %})"
           body: |
-            Automated changes generated by Codex.
+            Automated generation by Codex.
             - mode: `${{ inputs.mode }}`
+            - allow_strategy: `${{ inputs.allow_strategy }}`
             - model: `${{ inputs.model }}`
-          add-paths: |
-            src/**
-            tests/**
-            tools/**
-            storage/**
-            logs/**
-            app.php
-            env-lite.php
-            health-lite.php
-            .htaccess
-            ai/**
           signoff: true
