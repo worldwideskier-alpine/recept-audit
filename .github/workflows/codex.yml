@@ -2,24 +2,30 @@ name: "Codex Generate (dispatcher)"
 
 on:
   push:
-    branches: ["**"]
-    paths: ["spec/**", "AGENTS.md"]
+    branches: ["main"]
+    paths:
+      - "spec/**"
+      - "AGENTS.md"
+      - ".github/workflows/codex.yml"
+      - "ai/prompt.md"
   workflow_dispatch:
     inputs:
       mode:
-        description: "実行モード: full(再生成) / incremental(差分)"
+        description: "実行モード: full(全集成) / incremental(差分)"
         required: false
         default: "full"
+        type: string
       model:
-        description: "（任意）OpenAIモデル名"
+        description: "OpenAIモデル名（空欄可）"
         required: false
         default: ""
+        type: string
 
 jobs:
-  call-generate:
-    # ← 先頭に './' を付けてローカルの再利用WFを参照
+  generate:
     uses: ./.github/workflows/codex-generate.yml
-    secrets: inherit
+    secrets:
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
     with:
-      mode: "${{ github.event.inputs.mode || 'full' }}"
-      model: "${{ github.event.inputs.model || '' }}"
+      mode:  ${{ inputs.mode  || 'full' }}
+      model: ${{ inputs.model || '' }}
