@@ -5,30 +5,29 @@ on:
     inputs:
       mode:
         description: "実行モード: full（全生成） / incremental（差分）"
-        type: string
         required: false
         default: "full"
+        type: string
       model:
         description: "OpenAI モデル名（任意）"
-        type: string
         required: false
         default: ""
+        type: string
     secrets:
       OPENAI_API_KEY:
         required: true
-
   workflow_dispatch:
     inputs:
       mode:
         description: "実行モード: full（全生成） / incremental（差分）"
-        type: string
         required: false
         default: "full"
+        type: string
       model:
         description: "OpenAI モデル名（任意）"
-        type: string
         required: false
         default: ""
+        type: string
 
 permissions:
   contents: write
@@ -38,203 +37,146 @@ jobs:
   generate:
     name: "generate"
     runs-on: "ubuntu-latest"
+
     env:
-      OPENAI_API_KEY: "${{ secrets.OPENAI_API_KEY }}"
-      MODE: "${{ inputs.mode }}"
-      MODEL: "${{ inputs.model }}"
-      # 生成物として許可するパス（必要に応じて調整）
-      GENERATED_PATHS: |
-        src/**
-        tests/**
-        tools/**
-        public/**
-        storage/**
-        logs/**
-        app.php
-        env-lite.php
-        health-lite.php
-        .htaccess
+      SPEC_GROUPS: "foundation env-profiles features tests"
+      PROMPT_FILE: "ai/prompt.md"
+      BRANCH_PREFIX: "ai/codex/batch-"
+      PROTECT_GLOBS: "^spec/|^\\.github/"
 
     steps:
       - name: "Checkout"
-        uses: actions/checkout@v4
+        uses: "actions/checkout@v4"
 
-      # full のときのみ、生成対象を掃除（存在すれば削除）
-      - name: "Clean generated targets (full)"
-        if: "${{ env.MODE == 'full' }}"
-        shell: bash
+      - name: "Setup Node (for actions runtime)"
+        uses: "actions/setup-node@v4"
+        with:
+          node-version: "20"
+
+      - name: "Preflight - API key"
+        shell: "bash"
         run: |
           set -euo pipefail
-          to_clean=( "src" "tests" "tools" "public" "storage" "logs" "app.php" "env-lite.php" "health-lite.php" ".htaccess" )
-          for p in "${to_clean[@]}"; do
-            if [ -e "$p" ] || [ -L "$p" ]; then
-              git rm -r --ignore-unmatch -f "$p" || true
-              rm -rf "$p"
-            fi
-          done
+          if [ -z "${{ secrets.OPENAI_API_KEY }}" ]; then
+            echo "::error::OPENAI_API_KEY is missing"; exit 1;
+          fi
 
-      # 仕様を結合して一時領域にプロンプト作成
       - name: "Compose prompt from spec/"
-        id: prompt
-        shell: bash
+        id: "prompt"
+        shell: "bash"
         run: |
           set -euo pipefail
-          PROMPT="${RUNNER_TEMP}/prompt.md"
-          : > "$PROMPT"
+          mkdir -p "$(dirname "${PROMPT_FILE}")"
+          PROMPT="${PROMPT_FILE}"
+          : > "${PROMPT}"
 
           collect() {
             local group="$1"
+            # md / txt / yaml(yml) / json を対象、安定ソート
             find "spec/${group}" -type f \
               \( -name "*.md" -o -name "*.txt" -o -name "*.yaml" -o -name "*.yml" -o -name "*.json" \) \
               -print 2>/dev/null | LC_ALL=C sort || true
           }
-          add() {
+          add_file() {
             local f="$1"
-            printf "\n\n<!-- file: %s -->\n\n" "$f" >> "$PROMPT"
-            cat "$f" >> "$PROMPT"
-            printf "\n" >> "$PROMPT"
+            printf '\n\n<!-- file: %s -->\n\n' "$f" >> "${PROMPT}"
+            cat "$f" >> "${PROMPT}"
+            printf '\n' >> "${PROMPT}"
           }
 
           have=0
-          for g in foundation env-profiles features tests; do
+          for g in ${SPEC_GROUPS}; do
             while IFS= read -r f; do
-              [ -n "$f" ] && [ -f "$f" ] && add "$f" && have=1
+              [ -n "$f" ] && [ -f "$f" ] && add_file "$f" && have=1
             done < <(collect "$g")
           done
 
-          # 著述ルールを末尾に添える（分析ではなく実ファイルを書かせる）
-          cat >> "$PROMPT" <<'RULES'
+          # 末尾にルールを追記（heredoc不要、printfのみ）
+          {
+            printf '%s\n' '<!-- authoring-rules -->'
+            printf '%s\n' 'You are operating in a repository workspace with write tools enabled.'
+            printf '%s\n' 'Do not output long analysis. Create/overwrite files directly in the allowed paths.'
+            printf '%s\n' 'If a directory or file is missing, create it; write fully working PHP code and tests.'
+            printf '%s\n' 'All generated code must pass within `tests/`. Keep spec files under `spec/` untouched.'
+            printf '%s\n' 'Prefer creating minimal working scaffolds over skipping ambiguous pieces.'
+            printf '%s\n' '<!-- /authoring-rules -->'
+          } >> "${PROMPT}"
 
-<!-- authoring-rules -->
-You are operating in a repository workspace with write tools enabled.
-Do not output long analysis. Create/overwrite files directly in the allowed paths.
-If a directory or file is missing, create it. Write fully working PHP code and tests.
-All generated code must pass within `tests/`. Keep specs under `spec/` untouched.
-When in doubt, prefer creating minimal working scaffolds over skipping.
-<!-- /authoring-rules -->
+          if [ "${have}" -eq 0 ]; then
+            echo "::error::No spec files found under spec/{${SPEC_GROUPS// /, }}" ; exit 1;
+          fi
 
-RULES
+          echo "prompt_path=${PROMPT}" >> "${GITHUB_OUTPUT}"
 
-          if [ "$have" -eq 0 ]; then
-            echo "::error::No spec files found under spec/{foundation,env-profiles,features,tests}"
+      - name: "Run Codex"
+        id: "codex"
+        uses: "openai/codex-action@main"
+        with:
+          openai-api-key: "${{ secrets.OPENAI_API_KEY }}"
+          prompt-file: "${{ steps.prompt.outputs.prompt_path }}"
+          model: "${{ inputs.model || '' }}"
+          sandbox: "workspace-write"
+        # 生成に失敗したらそこで止める
+        continue-on-error: false
+
+      - name: "Show diff summary"
+        id: "diff"
+        shell: "bash"
+        run: |
+          set -euo pipefail
+          echo "::group::git status"
+          git status --porcelain=v1
+          echo "::endgroup::"
+          echo "::group::git diff stat"
+          git diff --stat || true
+          echo "::endgroup::"
+
+          CHANGED="false"
+          if ! git diff --quiet || ! git diff --cached --quiet; then
+            CHANGED="true"
+          fi
+          echo "changed=${CHANGED}" >> "${GITHUB_OUTPUT}"
+
+      - name: "Guard: forbid touching protected paths"
+        if: "steps.diff.outputs.changed == 'true'"
+        shell: "bash"
+        run: |
+          set -euo pipefail
+          BAD=$(git diff --name-only | grep -E "${PROTECT_GLOBS}" || true)
+          if [ -n "${BAD}" ]; then
+            echo "::error::Detected changes in protected paths:"
+            echo "${BAD}"
             exit 1
           fi
 
-          echo "PROMPT=$PROMPT" >> "$GITHUB_OUTPUT"
-
-      - name: "Upload prompt (debug)"
-        uses: actions/upload-artifact@v4
-        with:
-          name: composed-prompt
-          path: "${{ steps.prompt.outputs.PROMPT }}"
-          if-no-files-found: error
-          retention-days: 5
-
-      # 許可グロブを Codex 用にカンマ区切りへ
-      - name: "Build allow-write globs"
-        id: allow
-        shell: bash
+      - name: "Configure git author"
+        shell: "bash"
         run: |
           set -euo pipefail
-          ALLOW_WRITE="$(printf "%s" "${GENERATED_PATHS}" | sed '/^[[:space:]]*$/d' | paste -sd, -)"
-          echo "ALLOW_WRITE=$ALLOW_WRITE" >> "$GITHUB_OUTPUT"
-
-      # Codex 実行：allow-write を明示
-      - name: "Run Codex"
-        id: codex
-        uses: openai/codex-action@main
-        with:
-          openai-api-key: "${{ env.OPENAI_API_KEY }}"
-          prompt-file: "${{ steps.prompt.outputs.PROMPT }}"
-          model: "${{ env.MODEL }}"
-          sandbox: "workspace-write"
-          allow-write: "${{ steps.allow.outputs.ALLOW_WRITE }}"
-          # 互換キー（アクションの入力名差異に備えて同値を渡す）
-          allowlist: "${{ steps.allow.outputs.ALLOW_WRITE }}"
-          debug: "true"
-
-      # Codex の最終出力（あれば）を収集
-      - name: "Save Codex last message (debug)"
-        shell: bash
-        run: |
-          set -euo pipefail
-          out="${RUNNER_TEMP}/codex-last.md"
-          # 代表的な出力ファイルの既定位置を総当たり（無ければスキップ）
-          for f in /tmp/codex-exec-*/output.md "${HOME}"/codex/output.md; do
-            [ -f "$f" ] && cp -f "$f" "$out" && break || true
-          done
-          [ -f "$out" ] && echo "saved" || echo "no-output"
-        continue-on-error: true
-
-      - name: "Upload Codex last message (debug)"
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: codex-last
-          path: "${{ runner.temp }}/codex-last.md"
-          if-no-files-found: ignore
-          retention-days: 5
-
-      # 保護領域の変更をブロック
-      - name: "Guard: reject protected paths"
-        shell: bash
-        run: |
-          set -euo pipefail
-          [ -z "$(git status --porcelain)" ] && exit 0
-          PROTECTS=( ".github/**" "spec/**" "evidence/**" "dist/**" )
-          reject=0
-          while IFS= read -r path; do
-            for pat in "${PROTECTS[@]}"; do
-              [[ "$path" == $pat ]] && echo "::error::blocked change: $path" && reject=1
-            done
-          done < <(git status --porcelain | awk '{print $2}')
-          [ "$reject" -eq 0 ]
-
-      # 生成物だけステージ
-      - name: "Stage only generated paths"
-        shell: bash
-        run: |
-          set -euo pipefail
-          git add -A
-          git reset
-          while IFS= read -r pattern; do
-            [ -z "$pattern" ] && continue
-            git add --force -- "$pattern" 2>/dev/null || true
-          done <<< "${GENERATED_PATHS}"
-
-      - name: "Show diff summary"
-        shell: bash
-        run: |
-          git status --porcelain=v1 || true
-          git diff --cached --stat || true
-
-      - name: "Skip if no generated changes"
-        shell: bash
-        run: |
-          if [ -z "$(git diff --cached --name-only)" ]; then
-            echo "No generated changes to commit."
-            exit 0
-          fi
-
-      - name: "Set git author"
-        shell: bash
-        run: |
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
           git config --global user.name  "github-actions[bot]"
 
-      - name: "Create PR"
-        uses: peter-evans/create-pull-request@v7
+      - name: "Create Pull Request"
+        if: "steps.diff.outputs.changed == 'true'"
+        uses: "peter-evans/create-pull-request@v6"
         with:
           token: "${{ secrets.GITHUB_TOKEN }}"
-          branch: "ai/codex/batch-${{ github.run_id }}"
-          base: "main"
-          title: "AI: apply Codex changes"
-          body: "Automated changes generated from spec with mode `${{ env.MODE }}`."
-          commit-message: "chore(ai): apply Codex changes (mode=${{ env.MODE }})"
-          add-paths: |
-            ${{
-              env.GENERATED_PATHS
-            }}
+          title: "AI: apply Codex changes (${ { inputs.mode }})"
+          body: |
+            Automated changes generated by Codex.
+            - Mode: `${{ inputs.mode }}`
+            - Model: `${{ inputs.model }}`
+            - Prompt: `${{ steps.prompt.outputs.prompt_path }}`
+          commit-message: "chore(ai): apply Codex changes"
+          branch: "${{ env.BRANCH_PREFIX }}${{ github.run_id }}"
           delete-branch: true
+          draft: false
           signoff: false
+          base: "main"
           labels: "ai, codex, automated"
+
+      - name: "No changes note"
+        if: "steps.diff.outputs.changed != 'true'"
+        shell: "bash"
+        run: |
+          echo "No changes to commit. Skipping PR."
