@@ -1,31 +1,33 @@
 name: "Codex Generate (dispatcher)"
 
 on:
-  push:
-    branches: ["main"]
-    paths:
-      - "spec/**"
-      - "AGENTS.md"
-      - ".github/workflows/codex.yml"
-      - "ai/prompt.md"
   workflow_dispatch:
     inputs:
       mode:
-        description: "実行モード: full(全集成) / incremental(差分)"
+        description: "実行モード: full（全生成）/ incremental（差分）"
         required: false
         default: "full"
         type: string
       model:
-        description: "OpenAIモデル名（空欄可）"
+        description: "OpenAI モデル名（任意）"
         required: false
         default: ""
         type: string
+  push:
+    branches: ["main"]
+    paths:
+      - "spec/**"
+      - ".github/workflows/codex.yml"
+
+permissions:
+  contents: write
+  pull-requests: write
 
 jobs:
   generate:
-    uses: ./.github/workflows/codex-generate.yml
-    secrets:
-      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+    uses: ".github/workflows/codex-generate.yml"
     with:
-      mode:  ${{ inputs.mode  || 'full' }}
-      model: ${{ inputs.model || '' }}
+      mode: "${{ inputs.mode || 'full' }}"
+      model: "${{ inputs.model || '' }}"
+    secrets:
+      OPENAI_API_KEY: "${{ secrets.OPENAI_API_KEY }}"
