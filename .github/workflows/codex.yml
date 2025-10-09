@@ -25,7 +25,7 @@ permissions:
 
 jobs:
   generate:
-    uses: ".github/workflows/codex-generate.yml"
+    uses: "./.github/workflows/codex-generate.yml"
     with:
       mode: "${{ inputs.mode || 'full' }}"
       model: "${{ inputs.model || '' }}"
