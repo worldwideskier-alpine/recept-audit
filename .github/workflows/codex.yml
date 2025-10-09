@@ -1,4 +1,4 @@
-name: "Codex Generate & Test (fixed env/func)"
+name: "Codex Generate & PR (auto cleanup)"
 
 on:
   push:
@@ -9,12 +9,11 @@ on:
   workflow_dispatch:
     inputs:
       model:
-        description: "（任意）使用するモデル名（未指定＝既定）"
+        description: "（任意）モデル名（未指定＝既定）"
         required: false
-      max_fixes:
-        description: "テスト失敗時の自動修正トライ回数（0〜2）"
-        required: false
-        default: "1"
+  # PR が閉じられた時（merged/closed）にもこのファイルを起動して掃除する
+  pull_request_target:
+    types: [closed]
 
 permissions:
   contents: write
@@ -25,14 +24,18 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  codex:
+  # =========================
+  # 1) 生成 → PR 作成
+  # =========================
+  generate:
+    # cleanup 専用イベント時はこのジョブは走らせない
+    if: ${{ github.event_name != 'pull_request_target' }}
     runs-on: "ubuntu-latest"
 
     steps:
       - name: "Checkout"
         uses: "actions/checkout@v4"
-        with:
-          fetch-depth: 0
+        with: { fetch-depth: 0 }
 
       - name: "Set Git identity (CI)"
         shell: "bash"
@@ -42,7 +45,6 @@ jobs:
           git config --global user.name  "CI Bot"
           git config --global --add safe.directory "$GITHUB_WORKSPACE"
 
-      # 必須4ファイルの存在をチェック（固定）
       - name: "Assert required specs exist"
         shell: "bash"
         run: |
@@ -51,53 +53,34 @@ jobs:
             [ -f "$f" ] || { echo "::error::Missing spec: $f"; exit 1; }
           done
 
-      - name: "Build composite prompt (write-back + deliverables)"
+      - name: "Build composite prompt"
         id: "prompt"
         shell: "bash"
         run: |
           set -euo pipefail
           PROMPT_FILE="$RUNNER_TEMP/prompt.md"
-          TODAY="$(date -u +%Y-%m-%d)"
           : > "$PROMPT_FILE"
-
-          # 実装方針 + 仕様書“書き戻し”ポリシー + 成果物を明示（Clarification禁止）
+          # 即実装・Clarification禁止・生成先・成果物の最低限ルール
           cat >> "$PROMPT_FILE" <<'PRELUDE'
-          # TASK（実装を即実行）
-          - Clarification（質問・保留）を行わず、仕様の不足は合理的に補完して実装を完了する。
+          # TASK
+          - Clarification（質問・保留）を行わずに実装を完了する。
           - 出力はパッチ（ファイルの追加/更新）のみ。説明文は不要。
           - 生成先: `src/**`（アプリ本体）、`tests/**`（テスト）。必要に応じて `app.php`, `.htaccess`,
-            `env-lite.php`, `health-lite.php`, `tools/`, `storage/`, `logs/` も作成可。
-          - 1 回の実行でアプリとテスト一式を完成させる。既存は安全に上書き、無ければ新規作成。
+            `env-lite.php`, `health-lite.php` を作成可。
 
-          ## DELIVERABLES（必ず生成）
+          ## DELIVERABLES
           - app.php
-          - src/Kernel.php
-          - src/Routing.php
-          - src/Controllers/EnvLiteController.php
-          - env-lite.php
-          - health-lite.php
-          - tests/Feature/EnvLiteTest.php   # 期待JSON {"ok":true,"kind":"env-lite"} を検証
-          - ai/CHANGELOG_AI.md
-          - （必要に応じて）tools/**, storage/**, logs/**
-
-          # SPEC WRITE-BACK POLICY（仕様書に書き戻す）
-          - 共通事項（非機能・生成規約・テスト戦略）は **spec/generation.txt** と **spec/testing.txt** に書き戻す。
-          - 環境ごとの差分は **spec/environment.txt** に、機能ごとの差分は **spec/functional.txt** に書き戻す。
-          - 追記は各ファイル末尾に見出し「### AI Amendments (TODAY)」を新設して要点箇条書き、その後、本文へ統合（リライト）しても良い。
-          - 書き戻しの結果、重複や矛盾があれば **共通 > 個別** の順で整理し、個別ファイルは共通を上書きする差分のみ残す。
-          - 変更履歴は **ai/CHANGELOG_AI.md** に「What changed / Why / Affected files」を追加。
+          - src/**
+          - tests/**
           PRELUDE
 
-          # TODAY を実日付に置換
-          sed -i "s|TODAY|$TODAY|g" "$PROMPT_FILE"
-
-          # AGENTS.md（あれば先頭に）
+          # AGENTS.md（あれば先頭）
           if [ -f "AGENTS.md" ]; then
             printf "\n\n---\n\n# AGENTS.md\n\n" >> "$PROMPT_FILE"
             sed -e 's/\r$//' "AGENTS.md" >> "$PROMPT_FILE"
           fi
 
-          # 結合順：generation → testing → environment → functional（固定）
+          # 4仕様書を固定順で結合：生成→検査→環境→機能
           for f in spec/generation.txt spec/testing.txt spec/environment.txt spec/functional.txt; do
             printf "\n\n---\n\n# %s\n\n" "$f" >> "$PROMPT_FILE"
             sed -e 's/\r$//' "$f" >> "$PROMPT_FILE"
@@ -105,127 +88,30 @@ jobs:
 
           echo "file=$PROMPT_FILE" >> "$GITHUB_OUTPUT"
 
-      - name: "Preflight: check OPENAI_API_KEY"
-        env:
-          OPENAI_API_KEY: "${{ secrets.OPENAI_API_KEY }}"
+      - name: "Preflight: OPENAI_API_KEY"
+        env: { OPENAI_API_KEY: "${{ secrets.OPENAI_API_KEY }}" }
         shell: "bash"
         run: |
           set -eu
-          if [ -z "${OPENAI_API_KEY:-}" ]; then
-            echo "::error::OPENAI_API_KEY missing"; exit 1
-          fi
+          [ -n "${OPENAI_API_KEY:-}" ] || { echo "::error::OPENAI_API_KEY missing"; exit 1; }
           echo "OPENAI_API_KEY present"
 
-      # 1回目の生成
-      - name: "Run Codex (pass 1)"
-        id: "codex1"
+      - name: "Run Codex"
+        id: "codex"
         uses: "openai/codex-action@main"
-        env:
-          OPENAI_API_KEY: "${{ secrets.OPENAI_API_KEY }}"
+        env: { OPENAI_API_KEY: "${{ secrets.OPENAI_API_KEY }}" }
         with:
           openai-api-key: "${{ secrets.OPENAI_API_KEY }}"
           prompt-file: "${{ steps.prompt.outputs.file }}"
           model: "${{ github.event.inputs.model }}"
           sandbox: "workspace-write"
 
-      # .github/workflows の改変は安全のため破棄
       - name: "Discard workflow edits (safety)"
         shell: "bash"
         run: |
           set -eu
           if git status --porcelain | grep -E '^[AMDR].*\.github/workflows/'; then
-            echo "::warning::Discarding changes under .github/workflows/"
-            git checkout -- ".github/workflows" || true
-            git restore --staged ".github/workflows" || true
-          fi
-
-      # テストランナー検出（PHP/Jest/Vitest/PyTest/Go を簡易サポート）
-      - name: "Detect test runner"
-        id: "detect_tests"
-        shell: "bash"
-        run: |
-          set -euo pipefail
-          TEST_CMD=""
-
-          if [ -f "composer.json" ]; then
-            sudo apt-get update -y && sudo apt-get install -y jq >/dev/null 2>&1 || true
-            php -v || sudo apt-get install -y php-cli php-xml php-mbstring >/dev/null 2>&1 || true
-            curl -sS https://getcomposer.org/installer | php -- --quiet
-            php composer.phar install --no-interaction --no-progress || true
-            if jq -e '.scripts.test' composer.json >/dev/null 2>&1; then TEST_CMD="php composer.phar test"; fi
-            if [ -z "$TEST_CMD" ] && [ -f "vendor/bin/pest" ]; then TEST_CMD="vendor/bin/pest -q"; fi
-            if [ -z "$TEST_CMD" ] && [ -f "vendor/bin/phpunit" ]; then TEST_CMD="vendor/bin/phpunit --colors=never"; fi
-          fi
-
-          if [ -z "$TEST_CMD" ] && [ -f "package.json" ]; then
-            npm ci --prefer-offline --no-audit --no-fund || npm i
-            if npx --yes jest --version >/dev/null 2>&1; then TEST_CMD="npx jest --ci"; fi
-            if [ -z "$TEST_CMD" ] && npx --yes vitest --version >/dev/null 2>&1; then TEST_CMD="npx vitest run"; fi
-          fi
-
-          if [ -z "$TEST_CMD" ] && ls -1 tests 2>/dev/null | grep -E '\.py$|^test_' >/dev/null 2>&1; then
-            python3 -V || sudo apt-get install -y python3 python3-pip >/dev/null 2>&1 || true
-            [ -f "requirements.txt" ] && pip3 install -r requirements.txt || true
-            pip3 install pytest >/dev/null 2>&1 || true
-            TEST_CMD="pytest -q"
-          fi
-
-          if [ -z "$TEST_CMD" ] && ls -1 **/*_test.go 2>/dev/null | head -n1 >/dev/null; then
-            sudo apt-get update -y && sudo apt-get install -y golang >/dev/null 2>&1 || true
-            TEST_CMD="go test ./..."
-          fi
-
-          if [ -z "$TEST_CMD" ]; then
-            echo "::warning::No test runner detected"
-            echo "cmd=" >> "$GITHUB_OUTPUT"
-          else
-            echo "cmd=$TEST_CMD" >> "$GITHUB_OUTPUT"
-          fi
-
-      - name: "Run tests (pass 1)"
-        if: ${{ steps.detect_tests.outputs.cmd != '' }}
-        id: "t1"
-        shell: "bash"
-        continue-on-error: true
-        run: |
-          set -o pipefail
-          mkdir -p .ci/reports
-          bash -lc "${{ steps.detect_tests.outputs.cmd }}" | tee .ci/reports/test-pass1.log
-          echo "exitcode=${PIPESTATUS[0]}" >> "$GITHUB_OUTPUT"
-
-      - name: "Self-fix with failing logs (pass 2)"
-        if: ${{ steps.detect_tests.outputs.cmd != '' && steps.t1.outputs.exitcode != '0' && github.event.inputs.max_fixes != '0' }}
-        id: "fix1"
-        uses: "openai/codex-action@main"
-        env:
-          OPENAI_API_KEY: "${{ secrets.OPENAI_API_KEY }}"
-        with:
-          openai-api-key: "${{ secrets.OPENAI_API_KEY }}"
-          prompt-file: "${{ steps.prompt.outputs.file }}"
-          extra-input: |
-            ## TEST FAILURES (pass 1)
-            以下はテスト失敗ログの抜粋です。原因を修正し、必要なら仕様書にも書き戻してください。
-            （実行コマンド）${{ steps.detect_tests.outputs.cmd }}
-            （ログは上のステップ出力を参照）
-          sandbox: "workspace-write"
-
-      - name: "Run tests (pass 2 after fix)"
-        if: ${{ steps.detect_tests.outputs.cmd != '' && steps.t1.outputs.exitcode != '0' && github.event.inputs.max_fixes != '0' }}
-        id: "t2"
-        shell: "bash"
-        continue-on-error: true
-        run: |
-          set -o pipefail
-          mkdir -p .ci/reports
-          bash -lc "${{ steps.detect_tests.outputs.cmd }}" | tee .ci/reports/test-pass2.log
-          echo "exitcode=${PIPESTATUS[0]}" >> "$GITHUB_OUTPUT"
-
-      - name: "Discard workflow edits (safety)"
-        shell: "bash"
-        run: |
-          set -eu
-          if git status --porcelain | grep -E '^[AMDR].*\.github/workflows/'; then
-            echo "::warning::Discarding changes under .github/workflows/"
+            echo "::warning::Discarding .github/workflows changes"
             git checkout -- ".github/workflows" || true
             git restore --staged ".github/workflows" || true
           fi
@@ -240,37 +126,50 @@ jobs:
             echo "No changes."
           else
             echo "changed=true" >> "$GITHUB_OUTPUT"
-            echo "Changed files:"
             git diff --name-only || true
-          fi
-
-      - name: "Choose token (PAT > GITHUB_TOKEN)"
-        id: "tok"
-        shell: "bash"
-        run: |
-          if [ -n "${{ secrets.GH_PAT_WORKFLOWS }}" ]; then
-            echo "val=${{ secrets.GH_PAT_WORKFLOWS }}" >> "$GITHUB_OUTPUT"
-          else
-            echo "val=${{ github.token }}" >> "$GITHUB_OUTPUT"
           fi
 
       - name: "Create Pull Request (only if changed)"
         if: ${{ steps.diff.outputs.changed == 'true' }}
         uses: "peter-evans/create-pull-request@v7"
         with:
-          token: "${{ steps.tok.outputs.val }}"
-          title: "AI: generate code, run tests, and write back specs (fixed env/func)"
+          token: "${{ github.token }}"
+          title: "AI: apply Codex changes"
           body: |
-            Automated changes by Codex.
-
-            Specs (fixed):
-            - spec/generation.txt
-            - spec/testing.txt
-            - spec/environment.txt
-            - spec/functional.txt
-
-            Includes code generation, test run, optional self-fix, and spec write-back.
-          commit-message: "chore(ai): generate code + tests + spec write-back (fixed env/func)"
+            Automated changes generated by Codex from combined specs.
+          commit-message: "chore(ai): apply Codex changes"
           branch: "ai/codex/batch-${{ github.run_id }}"
           base: "main"
-          delete-branch: true
+          delete-branch: true  # ← アクションが自分でPRをクローズする場合に有効
+
+  # =========================
+  # 2) マージ後クリーンアップ（自動削除）
+  # =========================
+  cleanup_branch:
+    name: "Delete ai/codex/batch-* after merge"
+    if: >
+      ${{
+        github.event_name == 'pull_request_target' &&
+        github.event.action == 'closed' &&
+        github.event.pull_request.merged == true &&
+        startsWith(github.event.pull_request.head.ref, 'ai/codex/batch-') &&
+        github.event.pull_request.head.repo.full_name == github.repository
+      }}
+    runs-on: "ubuntu-latest"
+    permissions:
+      contents: write
+
+    steps:
+      - name: "Delete head branch via API"
+        uses: "actions/github-script@v7"
+        with:
+          script: |
+            const headRef = context.payload.pull_request.head.ref; // e.g. ai/codex/batch-1234567890
+            const ref = `heads/${headRef}`;
+            core.info(`Deleting ref ${ref} ...`);
+            await github.rest.git.deleteRef({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              ref
+            });
+            core.info(`Deleted ${ref}`);
