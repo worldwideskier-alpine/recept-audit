@@ -1,0 +1,23 @@
+{
+  "FEATURE_MAIL": [
+    "SMTP_HOST",
+    "SMTP_PORT",
+    "SMTP_USER",
+    "SMTP_PASS"
+  ],
+  "FEATURE_STORAGE": [
+    "STORAGE_DRIVER",
+    "STORAGE_BUCKET",
+    "STORAGE_REGION"
+  ],
+  "FEATURE_DB": [
+    "DB_HOST",
+    "DB_NAME",
+    "DB_USER",
+    "DB_PASS",
+    "DB_PORT"
+  ],
+  "FEATURE_PROVIDER_MULTI_TENANT": [
+    "TENANT_SALT"
+  ]
+}

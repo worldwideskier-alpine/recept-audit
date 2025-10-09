@@ -1,0 +1,47 @@
+# profiles/base.yml — 既定（全環境共通の最小セット）
+runtime:
+  php: "8.3"
+  web: "apache-mod_rewrite"
+  front_controller: "app.php"
+  http_client: "curl"
+  cache_control_no_store: true
+
+db:
+  engine: "mysql8"
+  host: "${DB_HOST}"
+  port: "${DB_PORT:-3306}"
+  name: "${DB_NAME}"
+  user: "${DB_USER}"
+  pass: "${DB_PASS}"
+  charset: "utf8mb4"
+  collation_primary: "utf8mb4_0900_ai_ci"
+  collation_fallback: "utf8mb4_unicode_ci"
+
+http:
+  timeout_seconds: 30
+  retry: 3
+
+paths:
+  storage: "storage"
+  logs: "storage/logs"
+
+rules:
+  apache_allow_override: "FileInfo+"
+  apache_disable_multiviews: true
+  apache_disable_indexes: true
+  forbid_rewritebase_root: true  # 必要時のみ実配備パスを明記
+
+# -- env_matrix 参照キー（placeholder。実値は .env / CI secrets で注入）
+# DB_HOST=…
+# DB_NAME=…
+# DB_PASS=…
+# DB_PORT=…
+# DB_USER=…
+# SMTP_HOST=…
+# SMTP_PASS=…
+# SMTP_PORT=…
+# SMTP_USER=…
+# STORAGE_BUCKET=…
+# STORAGE_DRIVER=…
+# STORAGE_REGION=…
+# TENANT_SALT=…

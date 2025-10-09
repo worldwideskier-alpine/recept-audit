@@ -1,0 +1,31 @@
+required_dirs:
+- src
+- tests
+- tools
+- storage
+- evidence
+- dist
+allowed_write:
+- src/**
+- tests/**
+- tools/**
+- storage/**
+- evidence/**
+- dist/**
+- .htaccess
+- app.php
+- env-lite.php
+- health-lite.php
+- COMPLIANCE.json
+forbidden_write:
+- spec/**
+- .github/**
+- ai/**
+- /*
+scaffold:
+- path: src/.keep
+- path: tests/.keep
+- path: tools/.keep
+- path: evidence/static/.keep
+- path: evidence/runtime/.keep
+- path: dist/.keep
