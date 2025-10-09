@@ -1,4 +1,4 @@
-name: "Codex Generate & Test (self-heal, spec write-back)"
+name: "Codex Generate & Test (fixed env/func)"
 
 on:
   push:
@@ -10,12 +10,6 @@ on:
     inputs:
       model:
         description: "（任意）使用するモデル名（未指定＝既定）"
-        required: false
-      env_spec:
-        description: "（任意）環境仕様書のパス（例: spec/environment.prod.txt）"
-        required: false
-      func_spec:
-        description: "（任意）機能仕様書のパス（例: spec/functional.receipts.txt）"
         required: false
       max_fixes:
         description: "テスト失敗時の自動修正トライ回数（0〜2）"
@@ -48,64 +42,14 @@ jobs:
           git config --global user.name  "CI Bot"
           git config --global --add safe.directory "$GITHUB_WORKSPACE"
 
-      - name: "Resolve spec set (common + selected)"
-        id: "resolve"
+      # 必須4ファイルの存在をチェック（固定）
+      - name: "Assert required specs exist"
         shell: "bash"
         run: |
           set -euo pipefail
-          COMMON_GEN="spec/generation.txt"
-          COMMON_TEST="spec/testing.txt"
-          ENV_IN="${{ github.event.inputs.env_spec }}"
-          FUNC_IN="${{ github.event.inputs.func_spec }}"
-
-          # 必須: generation/testing が無ければ失敗
-          for f in "$COMMON_GEN" "$COMMON_TEST"; do
-            if [ ! -f "$f" ]; then
-              echo "::error::Missing required common spec: $f"
-              exit 1
-            fi
+          for f in spec/generation.txt spec/testing.txt spec/environment.txt spec/functional.txt; do
+            [ -f "$f" ] || { echo "::error::Missing spec: $f"; exit 1; }
           done
-
-          # 環境仕様書の選定
-          pick_env=""
-          if [ -n "$ENV_IN" ] && [ -f "$ENV_IN" ]; then
-            pick_env="$ENV_IN"
-          elif [ -f spec/environment.txt ]; then
-            pick_env="spec/environment.txt"
-          else
-            env_candidates=$(ls -1 spec/environment*.txt 2>/dev/null || true)
-            if [ -n "$env_candidates" ]; then
-              pick_env="$(printf '%s\n' $env_candidates | sort | tail -n1)"
-            else
-              echo "::warning::No environment spec found (optional)"
-            fi
-          fi
-
-          # 機能仕様書の選定
-          pick_func=""
-          if [ -n "$FUNC_IN" ] && [ -f "$FUNC_IN" ]; then
-            pick_func="$FUNC_IN"
-          elif [ -f spec/functional.txt ]; then
-            pick_func="spec/functional.txt"
-          else
-            func_candidates=$(ls -1 spec/functional*.txt 2>/dev/null || true)
-            if [ -n "$func_candidates" ]; then
-              pick_func="$(printf '%s\n' $func_candidates | sort | tail -n1)"
-            else
-              echo "::warning::No functional spec found (optional)"
-            fi
-          fi
-
-          echo "gen=$COMMON_GEN"   >> "$GITHUB_OUTPUT"
-          echo "test=$COMMON_TEST" >> "$GITHUB_OUTPUT"
-          echo "env=$pick_env"     >> "$GITHUB_OUTPUT"
-          echo "func=$pick_func"   >> "$GITHUB_OUTPUT"
-
-          echo "Using specs:"
-          echo "  generation: $COMMON_GEN"
-          echo "  testing:    $COMMON_TEST"
-          echo "  environment: ${pick_env:-'(none)'}"
-          echo "  functional:  ${pick_func:-'(none)'}"
 
       - name: "Build composite prompt (write-back + deliverables)"
         id: "prompt"
@@ -137,40 +81,27 @@ jobs:
           - （必要に応じて）tools/**, storage/**, logs/**
 
           # SPEC WRITE-BACK POLICY（仕様書に書き戻す）
-          - 共通化できるルール／非機能・生成規約・テスト戦略は **spec/generation.txt** と **spec/testing.txt** に書き戻す。
-          - 環境ごとの差分は **ENV_SPEC** に、機能ごとの差分は **FUNC_SPEC** に書き戻す。
+          - 共通事項（非機能・生成規約・テスト戦略）は **spec/generation.txt** と **spec/testing.txt** に書き戻す。
+          - 環境ごとの差分は **spec/environment.txt** に、機能ごとの差分は **spec/functional.txt** に書き戻す。
           - 追記は各ファイル末尾に見出し「### AI Amendments (TODAY)」を新設して要点箇条書き、その後、本文へ統合（リライト）しても良い。
           - 書き戻しの結果、重複や矛盾があれば **共通 > 個別** の順で整理し、個別ファイルは共通を上書きする差分のみ残す。
           - 変更履歴は **ai/CHANGELOG_AI.md** に「What changed / Why / Affected files」を追加。
           PRELUDE
 
-          # 置換（ENV_SPEC / FUNC_SPEC / TODAY）
-          sed -i "s|ENV_SPEC|${{ steps.resolve.outputs.env || '(none)' }}|g" "$PROMPT_FILE"
-          sed -i "s|FUNC_SPEC|${{ steps.resolve.outputs.func || '(none)' }}|g" "$PROMPT_FILE"
+          # TODAY を実日付に置換
           sed -i "s|TODAY|$TODAY|g" "$PROMPT_FILE"
 
-          # AGENTS.md を先頭に（任意）
+          # AGENTS.md（あれば先頭に）
           if [ -f "AGENTS.md" ]; then
             printf "\n\n---\n\n# AGENTS.md\n\n" >> "$PROMPT_FILE"
             sed -e 's/\r$//' "AGENTS.md" >> "$PROMPT_FILE"
           fi
 
-          # 結合順：generation → testing → environment? → functional?
-          printf "\n\n---\n\n# %s\n\n" "${{ steps.resolve.outputs.gen }}"  >> "$PROMPT_FILE"
-          sed -e 's/\r$//' "${{ steps.resolve.outputs.gen }}"               >> "$PROMPT_FILE"
-
-          printf "\n\n---\n\n# %s\n\n" "${{ steps.resolve.outputs.test }}" >> "$PROMPT_FILE"
-          sed -e 's/\r$//' "${{ steps.resolve.outputs.test }}"              >> "$PROMPT_FILE"
-
-          if [ -n "${{ steps.resolve.outputs.env }}" ]; then
-            printf "\n\n---\n\n# %s\n\n" "${{ steps.resolve.outputs.env }}" >> "$PROMPT_FILE"
-            sed -e 's/\r$//' "${{ steps.resolve.outputs.env }}"             >> "$PROMPT_FILE"
-          fi
-
-          if [ -n "${{ steps.resolve.outputs.func }}" ]; then
-            printf "\n\n---\n\n# %s\n\n" "${{ steps.resolve.outputs.func }}" >> "$PROMPT_FILE"
-            sed -e 's/\r$//' "${{ steps.resolve.outputs.func }}"             >> "$PROMPT_FILE"
-          fi
+          # 結合順：generation → testing → environment → functional（固定）
+          for f in spec/generation.txt spec/testing.txt spec/environment.txt spec/functional.txt; do
+            printf "\n\n---\n\n# %s\n\n" "$f" >> "$PROMPT_FILE"
+            sed -e 's/\r$//' "$f" >> "$PROMPT_FILE"
+          done
 
           echo "file=$PROMPT_FILE" >> "$GITHUB_OUTPUT"
 
@@ -197,6 +128,7 @@ jobs:
           model: "${{ github.event.inputs.model }}"
           sandbox: "workspace-write"
 
+      # .github/workflows の改変は安全のため破棄
       - name: "Discard workflow edits (safety)"
         shell: "bash"
         run: |
@@ -207,7 +139,7 @@ jobs:
             git restore --staged ".github/workflows" || true
           fi
 
-      # テスト検出
+      # テストランナー検出（PHP/Jest/Vitest/PyTest/Go を簡易サポート）
       - name: "Detect test runner"
         id: "detect_tests"
         shell: "bash"
@@ -250,7 +182,6 @@ jobs:
             echo "cmd=$TEST_CMD" >> "$GITHUB_OUTPUT"
           fi
 
-      # パス1: テスト実行
       - name: "Run tests (pass 1)"
         if: ${{ steps.detect_tests.outputs.cmd != '' }}
         id: "t1"
@@ -262,7 +193,6 @@ jobs:
           bash -lc "${{ steps.detect_tests.outputs.cmd }}" | tee .ci/reports/test-pass1.log
           echo "exitcode=${PIPESTATUS[0]}" >> "$GITHUB_OUTPUT"
 
-      # 失敗時の自己修復（最大 max_fixes 回）
       - name: "Self-fix with failing logs (pass 2)"
         if: ${{ steps.detect_tests.outputs.cmd != '' && steps.t1.outputs.exitcode != '0' && github.event.inputs.max_fixes != '0' }}
         id: "fix1"
@@ -275,11 +205,8 @@ jobs:
           extra-input: |
             ## TEST FAILURES (pass 1)
             以下はテスト失敗ログの抜粋です。原因を修正し、必要なら仕様書にも書き戻してください。
-            ```
-            ${{ steps.detect_tests.outputs.cmd }}
-            ---
-            ${{ runner.temp }}/ignored  # 占位
-            ```
+            （実行コマンド）${{ steps.detect_tests.outputs.cmd }}
+            （ログは上のステップ出力を参照）
           sandbox: "workspace-write"
 
       - name: "Run tests (pass 2 after fix)"
@@ -293,7 +220,6 @@ jobs:
           bash -lc "${{ steps.detect_tests.outputs.cmd }}" | tee .ci/reports/test-pass2.log
           echo "exitcode=${PIPESTATUS[0]}" >> "$GITHUB_OUTPUT"
 
-      # .github/workflows の改変は捨てる
       - name: "Discard workflow edits (safety)"
         shell: "bash"
         run: |
@@ -333,20 +259,18 @@ jobs:
         uses: "peter-evans/create-pull-request@v7"
         with:
           token: "${{ steps.tok.outputs.val }}"
-          title: "AI: generate code, run tests, and write back specs"
+          title: "AI: generate code, run tests, and write back specs (fixed env/func)"
           body: |
             Automated changes by Codex.
 
-            Specs (common):
-            - ${{ steps.resolve.outputs.gen }}
-            - ${{ steps.resolve.outputs.test }}
-
-            Specs (selected):
-            - env:  ${{ steps.resolve.outputs.env || '(none)' }}
-            - func: ${{ steps.resolve.outputs.func || '(none)' }}
+            Specs (fixed):
+            - spec/generation.txt
+            - spec/testing.txt
+            - spec/environment.txt
+            - spec/functional.txt
 
             Includes code generation, test run, optional self-fix, and spec write-back.
-          commit-message: "chore(ai): generate code + tests + spec write-back"
+          commit-message: "chore(ai): generate code + tests + spec write-back (fixed env/func)"
           branch: "ai/codex/batch-${{ github.run_id }}"
           base: "main"
           delete-branch: true
