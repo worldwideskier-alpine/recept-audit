@@ -1,30 +1,26 @@
-name: "Codex Generate & PR (full regen)"
+name: "Codex Generate (reusable)"
 
 on:
-  push:
-    branches: ["**"]
-    paths: ["spec/**", "AGENTS.md"]
-  workflow_dispatch:
+  workflow_call:
     inputs:
       mode:
-        description: "実行モード: full(再生成) / incremental(差分)"
+        description: "full / incremental"
         required: false
         default: "full"
+        type: string
       model:
-        description: "（任意）OpenAIモデル名（未指定＝既定）"
+        description: "OpenAI model name"
         required: false
+        default: ""
+        type: string
 
 permissions:
   contents: write
   pull-requests: write
 
-concurrency:
-  group: "codex-${{ github.ref }}"
-  cancel-in-progress: false
-
 env:
-  REGEN_MODE: "${{ github.event.inputs.mode || 'full' }}"
-  SELECTED_MODEL: "${{ github.event.inputs.model || '' }}"
+  REGEN_MODE: "${{ inputs.mode }}"
+  SELECTED_MODEL: "${{ inputs.model }}"
 
 jobs:
   generate:
@@ -36,7 +32,7 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: "Set Git identity"
+      - name: "Git identity"
         shell: "bash"
         run: |
           set -eu
@@ -44,7 +40,7 @@ jobs:
           git config --global user.name  "CI Bot"
           git config --global --add safe.directory "$GITHUB_WORKSPACE"
 
-      - name: "Preflight: require specs"
+      - name: "Require specs"
         shell: "bash"
         run: |
           set -euo pipefail
@@ -52,12 +48,11 @@ jobs:
             [ -f "$f" ] || { echo "::error::Missing spec: $f"; exit 1; }
           done
 
-      - name: "Wipe repository except specs & workflows (full regen)"
+      - name: "Full regen: wipe tree (keep specs & workflows)"
         if: ${{ env.REGEN_MODE == 'full' }}
         shell: "bash"
         run: |
           set -euo pipefail
-          echo "Full regeneration: wiping working tree (keep specs & workflows)"
           git rm -r --cached . || true
           git add ".github" || true
           git add "spec" || true
@@ -67,7 +62,7 @@ jobs:
           git clean -fdx -e ".github" -e ".github/workflows" -e "spec" -e "spec/**" -e "AGENTS.md" -e "README.md" -e ".gitignore"
           git commit -m "chore(ai): wipe tree for full regeneration" || echo "no wipe commit"
 
-      - name: "Build composite prompt"
+      - name: "Build prompt"
         id: "prompt"
         shell: "bash"
         run: |
@@ -75,21 +70,25 @@ jobs:
           PROMPT_FILE="$RUNNER_TEMP/prompt.md"
           : > "$PROMPT_FILE"
 
-          cat >> "$PROMPT_FILE" <<'PRELUDE'
+          if [ -f "ai/codex-generate.tml" ]; then
+            sed -e 's/\r$//' "ai/codex-generate.tml" >> "$PROMPT_FILE"
+          else
+            cat >> "$PROMPT_FILE" <<'PRE'
           # TASK
-          - Clarification を行わず直ちに実装する。
-          - 出力は「ファイル追加・更新」パッチのみ（説明文は出力しない）。
-          - 生成先: `src/**`（本体）, `tests/**`（テスト）, 必要に応じて `app.php`, `.htaccess`, `env-lite.php`, `health-lite.php` を生成。
-          - 仕様で規定したディレクトリ構造を厳守。余分なファイルは作らない。
+          - Clarification はせず即実装。
+          - 出力はファイルパッチのみ（説明は出さない）。
+          - 生成先: `src/**`（アプリ本体）, `tests/**`（テスト）, 必要に応じて `app.php`, `.htaccess`, `env-lite.php`, `health-lite.php`。
+          - 仕様で示した構成を厳守。余分は作らない。
 
-          ## DELIVERABLES (MUST)
+          ## MUST DELIVERABLES
           - app.php
           - src/**
           - tests/**
           - env-lite.php
           - health-lite.php
           - .htaccess
-          PRELUDE
+          PRE
+          fi
 
           if [ -f "AGENTS.md" ]; then
             printf "\n\n---\n\n# AGENTS.md\n\n" >> "$PROMPT_FILE"
@@ -103,7 +102,7 @@ jobs:
 
           echo "file=$PROMPT_FILE" >> "$GITHUB_OUTPUT"
 
-      - name: "Preflight: OPENAI_API_KEY"
+      - name: "Check OPENAI_API_KEY"
         env:
           OPENAI_API_KEY: "${{ secrets.OPENAI_API_KEY }}"
         shell: "bash"
@@ -123,7 +122,7 @@ jobs:
           model: "${{ env.SELECTED_MODEL }}"
           sandbox: "workspace-write"
 
-      - name: "Guard: discard edits under .github/workflows"
+      - name: "Guard: drop .github/workflows edits"
         shell: "bash"
         run: |
           set -eu
@@ -133,7 +132,7 @@ jobs:
             git restore --staged ".github/workflows" || true
           fi
 
-      - name: "Stage & maybe commit"
+      - name: "Stage & commit"
         id: "stage"
         shell: "bash"
         run: |
@@ -147,13 +146,13 @@ jobs:
           git commit -m "chore(ai): apply Codex generated code"
           echo "changed=true" >> "$GITHUB_OUTPUT"
 
-      - name: "Create Pull Request"
+      - name: "Create PR"
         if: ${{ steps.stage.outputs.changed == 'true' }}
         uses: "peter-evans/create-pull-request@v7"
         with:
           token: "${{ github.token }}"
-          title: "AI: full regeneration from specs"
-          body: "Automated full regeneration by Codex based on specs."
+          title: "AI: regeneration from specs (${{ inputs.mode }})"
+          body: "Automated regeneration by Codex based on specs."
           commit-message: "chore(ai): apply Codex generated code"
           branch: "ai/codex/batch-${{ github.run_id }}"
           base: "main"
