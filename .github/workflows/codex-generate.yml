@@ -1,4 +1,4 @@
-name: "Codex Generate (spec_fixed_v3)"
+name: "Codex Generate (spec_fixed_v3, no-heredoc)"
 
 on:
   workflow_dispatch:
@@ -31,8 +31,9 @@ concurrency:
 jobs:
   generate:
     runs-on: ubuntu-latest
+
     env:
-      # 既定の安全デフォルト（file-globs.yml が読めない場合のフォールバック）
+      # file-globs.yml が読めない場合の安全デフォルト
       ALLOWED_WRITE_DEFAULT: |
         src/**
         tests/**
@@ -55,6 +56,7 @@ jobs:
         evidence/pkg
         evidence/verify
         dist
+
     steps:
       - name: "Checkout"
         uses: actions/checkout@v4
@@ -75,15 +77,14 @@ jobs:
         shell: bash
         run: |
           set -Eeuo pipefail
-          printf "" > ai/.keep
           mkdir -p ai
+          : > ai/.keep
 
-          # 生成用プロンプトを作る（順序を固定）
           PROMPT="ai/prompt.md"
           : > "$PROMPT"
 
           add_file() {
-            local f="$1"
+            f="$1"
             if [ -f "$f" ]; then
               printf "\n\n---\n\n# %s\n\n" "$f" >> "$PROMPT"
               cat "$f" >> "$PROMPT"
@@ -92,7 +93,7 @@ jobs:
             fi
           }
 
-          # 1) AGENTS.md（任意）
+          # 1) AGENTS（任意）
           if [ -f AGENTS.md ]; then
             printf "# AGENTS.md（方針）\n\n" >> "$PROMPT"
             cat AGENTS.md >> "$PROMPT"
@@ -103,17 +104,17 @@ jobs:
           add_file "spec/foundation/contracts.md"
           add_file "spec/foundation/file-globs.yml"
 
-          # 3) tests（概要とゲート定義）
+          # 3) tests
           add_file "spec/tests/policies.md"
           add_file "spec/tests/gate-matrix.yml"
 
-          # 4) env（方針＋選択プロファイル＋Apache正本）
+          # 4) env（選択プロファイル含む）
           add_file "spec/env/policies.md"
           profile="spec/env/profiles/${{ github.event.inputs.env_profile || 'base' }}.yml"
           add_file "$profile"
           add_file "spec/env/apache/htaccess.bnorm.conf"
 
-          # 5) features（機能の正本）
+          # 5) features
           add_file "spec/features/policies.md"
           add_file "spec/features/endpoints.md"
           add_file "spec/features/provider_setup.md"
@@ -127,41 +128,38 @@ jobs:
           add_file "spec/features/logs.md"
           add_file "spec/features/acceptance_e2e.md"
 
-          # 先頭に実行タスクを明示（生成方針/AHR/出力期待）
+          # 実行タスク明示
           TASK="ai/task.md"
           : > "$TASK"
           printf "# TASK\n\n" >> "$TASK"
-          printf "- mode: %s\n" "${{ inputs.mode }}"
-          printf "- env_profile: %s\n" "${{ inputs.env_profile }}"
+          printf "- mode: %s\n" "${{ inputs.mode }}" >> "$TASK"
+          printf "- env_profile: %s\n" "${{ inputs.env_profile }}" >> "$TASK"
           printf "\n## 要求\n" >> "$TASK"
-          printf "1) %s モードで、仕様に従い **必要ファイルを一式生成/更新** すること（言語/FW固定は仕様準拠）。\n" "${{ inputs.mode }}"
-          printf "2) `spec/foundation/file-globs.yml` の `allowed_write` に **厳密に従う** こと（フォールバックは ALLOWED_WRITE_DEFAULT）。\n" >> "$TASK"
-          printf "3) `spec/tests/runner/run_checks.sh` が **合格** すること（失敗時は最小差分で自己修復=AHRし、再検査）。\n" >> "$TASK"
-          printf "4) 合格時は `dist/package.zip` を作成（pack provenance を満たす）。\n" >> "$TASK"
+          printf "1) %s モードで仕様に従い **必要ファイルを一式生成/更新** すること。\n" "${{ inputs.mode }}" >> "$TASK"
+          printf "2) `spec/foundation/file-globs.yml` の `allowed_write` を厳守（無ければ安全デフォルト）。\n" >> "$TASK"
+          printf "3) `spec/tests/runner/run_checks.sh` を PASS させること（失敗時は最小差分で自己修復の再試行を1回）。\n" >> "$TASK"
+          printf "4) 合格時は `dist/package.zip` を生成。\n" >> "$TASK"
           printf "\n---\n" >> "$TASK"
 
-          # 合成
           cat "$TASK" "$PROMPT" > ai/COMPOSITE_PROMPT.md
           wc -c ai/COMPOSITE_PROMPT.md
 
-      - name: "Scaffold minimal workspace"
+      - name: "Scaffold minimal workspace (no-heredoc)"
         shell: bash
         run: |
           set -Eeuo pipefail
-          # 既定ディレクトリ
-          while IFS= read -r d; do
+          DIRS="src
+tests
+tools
+storage
+evidence/static
+evidence/runtime
+evidence/pkg
+evidence/verify
+dist"
+          printf "%s\n" "$DIRS" | while IFS= read -r d; do
             [ -n "$d" ] && mkdir -p "$d"
-          done <<'EOFREQ'
-          src
-          tests
-          tools
-          storage
-          evidence/static
-          evidence/runtime
-          evidence/pkg
-          evidence/verify
-          dist
-EOFREQ
+          done
 
       - name: "git config (bot identity)"
         shell: bash
@@ -170,7 +168,6 @@ EOFREQ
           git config user.name "codex-bot"
           git config user.email "codex-bot@example.invalid"
 
-      # Codex 実行（Attempt 1）
       - name: "Run Codex (attempt 1)"
         id: codex1
         uses: openai/codex-action@main
@@ -182,22 +179,14 @@ EOFREQ
           sandbox: "workspace-write"
           model: "${{ inputs.model }}"
 
-      - name: "Make test runner executable (if not)"
+      - name: "Make test runner executable (if exists)"
         shell: bash
         run: |
           set -Eeuo pipefail
-          if [ -f spec/tests/runner/run_checks.sh ]; then
-            chmod +x spec/tests/runner/run_checks.sh
-          fi
-          if [ -f spec/tests/tools/polyglot_lint.sh ]; then
-            chmod +x spec/tests/tools/polyglot_lint.sh
-          fi
-          if [ -f spec/tests/tools/render_smoke.sh ]; then
-            chmod +x spec/tests/tools/render_smoke.sh
-          fi
-          if [ -f spec/tests/tools/verify_report.sh ]; then
-            chmod +x spec/tests/tools/verify_report.sh
-          fi
+          [ -f spec/tests/runner/run_checks.sh ] && chmod +x spec/tests/runner/run_checks.sh || true
+          [ -f spec/tests/tools/polyglot_lint.sh ] && chmod +x spec/tests/tools/polyglot_lint.sh || true
+          [ -f spec/tests/tools/render_smoke.sh ] && chmod +x spec/tests/tools/render_smoke.sh || true
+          [ -f spec/tests/tools/verify_report.sh ] && chmod +x spec/tests/tools/verify_report.sh || true
 
       - name: "Run tests (attempt 1)"
         id: test1
@@ -211,28 +200,32 @@ EOFREQ
           bash spec/tests/runner/run_checks.sh
           echo "exit_code=$?" >> "$GITHUB_OUTPUT"
 
-      # 失敗したら最小差分の AHR を 1 回だけ実施
-      - name: "Auto-Heal & Retry: build fix context"
+      - name: "Auto-Heal & Retry: compose fix context"
         if: ${{ steps.test1.outputs.exit_code != '0' }}
-        id: fixctx
         shell: bash
         run: |
           set -Eeuo pipefail
           mkdir -p ai
           FIX="ai/fix_context.txt"
           : > "$FIX"
-          [ -f COMPLIANCE.json ] && { printf "## COMPLIANCE.json\n" >> "$FIX"; cat COMPLIANCE.json >> "$FIX"; printf "\n---\n" >> "$FIX"; } || true
+          if [ -f COMPLIANCE.json ]; then
+            printf "## COMPLIANCE.json\n" >> "$FIX"
+            cat COMPLIANCE.json >> "$FIX"
+            printf "\n---\n" >> "$FIX"
+          fi
           for f in evidence/static/POLYGLOT_LINT.err evidence/static/RENDER_SMOKE.err; do
-            [ -f "$f" ] && { printf "## %s\n" "$f" >> "$FIX"; tail -n 200 "$f" >> "$FIX"; printf "\n---\n" >> "$FIX"; }
+            if [ -f "$f" ]; then
+              printf "## %s\n" "$f" >> "$FIX"
+              tail -n 200 "$f" >> "$FIX"
+              printf "\n---\n" >> "$FIX"
+            fi
           done
-          printf "## Instruction\n" >> "$FIX"
-          printf "上記ログに基づき、最小差分で修正して tests を PASS させてください。\n" >> "$FIX"
+          printf "## Instruction\n最小差分で修正し、tests を PASS させてください。\n" >> "$FIX"
           cat ai/COMPOSITE_PROMPT.md "$FIX" > ai/COMPOSITE_PROMPT_FIX.md
           wc -c ai/COMPOSITE_PROMPT_FIX.md
 
       - name: "Run Codex (attempt 2 - AHR)"
         if: ${{ steps.test1.outputs.exit_code != '0' }}
-        id: codex2
         uses: openai/codex-action@main
         env:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
@@ -244,14 +237,11 @@ EOFREQ
 
       - name: "Run tests (attempt 2)"
         if: ${{ steps.test1.outputs.exit_code != '0' }}
-        id: test2
-        continue-on-error: false
         shell: bash
         run: |
           set -Eeuo pipefail
           bash spec/tests/runner/run_checks.sh
 
-      # allowed_write に従ってステージング
       - name: "Resolve allowed_write (file-globs.yml or default)"
         id: allow
         shell: bash
@@ -259,12 +249,12 @@ EOFREQ
           set -Eeuo pipefail
           ALLOWED="$GITHUB_WORKSPACE/ai/allowed.txt"
           : > "$ALLOWED"
+
           if [ -f spec/foundation/file-globs.yml ]; then
-            # 簡易抽出（yq無しで最小実装）
+            # yq なし簡易抽出: allowed_write セクションの箇条書き行のみ
             awk 'f{print} /allowed_write:/{f=1} /^(scaffold:|forbidden_write:)/{f=0}' spec/foundation/file-globs.yml \
               | grep -E '^\s*-\s*' | sed -E 's/^\s*-\s*"?([^"]+)"?/\1/' >> "$ALLOWED" || true
           fi
-
           if ! grep -q . "$ALLOWED"; then
             printf "%s\n" "${ALLOWED_WRITE_DEFAULT}" >> "$ALLOWED"
           fi
@@ -272,12 +262,11 @@ EOFREQ
           echo "Allowed patterns:"
           cat "$ALLOWED"
 
-          # 一旦すべての変更を差し戻し、allowed のみ add
+          # ステージングを許可パターンに限定
           git reset
           git checkout -- .
           git add -A :/
           git reset
-
           while IFS= read -r pat; do
             [ -z "$pat" ] && continue
             git add -f $pat 2>/dev/null || true
@@ -292,11 +281,8 @@ EOFREQ
         run: |
           set -Eeuo pipefail
           mkdir -p dist
-          # 代表的な領域のみをパッケージ
           zip -qr dist/package.zip src tests tools public app.php env-lite.php health-lite.php .htaccess COMPLIANCE.json 2>/dev/null || true
-          if [ -f dist/package.zip ]; then
-            echo "ZIP_READY_OK" > evidence/pkg/ZIP_READY_OK.txt
-          fi
+          [ -f dist/package.zip ] && echo "ZIP_READY_OK" > evidence/pkg/ZIP_READY_OK.txt || true
 
       - name: "Upload artifact (package.zip / evidence)"
         if: ${{ success() }}
@@ -314,12 +300,10 @@ EOFREQ
           title: "AI: Codex generate (${{ inputs.mode }} / env:${{ inputs.env_profile }})"
           body: |
             Automated generation from spec_fixed_v3:
-            - foundation/tests/env/features (ordered composite prompt)
+            - foundation/tests/env/features（ordered）
             - AHR: up to 1 retry
             - Tests: spec/tests/runner/run_checks.sh
-
-            Artifacts:
-            - dist/package.zip (if present)
+            - Artifacts: dist/package.zip（if present）
           commit-message: "chore(ai): codex generate (${{ inputs.mode }} / env:${{ inputs.env_profile }})"
           branch: "ai/codex/batch-${{ github.run_id }}"
           base: "main"
