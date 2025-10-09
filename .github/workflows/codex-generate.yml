@@ -1,0 +1,160 @@
+name: "Codex Generate & PR (full regen)"
+
+on:
+  push:
+    branches: ["**"]
+    paths: ["spec/**", "AGENTS.md"]
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "実行モード: full(再生成) / incremental(差分)"
+        required: false
+        default: "full"
+      model:
+        description: "（任意）OpenAIモデル名（未指定＝既定）"
+        required: false
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: "codex-${{ github.ref }}"
+  cancel-in-progress: false
+
+env:
+  REGEN_MODE: "${{ github.event.inputs.mode || 'full' }}"
+  SELECTED_MODEL: "${{ github.event.inputs.model || '' }}"
+
+jobs:
+  generate:
+    runs-on: "ubuntu-latest"
+
+    steps:
+      - name: "Checkout"
+        uses: "actions/checkout@v4"
+        with:
+          fetch-depth: 0
+
+      - name: "Set Git identity"
+        shell: "bash"
+        run: |
+          set -eu
+          git config --global user.email "ci-bot@example.invalid"
+          git config --global user.name  "CI Bot"
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      - name: "Preflight: require specs"
+        shell: "bash"
+        run: |
+          set -euo pipefail
+          for f in spec/generation.txt spec/testing.txt spec/environment.txt spec/functional.txt; do
+            [ -f "$f" ] || { echo "::error::Missing spec: $f"; exit 1; }
+          done
+
+      - name: "Wipe repository except specs & workflows (full regen)"
+        if: ${{ env.REGEN_MODE == 'full' }}
+        shell: "bash"
+        run: |
+          set -euo pipefail
+          echo "Full regeneration: wiping working tree (keep specs & workflows)"
+          git rm -r --cached . || true
+          git add ".github" || true
+          git add "spec" || true
+          [ -f "AGENTS.md" ]  && git add "AGENTS.md"  || true
+          [ -f "README.md" ]  && git add "README.md"  || true
+          [ -f ".gitignore" ] && git add ".gitignore" || true
+          git clean -fdx -e ".github" -e ".github/workflows" -e "spec" -e "spec/**" -e "AGENTS.md" -e "README.md" -e ".gitignore"
+          git commit -m "chore(ai): wipe tree for full regeneration" || echo "no wipe commit"
+
+      - name: "Build composite prompt"
+        id: "prompt"
+        shell: "bash"
+        run: |
+          set -euo pipefail
+          PROMPT_FILE="$RUNNER_TEMP/prompt.md"
+          : > "$PROMPT_FILE"
+
+          cat >> "$PROMPT_FILE" <<'PRELUDE'
+          # TASK
+          - Clarification を行わず直ちに実装する。
+          - 出力は「ファイル追加・更新」パッチのみ（説明文は出力しない）。
+          - 生成先: `src/**`（本体）, `tests/**`（テスト）, 必要に応じて `app.php`, `.htaccess`, `env-lite.php`, `health-lite.php` を生成。
+          - 仕様で規定したディレクトリ構造を厳守。余分なファイルは作らない。
+
+          ## DELIVERABLES (MUST)
+          - app.php
+          - src/**
+          - tests/**
+          - env-lite.php
+          - health-lite.php
+          - .htaccess
+          PRELUDE
+
+          if [ -f "AGENTS.md" ]; then
+            printf "\n\n---\n\n# AGENTS.md\n\n" >> "$PROMPT_FILE"
+            sed -e 's/\r$//' "AGENTS.md" >> "$PROMPT_FILE"
+          fi
+
+          for f in spec/generation.txt spec/testing.txt spec/environment.txt spec/functional.txt; do
+            printf "\n\n---\n\n# %s\n\n" "$f" >> "$PROMPT_FILE"
+            sed -e 's/\r$//' "$f" >> "$PROMPT_FILE"
+          done
+
+          echo "file=$PROMPT_FILE" >> "$GITHUB_OUTPUT"
+
+      - name: "Preflight: OPENAI_API_KEY"
+        env:
+          OPENAI_API_KEY: "${{ secrets.OPENAI_API_KEY }}"
+        shell: "bash"
+        run: |
+          set -eu
+          [ -n "${OPENAI_API_KEY:-}" ] || { echo "::error::OPENAI_API_KEY missing"; exit 1; }
+          echo "OPENAI_API_KEY present"
+
+      - name: "Run Codex"
+        id: "codex"
+        uses: "openai/codex-action@main"
+        env:
+          OPENAI_API_KEY: "${{ secrets.OPENAI_API_KEY }}"
+        with:
+          openai-api-key: "${{ secrets.OPENAI_API_KEY }}"
+          prompt-file: "${{ steps.prompt.outputs.file }}"
+          model: "${{ env.SELECTED_MODEL }}"
+          sandbox: "workspace-write"
+
+      - name: "Guard: discard edits under .github/workflows"
+        shell: "bash"
+        run: |
+          set -eu
+          if git status --porcelain | grep -E '^[AMDR].*\.github/workflows/'; then
+            echo "::warning::Discarding .github/workflows changes"
+            git checkout -- ".github/workflows" || true
+            git restore --staged ".github/workflows" || true
+          fi
+
+      - name: "Stage & maybe commit"
+        id: "stage"
+        shell: "bash"
+        run: |
+          set -euo pipefail
+          git add -A
+          if git diff --cached --quiet; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "No changes from Codex."
+            exit 0
+          fi
+          git commit -m "chore(ai): apply Codex generated code"
+          echo "changed=true" >> "$GITHUB_OUTPUT"
+
+      - name: "Create Pull Request"
+        if: ${{ steps.stage.outputs.changed == 'true' }}
+        uses: "peter-evans/create-pull-request@v7"
+        with:
+          token: "${{ github.token }}"
+          title: "AI: full regeneration from specs"
+          body: "Automated full regeneration by Codex based on specs."
+          commit-message: "chore(ai): apply Codex generated code"
+          branch: "ai/codex/batch-${{ github.run_id }}"
+          base: "main"
+          delete-branch: true
