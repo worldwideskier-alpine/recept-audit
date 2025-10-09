@@ -1,310 +1,165 @@
-name: "Codex Generate (spec_fixed_v3, no-heredoc)"
+name: "Codex Generate (spec-driven)"
 
 on:
   workflow_dispatch:
     inputs:
       mode:
-        description: "生成モード: full（更地から一式）/ incremental（差分更新）"
-        type: choice
-        required: true
-        default: full
-        options: [full, incremental]
-      env_profile:
-        description: "環境プロファイル: base / dev / prod"
-        type: choice
-        required: true
-        default: base
-        options: [base, dev, prod]
+        description: "実行モード（full=全生成 / incremental=差分）"
+        required: false
+        default: "full"
       model:
-        description: "(任意) OpenAI モデル指定（空なら既定）"
+        description: "利用するモデル名（未指定可）"
         required: false
         default: ""
+  push:
+    branches: ["main"]
+    paths:
+      - "spec/**"
+      - ".github/workflows/codex-generate.yml"
 
 permissions:
   contents: write
   pull-requests: write
 
-concurrency:
-  group: "codex-${{ github.ref }}"
-  cancel-in-progress: false
-
 jobs:
   generate:
+    name: "generate"
     runs-on: ubuntu-latest
 
     env:
-      # file-globs.yml が読めない場合の安全デフォルト
-      ALLOWED_WRITE_DEFAULT: |
-        src/**
-        tests/**
-        tools/**
-        storage/**
-        evidence/**
-        dist/**
-        .htaccess
-        app.php
-        env-lite.php
-        health-lite.php
-        COMPLIANCE.json
-      REQUIRED_DIRS_DEFAULT: |
-        src
-        tests
-        tools
-        storage
-        evidence/static
-        evidence/runtime
-        evidence/pkg
-        evidence/verify
-        dist
+      # 仕様書（存在するものだけを順に結合）
+      SPEC_FILES: "spec/generation.txt spec/testing.txt spec/environment.txt spec/functional.txt"
+      PROMPT_FILE: "ai/prompt.md"
+      DEFECTS_DIR: "ai/defects"
+      OPENAI_MODEL_DEFAULT: ""
+      ALLOW_MODE: "${{ github.event.inputs.mode || 'full' }}"
 
     steps:
       - name: "Checkout"
         uses: actions/checkout@v4
 
-      - name: "Preflight: OPENAI_API_KEY"
+      - name: "Setup Node"
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+
+      - name: "Preflight: check OPENAI_API_KEY"
         shell: bash
-        env:
-          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
         run: |
           set -Eeuo pipefail
-          if [ -z "${OPENAI_API_KEY:-}" ]; then
-            echo "::error::OPENAI_API_KEY is empty (Secrets)"; exit 1
+          if [ -z "${{ secrets.OPENAI_API_KEY }}" ]; then
+            echo "::error::OPENAI_API_KEY is missing in repo secrets"
+            exit 1
           fi
-          echo "OPENAI_API_KEY present"
 
-      - name: "Gather spec files (ordered)"
-        id: gather
+      - name: "Prepare folders"
         shell: bash
         run: |
           set -Eeuo pipefail
-          mkdir -p ai
-          : > ai/.keep
+          mkdir -p "$(dirname "$PROMPT_FILE")" "$DEFECTS_DIR"
 
-          PROMPT="ai/prompt.md"
-          : > "$PROMPT"
-
-          add_file() {
-            f="$1"
+      - name: "Compose prompt from specs (no heredoc)"
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          : > "$PROMPT_FILE"
+          for f in $SPEC_FILES; do
             if [ -f "$f" ]; then
-              printf "\n\n---\n\n# %s\n\n" "$f" >> "$PROMPT"
-              cat "$f" >> "$PROMPT"
-            else
-              echo "WARN: missing $f" >&2
+              printf '%s\n' '---' "<!-- file: '"$f"' -->" >> "$PROMPT_FILE"
+              sed -e 's/\r$//' "$f" >> "$PROMPT_FILE"
+              printf '\n' >> "$PROMPT_FILE"
             fi
-          }
-
-          # 1) AGENTS（任意）
-          if [ -f AGENTS.md ]; then
-            printf "# AGENTS.md（方針）\n\n" >> "$PROMPT"
-            cat AGENTS.md >> "$PROMPT"
+          done
+          if [ ! -s "$PROMPT_FILE" ]; then
+            echo "::error::No spec files found to compose prompt."
+            exit 1
           fi
 
-          # 2) foundation
-          add_file "spec/foundation/policies.md"
-          add_file "spec/foundation/contracts.md"
-          add_file "spec/foundation/file-globs.yml"
-
-          # 3) tests
-          add_file "spec/tests/policies.md"
-          add_file "spec/tests/gate-matrix.yml"
-
-          # 4) env（選択プロファイル含む）
-          add_file "spec/env/policies.md"
-          profile="spec/env/profiles/${{ github.event.inputs.env_profile || 'base' }}.yml"
-          add_file "$profile"
-          add_file "spec/env/apache/htaccess.bnorm.conf"
-
-          # 5) features
-          add_file "spec/features/policies.md"
-          add_file "spec/features/endpoints.md"
-          add_file "spec/features/provider_setup.md"
-          add_file "spec/features/data_model.md"
-          add_file "spec/features/schema.required.json"
-          add_file "spec/features/env_matrix.json"
-          add_file "spec/features/imports.md"
-          add_file "spec/features/cli.md"
-          add_file "spec/features/cron.md"
-          add_file "spec/features/ui_rbac.md"
-          add_file "spec/features/logs.md"
-          add_file "spec/features/acceptance_e2e.md"
-
-          # 実行タスク明示
-          TASK="ai/task.md"
-          : > "$TASK"
-          printf "# TASK\n\n" >> "$TASK"
-          printf "- mode: %s\n" "${{ inputs.mode }}" >> "$TASK"
-          printf "- env_profile: %s\n" "${{ inputs.env_profile }}" >> "$TASK"
-          printf "\n## 要求\n" >> "$TASK"
-          printf "1) %s モードで仕様に従い **必要ファイルを一式生成/更新** すること。\n" "${{ inputs.mode }}" >> "$TASK"
-          printf "2) `spec/foundation/file-globs.yml` の `allowed_write` を厳守（無ければ安全デフォルト）。\n" >> "$TASK"
-          printf "3) `spec/tests/runner/run_checks.sh` を PASS させること（失敗時は最小差分で自己修復の再試行を1回）。\n" >> "$TASK"
-          printf "4) 合格時は `dist/package.zip` を生成。\n" >> "$TASK"
-          printf "\n---\n" >> "$TASK"
-
-          cat "$TASK" "$PROMPT" > ai/COMPOSITE_PROMPT.md
-          wc -c ai/COMPOSITE_PROMPT.md
-
-      - name: "Scaffold minimal workspace (no-heredoc)"
+      - name: "Scaffold minimal workspace (no heredoc, no multiline vars)"
         shell: bash
         run: |
           set -Eeuo pipefail
-          DIRS="src
-tests
-tools
-storage
-evidence/static
-evidence/runtime
-evidence/pkg
-evidence/verify
-dist"
-          printf "%s\n" "$DIRS" | while IFS= read -r d; do
-            [ -n "$d" ] && mkdir -p "$d"
-          done
+          printf '%s\n' \
+            'src' \
+            'tests' \
+            'tools' \
+            'storage' \
+            'evidence/static' \
+            'evidence/runtime' \
+            'evidence/pkg' \
+            'evidence/verify' \
+            'dist' \
+          | while IFS= read -r d; do
+              mkdir -p "$d"
+            done
 
-      - name: "git config (bot identity)"
-        shell: bash
-        run: |
-          set -Eeuo pipefail
-          git config user.name "codex-bot"
-          git config user.email "codex-bot@example.invalid"
-
-      - name: "Run Codex (attempt 1)"
+      - name: "Run Codex (pass 1)"
         id: codex1
         uses: openai/codex-action@main
-        env:
-          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
         with:
-          openai-api-key: ${{ secrets.OPENAI_API_KEY }}
-          prompt-file: "ai/COMPOSITE_PROMPT.md"
+          openai-api-key: "${{ secrets.OPENAI_API_KEY }}"
+          prompt-file: "${{ env.PROMPT_FILE }}"
+          model: "${{ github.event.inputs.model || env.OPENAI_MODEL_DEFAULT }}"
           sandbox: "workspace-write"
-          model: "${{ inputs.model }}"
 
-      - name: "Make test runner executable (if exists)"
+      - name: "Validate PHP require/include (simple check)"
         shell: bash
         run: |
           set -Eeuo pipefail
-          [ -f spec/tests/runner/run_checks.sh ] && chmod +x spec/tests/runner/run_checks.sh || true
-          [ -f spec/tests/tools/polyglot_lint.sh ] && chmod +x spec/tests/tools/polyglot_lint.sh || true
-          [ -f spec/tests/tools/render_smoke.sh ] && chmod +x spec/tests/tools/render_smoke.sh || true
-          [ -f spec/tests/tools/verify_report.sh ] && chmod +x spec/tests/tools/verify_report.sh || true
-
-      - name: "Run tests (attempt 1)"
-        id: test1
-        continue-on-error: true
-        shell: bash
-        run: |
-          set -Eeuo pipefail
-          if [ ! -f spec/tests/runner/run_checks.sh ]; then
-            echo "::error::spec/tests/runner/run_checks.sh not found"; exit 1
-          fi
-          bash spec/tests/runner/run_checks.sh
-          echo "exit_code=$?" >> "$GITHUB_OUTPUT"
-
-      - name: "Auto-Heal & Retry: compose fix context"
-        if: ${{ steps.test1.outputs.exit_code != '0' }}
-        shell: bash
-        run: |
-          set -Eeuo pipefail
-          mkdir -p ai
-          FIX="ai/fix_context.txt"
-          : > "$FIX"
-          if [ -f COMPLIANCE.json ]; then
-            printf "## COMPLIANCE.json\n" >> "$FIX"
-            cat COMPLIANCE.json >> "$FIX"
-            printf "\n---\n" >> "$FIX"
-          fi
-          for f in evidence/static/POLYGLOT_LINT.err evidence/static/RENDER_SMOKE.err; do
-            if [ -f "$f" ]; then
-              printf "## %s\n" "$f" >> "$FIX"
-              tail -n 200 "$f" >> "$FIX"
-              printf "\n---\n" >> "$FIX"
-            fi
-          done
-          printf "## Instruction\n最小差分で修正し、tests を PASS させてください。\n" >> "$FIX"
-          cat ai/COMPOSITE_PROMPT.md "$FIX" > ai/COMPOSITE_PROMPT_FIX.md
-          wc -c ai/COMPOSITE_PROMPT_FIX.md
-
-      - name: "Run Codex (attempt 2 - AHR)"
-        if: ${{ steps.test1.outputs.exit_code != '0' }}
-        uses: openai/codex-action@main
-        env:
-          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-        with:
-          openai-api-key: ${{ secrets.OPENAI_API_KEY }}
-          prompt-file: "ai/COMPOSITE_PROMPT_FIX.md"
-          sandbox: "workspace-write"
-          model: "${{ inputs.model }}"
-
-      - name: "Run tests (attempt 2)"
-        if: ${{ steps.test1.outputs.exit_code != '0' }}
-        shell: bash
-        run: |
-          set -Eeuo pipefail
-          bash spec/tests/runner/run_checks.sh
-
-      - name: "Resolve allowed_write (file-globs.yml or default)"
-        id: allow
-        shell: bash
-        run: |
-          set -Eeuo pipefail
-          ALLOWED="$GITHUB_WORKSPACE/ai/allowed.txt"
-          : > "$ALLOWED"
-
-          if [ -f spec/foundation/file-globs.yml ]; then
-            # yq なし簡易抽出: allowed_write セクションの箇条書き行のみ
-            awk 'f{print} /allowed_write:/{f=1} /^(scaffold:|forbidden_write:)/{f=0}' spec/foundation/file-globs.yml \
-              | grep -E '^\s*-\s*' | sed -E 's/^\s*-\s*"?([^"]+)"?/\1/' >> "$ALLOWED" || true
-          fi
-          if ! grep -q . "$ALLOWED"; then
-            printf "%s\n" "${ALLOWED_WRITE_DEFAULT}" >> "$ALLOWED"
+          : > "$DEFECTS_DIR/missing-requires.txt"
+          mapfile -t php_files < <(git ls-files -- '*.php' 2>/dev/null || true)
+          if [ "${#php_files[@]}" -gt 0 ]; then
+            for f in "${php_files[@]}"; do
+              # ざっくり抽出（シングル/ダブルクォート対応）
+              mapfile -t targets < <(grep -Eo "require(_once)?\s*\(\s*['\"][^'\"]+['\"]\s*\)|include(_once)?\s*\(\s*['\"][^'\"]+['\"]\s*\)" "$f" \
+                | sed -E "s/.*\(['\"]([^'\"]+)['\"]\).*/\1/")
+              for t in "${targets[@]}"; do
+                # 相対パスはファイル基準で解決
+                if [[ "$t" != /* ]]; then
+                  base="$(dirname "$f")"
+                  path="$base/$t"
+                else
+                  path="$t"
+                fi
+                if [ ! -f "$path" ]; then
+                  printf '%s\t%s -> %s\n' "MISSING" "$f" "$t" >> "$DEFECTS_DIR/missing-requires.txt"
+                fi
+              done
+            done
           fi
 
-          echo "Allowed patterns:"
-          cat "$ALLOWED"
+          if [ -s "$DEFECTS_DIR/missing-requires.txt" ]; then
+            echo "::warning::Some required/include files are missing. See $DEFECTS_DIR/missing-requires.txt"
+          fi
 
-          # ステージングを許可パターンに限定
-          git reset
-          git checkout -- .
-          git add -A :/
-          git reset
-          while IFS= read -r pat; do
-            [ -z "$pat" ] && continue
-            git add -f $pat 2>/dev/null || true
-          done < "$ALLOWED"
-
-          echo "Staged files:"
-          git status --porcelain
-
-      - name: "Package dist (zip) after PASS"
-        if: ${{ success() }}
+      - name: "Show diff summary"
         shell: bash
         run: |
           set -Eeuo pipefail
-          mkdir -p dist
-          zip -qr dist/package.zip src tests tools public app.php env-lite.php health-lite.php .htaccess COMPLIANCE.json 2>/dev/null || true
-          [ -f dist/package.zip ] && echo "ZIP_READY_OK" > evidence/pkg/ZIP_READY_OK.txt || true
+          git status --porcelain=v1 || true
+          git diff --stat || true
 
-      - name: "Upload artifact (package.zip / evidence)"
-        if: ${{ success() }}
-        uses: actions/upload-artifact@v4
-        with:
-          name: "codex-artifacts-${{ github.run_id }}"
-          path: |
-            dist/package.zip
-            evidence/**
+      - name: "Configure git author"
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          git config --global user.email "ci-bot@example.invalid"
+          git config --global user.name  "CI Bot"
 
       - name: "Create Pull Request"
-        if: ${{ success() }}
         uses: peter-evans/create-pull-request@v7
         with:
-          title: "AI: Codex generate (${{ inputs.mode }} / env:${{ inputs.env_profile }})"
-          body: |
-            Automated generation from spec_fixed_v3:
-            - foundation/tests/env/features（ordered）
-            - AHR: up to 1 retry
-            - Tests: spec/tests/runner/run_checks.sh
-            - Artifacts: dist/package.zip（if present）
-          commit-message: "chore(ai): codex generate (${{ inputs.mode }} / env:${{ inputs.env_profile }})"
+          token: "${{ github.token }}"
           branch: "ai/codex/batch-${{ github.run_id }}"
           base: "main"
-          delete-branch: true
+          title: "AI: codegen (${{ env.ALLOW_MODE }})"
+          body: |
+            Automated code generation from specs.
+            - mode: `${{ env.ALLOW_MODE }}`
+            - model: `${{ github.event.inputs.model || 'default' }}`
+            - defects: see `ai/defects/` if present
+          add-paths: |
+            .
+          signoff: false
+          draft: false
