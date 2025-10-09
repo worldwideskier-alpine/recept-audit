@@ -4,12 +4,12 @@ on:
   workflow_call:
     inputs:
       mode:
-        description: "full:全再生成 / incremental:差分"
+        description: "full:全集成 / incremental:差分"
         required: false
         default: "full"
         type: string
       model:
-        description: "OpenAI model（未指定可）"
+        description: "OpenAIモデル名（空欄可）"
         required: false
         default: ""
         type: string
@@ -27,8 +27,6 @@ env:
     spec/testing.txt
     spec/environment.txt
     spec/functional.txt
-
-  # 変更を許可するパス
   ALLOWED_GLOBS: |
     src/**
     tests/**
@@ -44,7 +42,6 @@ env:
 jobs:
   codex:
     runs-on: ubuntu-latest
-
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -67,12 +64,15 @@ jobs:
           mkdir -p ai/defects
           : > ai/defects/missing-requires.txt
 
-      # -------- 1st pass --------
       - name: Compose prompt (pass 1)
         shell: bash
         run: |
           set -euo pipefail
-          cat ai/prompt.md > ai/prompt.combined.md
+          if [ -f ai/prompt.md ]; then
+            cat ai/prompt.md > ai/prompt.combined.md
+          else
+            printf "# Prompt\n\n" > ai/prompt.combined.md
+          fi
           if [ -s ai/defects/missing-requires.txt ]; then
             printf "\n\n## Missing artifacts to create\n" >> ai/prompt.combined.md
             cat ai/defects/missing-requires.txt >> ai/prompt.combined.md
@@ -98,8 +98,8 @@ jobs:
           mapfile -t PHP_FILES < <(git ls-files -- "*.php" || true)
           for f in "${PHP_FILES[@]}"; do
             while IFS= read -r line; do
-              req_path=$(echo "$line" | sed -E 's/.*require(_once)?\s*\(?["'\'']([^"'\''\)]+)["'\'']\)?;.*/\2/')
-              [[ -z "$req_path" ]] && continue
+              req_path=$(echo "$line" | sed -E 's/.*require(_once)?\s*\(?["'\''"]([^"'\''\)]+)["'\''"]\)?;.*/\2/')
+              [ -n "$req_path" ] || continue
               case "$req_path" in /*) continue ;; esac
               base_dir=$(dirname "$f")
               target=$(python3 - << 'PY'
@@ -107,25 +107,19 @@ import os,sys
 print(os.path.normpath(os.path.join(sys.argv[1], sys.argv[2])))
 PY
 "$base_dir" "$req_path")
-              if [ ! -f "$target" ]; then
-                rel=$(realpath --relative-to="." "$target" 2>/dev/null || echo "$target")
-                MISSING+=("$rel  # required by $f")
-              fi
-            done < <(grep -nE 'require(_once)?\s*\(|require(_once)?\s*["'\'']|include\s*\(|include\s*["'\'']' "$f" || true)
+              [ -f "$target" ] || MISSING+=("$(realpath --relative-to="." "$target" 2>/dev/null || echo "$target")  # required by $f")
+            done < <(grep -nE 'require(_once)?\s*\(|require(_once)?\s*["'\''"]|include\s*\(|include\s*["'\''"]' "$f" || true)
           done
           if [ ${#MISSING[@]} -gt 0 ]; then
             {
               echo "### Create these files with implementations:"
               printf -- "- %s\n" "${MISSING[@]}"
-              echo
-              echo "_Each file must include the functions/classes expected by callers._"
             } > ai/defects/missing-requires.txt
             echo "missing=true" >> "$GITHUB_OUTPUT"
           else
             echo "missing=false" >> "$GITHUB_OUTPUT"
           fi
 
-      # -------- 2nd pass (conditional) --------
       - name: Compose prompt (pass 2)
         if: steps.validate1.outputs.missing == 'true'
         shell: bash
@@ -153,13 +147,12 @@ PY
         shell: bash
         run: |
           set -euo pipefail
-          # 1回目と同じ検査
           MISSING=()
           mapfile -t PHP_FILES < <(git ls-files -- "*.php" || true)
           for f in "${PHP_FILES[@]}"; do
             while IFS= read -r line; do
-              req_path=$(echo "$line" | sed -E 's/.*require(_once)?\s*\(?["'\'']([^"'\''\)]+)["'\'']\)?;.*/\2/')
-              [[ -z "$req_path" ]] && continue
+              req_path=$(echo "$line" | sed -E 's/.*require(_once)?\s*\(?["'\''"]([^"'\''\)]+)["'\''"]\)?;.*/\2/')
+              [ -n "$req_path" ] || continue
               case "$req_path" in /*) continue ;; esac
               base_dir=$(dirname "$f")
               target=$(python3 - << 'PY'
@@ -167,11 +160,8 @@ import os,sys
 print(os.path.normpath(os.path.join(sys.argv[1], sys.argv[2])))
 PY
 "$base_dir" "$req_path")
-              if [ ! -f "$target" ]; then
-                rel=$(realpath --relative-to="." "$target" 2>/dev/null || echo "$target")
-                MISSING+=("$rel  # required by $f")
-              fi
-            done < <(grep -nE 'require(_once)?\s*\(|require(_once)?\s*["'\'']|include\s*\(|include\s*["'\'']' "$f" || true)
+              [ -f "$target" ] || MISSING+=("$(realpath --relative-to="." "$target" 2>/dev/null || echo "$target")  # required by $f")
+            done < <(grep -nE 'require(_once)?\s*\(|require(_once)?\s*["'\''"]|include\s*\(|include\s*["'\''"]' "$f" || true)
           done
           if [ ${#MISSING[@]} -gt 0 ]; then
             {
@@ -183,7 +173,6 @@ PY
             echo "missing=false" >> "$GITHUB_OUTPUT"
           fi
 
-      # -------- 3rd pass (final) --------
       - name: Compose prompt (pass 3)
         if: steps.validate2.outputs.missing == 'true'
         shell: bash
@@ -214,8 +203,8 @@ PY
           mapfile -t PHP_FILES < <(git ls-files -- "*.php" || true)
           for f in "${PHP_FILES[@]}"; do
             while IFS= read -r line; do
-              req_path=$(echo "$line" | sed -E 's/.*require(_once)?\s*\(?["'\'']([^"'\''\)]+)["'\'']\)?;.*/\2/')
-              [[ -z "$req_path" ]] && continue
+              req_path=$(echo "$line" | sed -E 's/.*require(_once)?\s*\(?["'\''"]([^"'\''\)]+)["'\''"]\)?;.*/\2/')
+              [ -n "$req_path" ] || continue
               case "$req_path" in /*) continue ;; esac
               base_dir=$(dirname "$f")
               target=$(python3 - << 'PY'
@@ -224,7 +213,7 @@ print(os.path.normpath(os.path.join(sys.argv[1], sys.argv[2])))
 PY
 "$base_dir" "$req_path")
               [ -f "$target" ] || MISSING+=("$target")
-            done < <(grep -nE 'require(_once)?\s*\(|require(_once)?\s*["'\'']|include\s*\(|include\s*["'\'']' "$f" || true)
+            done < <(grep -nE 'require(_once)?\s*\(|require(_once)?\s*["'\''"]|include\s*\(|include\s*["'\''"]' "$f" || true)
           done
           if [ ${#MISSING[@]} -gt 0 ]; then
             printf "::error::Still missing files after 3 passes:\n%s\n" "$(printf '%s\n' "${MISSING[@]}")"
@@ -251,7 +240,8 @@ PY
             fi
           done
           if [ $reject -eq 1 ]; then
-            echo "Allowed patterns were:"; printf ' - %s\n' "${ALLOWED[@]}"
+            echo "Allowed patterns were:"
+            printf ' - %s\n' "${ALLOWED[@]}"
             exit 1
           fi
 
