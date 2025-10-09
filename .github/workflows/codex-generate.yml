@@ -1,159 +1,190 @@
+# .github/workflows/codex-generate.yml
 name: "Codex Generate (reusable)"
 
 on:
   workflow_call:
     inputs:
       mode:
-        description: "full / incremental"
+        description: "full:全再生成 / incremental:差分"
         required: false
         default: "full"
         type: string
       model:
-        description: "OpenAI model name"
+        description: "OpenAI model（未指定可）"
         required: false
         default: ""
         type: string
+    secrets:
+      OPENAI_API_KEY:
+        required: true
 
 permissions:
   contents: write
   pull-requests: write
 
 env:
-  REGEN_MODE: "${{ inputs.mode }}"
-  SELECTED_MODEL: "${{ inputs.model }}"
+  # 仕様書一式（生成/検査/環境/機能）
+  SPEC_FILES: |
+    spec/generation.txt
+    spec/testing.txt
+    spec/environment.txt
+    spec/functional.txt
+
+  # 事前に必ず用意するディレクトリ（空でも .gitkeep で載せる）
+  SCAFFOLD_DIRS: |
+    src
+    src/support
+    src/config
+    src/routes
+    src/http
+    tools
+    storage/logs
+    storage/tmp
+    tests
+
+  # コード編集を許可するパス（gate 用）
+  ALLOWED_GLOBS: |
+    src/**
+    tests/**
+    tools/**
+    storage/**
+    logs/**
+    app.php
+    env-lite.php
+    health-lite.php
+    .htaccess
+    ai/CHANGELOG_AI.md
 
 jobs:
-  generate:
-    runs-on: "ubuntu-latest"
+  codex:
+    runs-on: ubuntu-latest
 
     steps:
-      - name: "Checkout"
-        uses: "actions/checkout@v4"
-        with:
-          fetch-depth: 0
+      - name: Checkout
+        uses: actions/checkout@v4
 
-      - name: "Git identity"
-        shell: "bash"
-        run: |
-          set -eu
-          git config --global user.email "ci-bot@example.invalid"
-          git config --global user.name  "CI Bot"
-          git config --global --add safe.directory "$GITHUB_WORKSPACE"
-
-      - name: "Require specs"
-        shell: "bash"
+      - name: Preflight – check OPENAI_API_KEY
+        shell: bash
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
         run: |
           set -euo pipefail
-          for f in spec/generation.txt spec/testing.txt spec/environment.txt spec/functional.txt; do
-            [ -f "$f" ] || { echo "::error::Missing spec: $f"; exit 1; }
+          if [ -z "${OPENAI_API_KEY:-}" ]; then
+            echo "::error::OPENAI_API_KEY is missing"
+            exit 1
+          fi
+
+      - name: Scaffold required dirs with .gitkeep
+        shell: bash
+        run: |
+          set -euo pipefail
+          while IFS= read -r d; do
+            [ -z "$d" ] && continue
+            mkdir -p "$d"
+            # ディレクトリが空の場合でも Git に載るよう .gitkeep を置く
+            if [ -z "$(ls -A "$d" 2>/dev/null || true)" ]; then
+              touch "$d/.gitkeep"
+            fi
+          done <<< "${SCAFFOLD_DIRS}"
+
+      # === ここでモデルに生成を依頼（従来どおり） ===
+      - name: Run Codex (workspace-write)
+        id: codex_exec
+        uses: openai/codex-action@main
+        continue-on-error: false
+        with:
+          openai-api-key: ${{ secrets.OPENAI_API_KEY }}
+          prompt-file: ai/prompt.md
+          # dispatcher 側の inputs をそのまま渡す
+          model: ${{ inputs.model }}
+          sandbox: workspace-write
+        env:
+          SPEC_FILES: ${{ env.SPEC_FILES }}
+
+      # 生成結果の PHP の require/require_once/include を静的チェック
+      - name: Validate PHP require targets exist
+        shell: bash
+        run: |
+          set -euo pipefail
+          MISSING=()
+
+          # チェック対象 PHP
+          mapfile -t PHP_FILES < <(git ls-files -- "*.php" || true)
+          # ルート直下の app.php なども拾う
+          for f in "${PHP_FILES[@]}"; do
+            # require/require_once/include の相対パスを抽出
+            while IFS= read -r line; do
+              req_path=$(echo "$line" | sed -E 's/.*require(_once)?\s*\(?[\"\x27]([^\"\x27]+)[\"\x27]\)?.*/\2/')
+              # 絶対パスは対象外（基本使わない想定）
+              case "$req_path" in
+                /*) continue ;;
+              esac
+              # 呼び出し元からの相対解決
+              base_dir=$(dirname "$f")
+              target="$base_dir/$req_path"
+              # ../ 正規化
+              target=$(python3 - << 'PY'
+import os,sys
+print(os.path.normpath(sys.argv[1]))
+PY
+"$target")
+              if [ ! -f "$target" ]; then
+                MISSING+=("$f => $req_path -> $target")
+              fi
+            done < <(grep -nE 'require(_once)?|include' "$f" || true)
           done
 
-      - name: "Full regen: wipe tree (keep specs & workflows)"
-        if: ${{ env.REGEN_MODE == 'full' }}
-        shell: "bash"
-        run: |
-          set -euo pipefail
-          git rm -r --cached . || true
-          git add ".github" || true
-          git add "spec" || true
-          [ -f "AGENTS.md" ]  && git add "AGENTS.md"  || true
-          [ -f "README.md" ]  && git add "README.md"  || true
-          [ -f ".gitignore" ] && git add ".gitignore" || true
-          git clean -fdx -e ".github" -e ".github/workflows" -e "spec" -e "spec/**" -e "AGENTS.md" -e "README.md" -e ".gitignore"
-          git commit -m "chore(ai): wipe tree for full regeneration" || echo "no wipe commit"
-
-      - name: "Build prompt"
-        id: "prompt"
-        shell: "bash"
-        run: |
-          set -euo pipefail
-          PROMPT_FILE="$RUNNER_TEMP/prompt.md"
-          : > "$PROMPT_FILE"
-
-          if [ -f "ai/codex-generate.tml" ]; then
-            sed -e 's/\r$//' "ai/codex-generate.tml" >> "$PROMPT_FILE"
-          else
-            cat >> "$PROMPT_FILE" <<'PRE'
-          # TASK
-          - Clarification はせず即実装。
-          - 出力はファイルパッチのみ（説明は出さない）。
-          - 生成先: `src/**`（アプリ本体）, `tests/**`（テスト）, 必要に応じて `app.php`, `.htaccess`, `env-lite.php`, `health-lite.php`。
-          - 仕様で示した構成を厳守。余分は作らない。
-
-          ## MUST DELIVERABLES
-          - app.php
-          - src/**
-          - tests/**
-          - env-lite.php
-          - health-lite.php
-          - .htaccess
-          PRE
+          if [ ${#MISSING[@]} -gt 0 ]; then
+            echo "::group::Missing require targets"
+            printf '%s\n' "${MISSING[@]}"
+            echo "::endgroup::"
+            echo "::error::PHP require/include target files missing. See list above."
+            exit 1
           fi
 
-          if [ -f "AGENTS.md" ]; then
-            printf "\n\n---\n\n# AGENTS.md\n\n" >> "$PROMPT_FILE"
-            sed -e 's/\r$//' "AGENTS.md" >> "$PROMPT_FILE"
-          fi
-
-          for f in spec/generation.txt spec/testing.txt spec/environment.txt spec/functional.txt; do
-            printf "\n\n---\n\n# %s\n\n" "$f" >> "$PROMPT_FILE"
-            sed -e 's/\r$//' "$f" >> "$PROMPT_FILE"
-          done
-
-          echo "file=$PROMPT_FILE" >> "$GITHUB_OUTPUT"
-
-      - name: "Check OPENAI_API_KEY"
-        env:
-          OPENAI_API_KEY: "${{ secrets.OPENAI_API_KEY }}"
-        shell: "bash"
-        run: |
-          set -eu
-          [ -n "${OPENAI_API_KEY:-}" ] || { echo "::error::OPENAI_API_KEY missing"; exit 1; }
-          echo "OPENAI_API_KEY present"
-
-      - name: "Run Codex"
-        id: "codex"
-        uses: "openai/codex-action@main"
-        env:
-          OPENAI_API_KEY: "${{ secrets.OPENAI_API_KEY }}"
-        with:
-          openai-api-key: "${{ secrets.OPENAI_API_KEY }}"
-          prompt-file: "${{ steps.prompt.outputs.file }}"
-          model: "${{ env.SELECTED_MODEL }}"
-          sandbox: "workspace-write"
-
-      - name: "Guard: drop .github/workflows edits"
-        shell: "bash"
-        run: |
-          set -eu
-          if git status --porcelain | grep -E '^[AMDR].*\.github/workflows/'; then
-            echo "::warning::Discarding .github/workflows changes"
-            git checkout -- ".github/workflows" || true
-            git restore --staged ".github/workflows" || true
-          fi
-
-      - name: "Stage & commit"
-        id: "stage"
-        shell: "bash"
+      # 許可パス以外の変更をガード
+      - name: Gate diffs to allowed paths
+        shell: bash
         run: |
           set -euo pipefail
+          ALLOWED=()
+          while IFS= read -r g; do [ -z "$g" ] || ALLOWED+=("$g"); done <<< "${ALLOWED_GLOBS}"
+
+          # 変更のあるファイルを取得
           git add -A
-          if git diff --cached --quiet; then
-            echo "changed=false" >> "$GITHUB_OUTPUT"
-            echo "No changes from Codex."
-            exit 0
+          mapfile -t CHANGED < <(git status --porcelain | awk '{print $2}')
+          reject=0
+          for f in "${CHANGED[@]}"; do
+            ok=false
+            for g in "${ALLOWED[@]}"; do
+              if [[ "$f" == $g ]]; then ok=true; break; fi
+            done
+            if [ "$ok" = false ]; then
+              echo "::error::disallowed change: $f"
+              reject=1
+            fi
+          done
+          if [ $reject -eq 1 ]; then
+            echo "Allowed patterns were:"; printf ' - %s\n' "${ALLOWED[@]}"
+            exit 1
           fi
-          git commit -m "chore(ai): apply Codex generated code"
-          echo "changed=true" >> "$GITHUB_OUTPUT"
 
-      - name: "Create PR"
-        if: ${{ steps.stage.outputs.changed == 'true' }}
-        uses: "peter-evans/create-pull-request@v7"
+      - name: Show diff summary
+        shell: bash
+        run: |
+          git status
+          git diff --stat || true
+
+      - name: Create PR
+        uses: peter-evans/create-pull-request@v7
         with:
-          token: "${{ github.token }}"
-          title: "AI: regeneration from specs (${{ inputs.mode }})"
-          body: "Automated regeneration by Codex based on specs."
-          commit-message: "chore(ai): apply Codex generated code"
-          branch: "ai/codex/batch-${{ github.run_id }}"
-          base: "main"
-          delete-branch: true
+          token: ${{ secrets.GITHUB_TOKEN }}
+          title: "AI: apply Codex changes"
+          body: |
+            Automated changes by Codex.
+            Mode: `${{ inputs.mode || 'full' }}`
+          branch: ai/codex/batch-${{ github.run_id }}
+          base: main
+          signoff: true
+          commit-message: "chore(ai): apply Codex changes"
+
