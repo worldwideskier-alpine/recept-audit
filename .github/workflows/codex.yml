@@ -11,12 +11,14 @@ on:
         required: false
         default: "full"
       model:
-        description: "（任意）OpenAIモデル名（未指定＝既定）"
+        description: "（任意）OpenAIモデル名"
         required: false
+        default: ""
 
 jobs:
   call-generate:
-    uses: ".github/workflows/codex-generate.yml"
+    # ← 先頭に './' を付けてローカルの再利用WFを参照
+    uses: ./.github/workflows/codex-generate.yml
     secrets: inherit
     with:
       mode: "${{ github.event.inputs.mode || 'full' }}"
