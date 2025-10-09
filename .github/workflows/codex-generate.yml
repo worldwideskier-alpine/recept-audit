@@ -1,49 +1,43 @@
-name: "Codex Generate (reusable)"
+name: "Codex Generate (spec-driven, supports full wipe)"
 
 on:
-  workflow_call:
-    inputs:
-      mode:
-        description: "実行モード: full(完全生成) / incremental(差分)"
-        required: false
-        default: "full"
-        type: "string"
-      model:
-        description: "OpenAI モデル名（未指定なら既定）"
-        required: false
-        default: ""
-        type: "string"
-    secrets:
-      OPENAI_API_KEY:
-        required: true
-
   workflow_dispatch:
     inputs:
       mode:
-        description: "実行モード: full(完全生成) / incremental(差分)"
+        description: "実行モード: full（全面再生成） / incremental（差分）"
         required: false
         default: "full"
-        type: "string"
       model:
-        description: "OpenAI モデル名（未指定なら既定）"
+        description: "OpenAI モデル（未指定ならデフォルト）"
         required: false
         default: ""
-        type: "string"
+  workflow_call:
+    inputs:
+      mode:
+        required: false
+        default: "full"
+        type: string
+      model:
+        required: false
+        default: ""
+        type: string
+    secrets:
+      OPENAI_API_KEY:
+        required: true
 
 permissions:
   contents: "write"
   pull-requests: "write"
 
 env:
+  # 仕様書（順番どおり連結してプロンプトにします）
   SPEC_FILES: |
     spec/generation.txt
     spec/testing.txt
     spec/environment.txt
     spec/functional.txt
-  FUNCTIONAL_SPEC: "spec/functional.txt"
-  ALLOWLIST_FILE: "ai/allowlist.txt"
   PROMPT_FILE: "ai/prompt.md"
-  BRANCH_NAME: "ai/codex/batch-${{ github.run_id }}"
+  PROMPT_COMBINED: "ai/prompt.combined.md"
 
 jobs:
   generate:
@@ -53,88 +47,132 @@ jobs:
     steps:
       - name: "Checkout"
         uses: "actions/checkout@v4"
-
-      # ★ 修正点: cache を一切指定しない（エラーの原因だった 'none' を撤去）
-      - name: "Setup Node"
-        uses: "actions/setup-node@v4"
         with:
-          node-version: "20"
+          fetch-depth: 0
 
-      - name: "Preflight - API key"
+      - name: "Preflight: check OPENAI_API_KEY"
         shell: "bash"
         run: |
-          set -eu
+          set -euo pipefail
           if [ -z "${{ secrets.OPENAI_API_KEY }}" ]; then
-            echo "::error::OPENAI_API_KEY is empty or missing"
+            echo "::error::OPENAI_API_KEY is missing."
             exit 1
           fi
-          echo "OPENAI_API_KEY present"
+          echo "OK"
 
-      - name: "Prepare dirs"
+      - name: "Full mode: wipe workspace (keep protected dirs)"
+        if: ${{ inputs.mode == 'full' }}
         shell: "bash"
         run: |
-          set -eu
-          mkdir -p "ai"
+          set -euo pipefail
+
+          # 1) 保護パターン（優先: ai/allowlist.txt、無ければ既定）
+          if [ -f "ai/allowlist.txt" ]; then
+            echo "::notice::Using ai/allowlist.txt"
+            KEEP_PAT="$(grep -vE '^\s*($|#)' ai/allowlist.txt | paste -sd '|' -)"
+            [ -z "${KEEP_PAT}" ] && KEEP_PAT='^(spec/|ai/|\.github/)'
+          else
+            KEEP_PAT='^(spec/|ai/|\.github/)'
+          fi
+          echo "KEEP_PAT=${KEEP_PAT}"
+
+          # 2) Git 管理ファイルのうち、保護対象以外を削除
+          git ls-files | grep -vE "${KEEP_PAT}" | xargs -r git rm -f
+
+          # 3) 非 Git ファイルも掃除（保護対象と .git は除外）
+          find . -type f \
+            ! -path "./.git/*" \
+            | grep -vE "/\.git/|${KEEP_PAT}" | xargs -r rm -f
+
+          # 4) 空ディレクトリを整理
+          find . -type d -empty \
+            ! -path "." \
+            ! -path "./.git" \
+            ! -path "./.git/*" \
+            | grep -vE "/\.git$|${KEEP_PAT}" \
+            | xargs -r rmdir || true
+
+          echo "::notice::Workspace wiped (protected kept)."
 
       - name: "Build prompt from specs"
+        id: "build_prompt"
         shell: "bash"
         run: |
-          set -eu
-          : > "${PROMPT_FILE}"
-          printf "%s\n" "# Codex generation prompt" >> "${PROMPT_FILE}"
-          printf "%s\n" "" >> "${PROMPT_FILE}"
-          for f in ${SPEC_FILES}; do
-            if [ -f "${f}" ]; then
-              printf "%s\n" "" >> "${PROMPT_FILE}"
-              printf "%s\n" "--- ${f} ---" >> "${PROMPT_FILE}"
-              cat "${f}" >> "${PROMPT_FILE}"
-              printf "%s\n" "" >> "${PROMPT_FILE}"
+          set -euo pipefail
+          mkdir -p ai
+          : > "${{ env.PROMPT_COMBINED }}"
+          echo "# Codex generation prompt" >> "${{ env.PROMPT_COMBINED }}"
+          echo "" >> "${{ env.PROMPT_COMBINED }}"
+          echo "- MODE: ${{ inputs.mode }}" >> "${{ env.PROMPT_COMBINED }}"
+          echo "" >> "${{ env.PROMPT_COMBINED }}"
+          while IFS= read -r f; do
+            [ -z "$f" ] && continue
+            if [ -f "$f" ]; then
+              echo "" >> "${{ env.PROMPT_COMBINED }}"
+              echo "<!-- file: $f -->" >> "${{ env.PROMPT_COMBINED }}"
+              echo "" >> "${{ env.PROMPT_COMBINED }}"
+              cat "$f" >> "${{ env.PROMPT_COMBINED }}"
+              echo "" >> "${{ env.PROMPT_COMBINED }}"
+            else
+              echo "::warning::Spec file not found: $f"
             fi
-          done
+          done <<'EOF_SPECS'
+          ${{ env.SPEC_FILES }}
+          EOF_SPECS
+          cp -f "${{ env.PROMPT_COMBINED }}" "${{ env.PROMPT_FILE }}"
 
       - name: "Run Codex"
-        id: "codex"
         uses: "openai/codex-action@main"
         with:
           openai-api-key: "${{ secrets.OPENAI_API_KEY }}"
-          prompt-file: "${{ env.PROMPT_FILE }}"
+          prompt-file: "${{ env.PROMPT_COMBINED }}"
           model: "${{ inputs.model || '' }}"
           sandbox: "workspace-write"
 
       - name: "Show diff summary"
+        id: "diff"
         shell: "bash"
         run: |
-          set -eu
+          set -euo pipefail
           echo "=== git status ==="
-          git status --porcelain=v1 || true
-          echo "=== git diff (stat) ==="
+          git status --porcelain=v1
+          echo "=== diff stat ==="
           git diff --stat || true
-
-      - name: "Configure git author"
-        shell: "bash"
-        run: |
-          set -eu
-          git config --global user.email "ci-bot@example.invalid"
-          git config --global user.name "CI Bot"
-          git config --global --add safe.directory "$GITHUB_WORKSPACE"
-
-      - name: "Fail if no changes (print last message)"
-        shell: "bash"
-        run: |
-          set -eu
-          if [ -z "$(git status --porcelain=v1)" ]; then
-            echo "::notice::No file changes were produced by Codex."
-            exit 0
+          if git status --porcelain=v1 | grep -q .; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=false" >> "$GITHUB_OUTPUT"
           fi
 
+      - name: "Configure git author"
+        if: ${{ steps.diff.outputs.changed == 'true' }}
+        shell: "bash"
+        run: |
+          set -euo pipefail
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git config --global user.name  "github-actions[bot]"
+
       - name: "Create Pull Request"
+        if: ${{ steps.diff.outputs.changed == 'true' }}
         uses: "peter-evans/create-pull-request@v7"
         with:
           token: "${{ secrets.GITHUB_TOKEN }}"
-          commit-message: "chore(ai): apply Codex changes (spec-driven)"
-          title: "AI: Codex updates"
-          body: "Automated changes generated by Codex based on spec files."
-          branch: "${{ env.BRANCH_NAME }}"
+          add-paths: |
+            .
+          commit-message: "chore(ai): apply Codex generation"
+          title: "AI: Codex updates (mode=${{ inputs.mode }})"
+          body: |
+            Automated changes generated by Codex.
+            - mode: `${{ inputs.mode }}`
+            - model: `${{ inputs.model || 'default' }}`
+            - specs: `${{ env.SPEC_FILES }}`
+          branch: "ai/codex/batch-${{ github.run_id }}"
           base: "main"
-          signoff: "true"
-          draft: "false"
+          signoff: false
+          delete-branch: true
+
+      - name: "No changes"
+        if: ${{ steps.diff.outputs.changed != 'true' }}
+        shell: "bash"
+        run: |
+          echo "No changes to commit."
