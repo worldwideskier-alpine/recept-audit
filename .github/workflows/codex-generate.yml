@@ -1,5 +1,4 @@
-# .github/workflows/codex-generate.yml
-name: "Codex Generate (reusable)"
+name: "Codex Generate (autofix loop)"
 
 on:
   workflow_call:
@@ -23,26 +22,13 @@ permissions:
   pull-requests: write
 
 env:
-  # 仕様書一式（生成/検査/環境/機能）
   SPEC_FILES: |
     spec/generation.txt
     spec/testing.txt
     spec/environment.txt
     spec/functional.txt
 
-  # 事前に必ず用意するディレクトリ（空でも .gitkeep で載せる）
-  SCAFFOLD_DIRS: |
-    src
-    src/support
-    src/config
-    src/routes
-    src/http
-    tools
-    storage/logs
-    storage/tmp
-    tests
-
-  # コード編集を許可するパス（gate 用）
+  # 変更を許可するパス
   ALLOWED_GLOBS: |
     src/**
     tests/**
@@ -63,10 +49,10 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Preflight – check OPENAI_API_KEY
-        shell: bash
+      - name: Preflight – OPENAI_API_KEY
         env:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        shell: bash
         run: |
           set -euo pipefail
           if [ -z "${OPENAI_API_KEY:-}" ]; then
@@ -74,83 +60,183 @@ jobs:
             exit 1
           fi
 
-      - name: Scaffold required dirs with .gitkeep
+      - name: Prepare defects file
         shell: bash
         run: |
           set -euo pipefail
-          while IFS= read -r d; do
-            [ -z "$d" ] && continue
-            mkdir -p "$d"
-            # ディレクトリが空の場合でも Git に載るよう .gitkeep を置く
-            if [ -z "$(ls -A "$d" 2>/dev/null || true)" ]; then
-              touch "$d/.gitkeep"
-            fi
-          done <<< "${SCAFFOLD_DIRS}"
+          mkdir -p ai/defects
+          : > ai/defects/missing-requires.txt
 
-      # === ここでモデルに生成を依頼（従来どおり） ===
-      - name: Run Codex (workspace-write)
-        id: codex_exec
+      # -------- 1st pass --------
+      - name: Compose prompt (pass 1)
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat ai/prompt.md > ai/prompt.combined.md
+          if [ -s ai/defects/missing-requires.txt ]; then
+            printf "\n\n## Missing artifacts to create\n" >> ai/prompt.combined.md
+            cat ai/defects/missing-requires.txt >> ai/prompt.combined.md
+          fi
+
+      - name: Run Codex (pass 1)
+        id: codex1
         uses: openai/codex-action@main
-        continue-on-error: false
         with:
           openai-api-key: ${{ secrets.OPENAI_API_KEY }}
-          prompt-file: ai/prompt.md
-          # dispatcher 側の inputs をそのまま渡す
-          model: ${{ inputs.model }}
-          sandbox: workspace-write
+          prompt-file: "ai/prompt.combined.md"
+          model: "${{ inputs.model }}"
+          sandbox: "workspace-write"
         env:
           SPEC_FILES: ${{ env.SPEC_FILES }}
 
-      # 生成結果の PHP の require/require_once/include を静的チェック
-      - name: Validate PHP require targets exist
+      - name: Validate requires (pass 1)
+        id: validate1
         shell: bash
         run: |
           set -euo pipefail
           MISSING=()
-
-          # チェック対象 PHP
           mapfile -t PHP_FILES < <(git ls-files -- "*.php" || true)
-          # ルート直下の app.php なども拾う
           for f in "${PHP_FILES[@]}"; do
-            # require/require_once/include の相対パスを抽出
             while IFS= read -r line; do
-              req_path=$(echo "$line" | sed -E 's/.*require(_once)?\s*\(?[\"\x27]([^\"\x27]+)[\"\x27]\)?.*/\2/')
-              # 絶対パスは対象外（基本使わない想定）
-              case "$req_path" in
-                /*) continue ;;
-              esac
-              # 呼び出し元からの相対解決
+              req_path=$(echo "$line" | sed -E 's/.*require(_once)?\s*\(?["'\'']([^"'\''\)]+)["'\'']\)?;.*/\2/')
+              [[ -z "$req_path" ]] && continue
+              case "$req_path" in /*) continue ;; esac
               base_dir=$(dirname "$f")
-              target="$base_dir/$req_path"
-              # ../ 正規化
               target=$(python3 - << 'PY'
 import os,sys
-print(os.path.normpath(sys.argv[1]))
+print(os.path.normpath(os.path.join(sys.argv[1], sys.argv[2])))
 PY
-"$target")
+"$base_dir" "$req_path")
               if [ ! -f "$target" ]; then
-                MISSING+=("$f => $req_path -> $target")
+                rel=$(realpath --relative-to="." "$target" 2>/dev/null || echo "$target")
+                MISSING+=("$rel  # required by $f")
               fi
-            done < <(grep -nE 'require(_once)?|include' "$f" || true)
+            done < <(grep -nE 'require(_once)?\s*\(|require(_once)?\s*["'\'']|include\s*\(|include\s*["'\'']' "$f" || true)
           done
-
           if [ ${#MISSING[@]} -gt 0 ]; then
-            echo "::group::Missing require targets"
-            printf '%s\n' "${MISSING[@]}"
-            echo "::endgroup::"
-            echo "::error::PHP require/include target files missing. See list above."
+            {
+              echo "### Create these files with implementations:"
+              printf -- "- %s\n" "${MISSING[@]}"
+              echo
+              echo "_Each file must include the functions/classes expected by callers._"
+            } > ai/defects/missing-requires.txt
+            echo "missing=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "missing=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      # -------- 2nd pass (conditional) --------
+      - name: Compose prompt (pass 2)
+        if: steps.validate1.outputs.missing == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat ai/prompt.md > ai/prompt.combined.md
+          printf "\n\n## Missing artifacts to create (pass 2)\n" >> ai/prompt.combined.md
+          cat ai/defects/missing-requires.txt >> ai/prompt.combined.md
+
+      - name: Run Codex (pass 2)
+        if: steps.validate1.outputs.missing == 'true'
+        id: codex2
+        uses: openai/codex-action@main
+        with:
+          openai-api-key: ${{ secrets.OPENAI_API_KEY }}
+          prompt-file: "ai/prompt.combined.md"
+          model: "${{ inputs.model }}"
+          sandbox: "workspace-write"
+        env:
+          SPEC_FILES: ${{ env.SPEC_FILES }}
+
+      - name: Re-validate requires (pass 2)
+        if: steps.validate1.outputs.missing == 'true'
+        id: validate2
+        shell: bash
+        run: |
+          set -euo pipefail
+          # 1回目と同じ検査
+          MISSING=()
+          mapfile -t PHP_FILES < <(git ls-files -- "*.php" || true)
+          for f in "${PHP_FILES[@]}"; do
+            while IFS= read -r line; do
+              req_path=$(echo "$line" | sed -E 's/.*require(_once)?\s*\(?["'\'']([^"'\''\)]+)["'\'']\)?;.*/\2/')
+              [[ -z "$req_path" ]] && continue
+              case "$req_path" in /*) continue ;; esac
+              base_dir=$(dirname "$f")
+              target=$(python3 - << 'PY'
+import os,sys
+print(os.path.normpath(os.path.join(sys.argv[1], sys.argv[2])))
+PY
+"$base_dir" "$req_path")
+              if [ ! -f "$target" ]; then
+                rel=$(realpath --relative-to="." "$target" 2>/dev/null || echo "$target")
+                MISSING+=("$rel  # required by $f")
+              fi
+            done < <(grep -nE 'require(_once)?\s*\(|require(_once)?\s*["'\'']|include\s*\(|include\s*["'\'']' "$f" || true)
+          done
+          if [ ${#MISSING[@]} -gt 0 ]; then
+            {
+              echo "### Still missing, create these files (pass 3):"
+              printf -- "- %s\n" "${MISSING[@]}"
+            } > ai/defects/missing-requires.txt
+            echo "missing=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "missing=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      # -------- 3rd pass (final) --------
+      - name: Compose prompt (pass 3)
+        if: steps.validate2.outputs.missing == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat ai/prompt.md > ai/prompt.combined.md
+          printf "\n\n## Missing artifacts to create (final)\n" >> ai/prompt.combined.md
+          cat ai/defects/missing-requires.txt >> ai/prompt.combined.md
+
+      - name: Run Codex (pass 3)
+        if: steps.validate2.outputs.missing == 'true'
+        id: codex3
+        uses: openai/codex-action@main
+        with:
+          openai-api-key: ${{ secrets.OPENAI_API_KEY }}
+          prompt-file: "ai/prompt.combined.md"
+          model: "${{ inputs.model }}"
+          sandbox: "workspace-write"
+        env:
+          SPEC_FILES: ${{ env.SPEC_FILES }}
+
+      - name: Final validate requires
+        id: final_validate
+        shell: bash
+        run: |
+          set -euo pipefail
+          MISSING=()
+          mapfile -t PHP_FILES < <(git ls-files -- "*.php" || true)
+          for f in "${PHP_FILES[@]}"; do
+            while IFS= read -r line; do
+              req_path=$(echo "$line" | sed -E 's/.*require(_once)?\s*\(?["'\'']([^"'\''\)]+)["'\'']\)?;.*/\2/')
+              [[ -z "$req_path" ]] && continue
+              case "$req_path" in /*) continue ;; esac
+              base_dir=$(dirname "$f")
+              target=$(python3 - << 'PY'
+import os,sys
+print(os.path.normpath(os.path.join(sys.argv[1], sys.argv[2])))
+PY
+"$base_dir" "$req_path")
+              [ -f "$target" ] || MISSING+=("$target")
+            done < <(grep -nE 'require(_once)?\s*\(|require(_once)?\s*["'\'']|include\s*\(|include\s*["'\'']' "$f" || true)
+          done
+          if [ ${#MISSING[@]} -gt 0 ]; then
+            printf "::error::Still missing files after 3 passes:\n%s\n" "$(printf '%s\n' "${MISSING[@]}")"
             exit 1
           fi
 
-      # 許可パス以外の変更をガード
       - name: Gate diffs to allowed paths
         shell: bash
         run: |
           set -euo pipefail
           ALLOWED=()
           while IFS= read -r g; do [ -z "$g" ] || ALLOWED+=("$g"); done <<< "${ALLOWED_GLOBS}"
-
-          # 変更のあるファイルを取得
           git add -A
           mapfile -t CHANGED < <(git status --porcelain | awk '{print $2}')
           reject=0
@@ -178,13 +264,12 @@ PY
       - name: Create PR
         uses: peter-evans/create-pull-request@v7
         with:
-          token: ${{ secrets.GITHUB_TOKEN }}
+          token: "${{ secrets.GITHUB_TOKEN }}"
           title: "AI: apply Codex changes"
           body: |
-            Automated changes by Codex.
-            Mode: `${{ inputs.mode || 'full' }}`
-          branch: ai/codex/batch-${{ github.run_id }}
-          base: main
+            Automated changes by Codex with autofix loop (up to 3 passes).
+            Mode: "${{ inputs.mode || 'full' }}"
+          branch: "ai/codex/batch-${{ github.run_id }}"
+          base: "main"
           signoff: true
           commit-message: "chore(ai): apply Codex changes"
-
