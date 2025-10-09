@@ -1,0 +1,11 @@
+Options -Indexes -MultiViews
+RewriteEngine On
+
+RewriteCond %{REQUEST_FILENAME} -f [OR]
+RewriteCond %{REQUEST_FILENAME} -d
+RewriteRule ^env-lite$ env-lite.php [L]
+RewriteRule ^health-lite$ health-lite.php [L]
+
+RewriteRule ^assets/ - [L]
+
+RewriteRule ^ app.php [L,QSA]
