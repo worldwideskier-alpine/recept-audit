@@ -1,4 +1,4 @@
-name: "Codex Generate & PR (full regen by default)"
+name: "Codex Generate & PR (full regen)"
 
 on:
   push:
@@ -52,29 +52,19 @@ jobs:
             [ -f "$f" ] || { echo "::error::Missing spec: $f"; exit 1; }
           done
 
-      # ★ フル再生成：仕様書とWF以外を全削除（破壊的）
       - name: "Wipe repository except specs & workflows (full regen)"
         if: ${{ env.REGEN_MODE == 'full' }}
         shell: "bash"
         run: |
           set -euo pipefail
           echo "Full regeneration: wiping working tree (keep specs & workflows)"
-          # 追跡中のファイルを一旦インデックスから外す
           git rm -r --cached . || true
-          # 仕様書・WFなど残したいものだけ再登録
           git add ".github" || true
           git add "spec" || true
           [ -f "AGENTS.md" ]  && git add "AGENTS.md"  || true
           [ -f "README.md" ]  && git add "README.md"  || true
           [ -f ".gitignore" ] && git add ".gitignore" || true
-          # 実ファイルも削除（除外を指定）
-          git clean -fdx \
-            -e ".github" -e ".github/workflows" \
-            -e "spec" -e "spec/**" \
-            -e "AGENTS.md" \
-            -e "README.md" \
-            -e ".gitignore"
-          # 「全削除」コミット（残らなければスキップ）
+          git clean -fdx -e ".github" -e ".github/workflows" -e "spec" -e "spec/**" -e "AGENTS.md" -e "README.md" -e ".gitignore"
           git commit -m "chore(ai): wipe tree for full regeneration" || echo "no wipe commit"
 
       - name: "Build composite prompt"
@@ -89,7 +79,7 @@ jobs:
           # TASK
           - Clarification を行わず直ちに実装する。
           - 出力は「ファイル追加・更新」パッチのみ（説明文は出力しない）。
-          - 生成先: `src/**`（本体）, `tests/**`（テスト）, 必要に応じてルート `app.php`, `.htaccess`, `env-lite.php`, `health-lite.php` を生成。
+          - 生成先: `src/**`（本体）, `tests/**`（テスト）, 必要に応じて `app.php`, `.htaccess`, `env-lite.php`, `health-lite.php` を生成。
           - 仕様で規定したディレクトリ構造を厳守。余分なファイルは作らない。
 
           ## DELIVERABLES (MUST)
@@ -168,34 +158,3 @@ jobs:
           branch: "ai/codex/batch-${{ github.run_id }}"
           base: "main"
           delete-branch: true
-
-  # PR がマージされた時だけ ai/codex/batch-* を削除
-  cleanup:
-    name: "Delete ai/codex/batch-* after merge"
-    if: ${{ github.event_name == 'pull_request' && github.event.action == 'closed' && github.event.pull_request.merged == true }}
-    runs-on: "ubuntu-latest"
-    permissions:
-      contents: write
-
-    steps:
-      - name: "Delete head branch"
-        uses: "actions/github-script@v7"
-        with:
-          script: |
-            const pr = context.payload.pull_request;
-            const sameRepo = pr.head.repo.full_name === `${context.repo.owner}/${context.repo.repo}`;
-            if (!sameRepo) {
-              core.notice("Head is a fork; skip branch delete.");
-              return;
-            }
-            const headRef = pr.head.ref;
-            if (!headRef.startsWith("ai/codex/batch-")) {
-              core.notice(`Head ref ${headRef} is not ai/codex/batch-*; skip.`);
-              return;
-            }
-            await github.rest.git.deleteRef({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              ref: `heads/${headRef}`
-            });
-            core.info(`Deleted heads/${headRef}`);
