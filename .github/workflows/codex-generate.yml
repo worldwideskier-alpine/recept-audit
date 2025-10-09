@@ -30,7 +30,6 @@ permissions:
   pull-requests: "write"
 
 env:
-  # 仕様書（順番どおり連結してプロンプトにします）
   SPEC_FILES: |
     spec/generation.txt
     spec/testing.txt
@@ -58,41 +57,68 @@ jobs:
             echo "::error::OPENAI_API_KEY is missing."
             exit 1
           fi
-          echo "OK"
 
-      - name: "Full mode: wipe workspace (keep protected dirs)"
+      - name: "Full mode: wipe workspace (keep spec/, ai/, .github/)"
         if: ${{ inputs.mode == 'full' }}
         shell: "bash"
         run: |
           set -euo pipefail
 
-          # 1) 保護パターン（優先: ai/allowlist.txt、無ければ既定）
-          if [ -f "ai/allowlist.txt" ]; then
-            echo "::notice::Using ai/allowlist.txt"
-            KEEP_PAT="$(grep -vE '^\s*($|#)' ai/allowlist.txt | paste -sd '|' -)"
-            [ -z "${KEEP_PAT}" ] && KEEP_PAT='^(spec/|ai/|\.github/)'
-          else
-            KEEP_PAT='^(spec/|ai/|\.github/)'
-          fi
-          echo "KEEP_PAT=${KEEP_PAT}"
+          # keep 判定（./ の有無どちらでも可）
+          keep() {
+            rel="${1#./}"
+            if [[ "$rel" =~ ^(spec/|ai/|\.github/) ]]; then
+              return 0
+            fi
+            return 1
+          }
 
-          # 2) Git 管理ファイルのうち、保護対象以外を削除
-          git ls-files | grep -vE "${KEEP_PAT}" | xargs -r git rm -f
+          echo "::group::Wipe (git-tracked files)"
+          # Git 管理ファイルは 1 件ずつ安全に判定
+          while IFS= read -r -d '' f; do
+            if keep "$f"; then
+              echo "keep: $f"
+            else
+              git rm -f -- "$f"
+            fi
+          done < <(git ls-files -z)
+          echo "::endgroup::"
 
-          # 3) 非 Git ファイルも掃除（保護対象と .git は除外）
-          find . -type f \
-            ! -path "./.git/*" \
-            | grep -vE "/\.git/|${KEEP_PAT}" | xargs -r rm -f
+          echo "::group::Wipe (untracked files)"
+          # 非 Git 管理のファイルも除去
+          while IFS= read -r -d '' f; do
+            if keep "$f"; then
+              echo "keep: $f"
+            else
+              rm -f -- "$f"
+            fi
+          done < <(git ls-files -z --others --exclude-standard)
+          echo "::endgroup::"
 
-          # 4) 空ディレクトリを整理
-          find . -type d -empty \
-            ! -path "." \
-            ! -path "./.git" \
-            ! -path "./.git/*" \
-            | grep -vE "/\.git$|${KEEP_PAT}" \
-            | xargs -r rmdir || true
+          # 空ディレクトリ掃除（.git/ は除外）
+          find . -type d -empty -not -path "./.git" -not -path "./.git/*" -delete || true
 
           echo "::notice::Workspace wiped (protected kept)."
+
+      - name: "Assert specs exist (after wipe)"
+        shell: "bash"
+        run: |
+          set -euo pipefail
+          missing=0
+          while IFS= read -r f; do
+            [ -z "$f" ] && continue
+            if [ ! -f "$f" ]; then
+              echo "::error::Spec file not found: $f"
+              missing=1
+            else
+              echo "ok: $f"
+            fi
+          done <<'EOF'
+          ${{ env.SPEC_FILES }}
+          EOF
+          if [ "$missing" -ne 0 ]; then
+            exit 1
+          fi
 
       - name: "Build prompt from specs"
         id: "build_prompt"
@@ -101,24 +127,23 @@ jobs:
           set -euo pipefail
           mkdir -p ai
           : > "${{ env.PROMPT_COMBINED }}"
-          echo "# Codex generation prompt" >> "${{ env.PROMPT_COMBINED }}"
-          echo "" >> "${{ env.PROMPT_COMBINED }}"
-          echo "- MODE: ${{ inputs.mode }}" >> "${{ env.PROMPT_COMBINED }}"
-          echo "" >> "${{ env.PROMPT_COMBINED }}"
+          {
+            echo "# Codex generation prompt"
+            echo
+            echo "- MODE: ${{ inputs.mode }}"
+            echo
+          } >> "${{ env.PROMPT_COMBINED }}"
+
           while IFS= read -r f; do
             [ -z "$f" ] && continue
-            if [ -f "$f" ]; then
-              echo "" >> "${{ env.PROMPT_COMBINED }}"
-              echo "<!-- file: $f -->" >> "${{ env.PROMPT_COMBINED }}"
-              echo "" >> "${{ env.PROMPT_COMBINED }}"
-              cat "$f" >> "${{ env.PROMPT_COMBINED }}"
-              echo "" >> "${{ env.PROMPT_COMBINED }}"
-            else
-              echo "::warning::Spec file not found: $f"
-            fi
-          done <<'EOF_SPECS'
+            echo >> "${{ env.PROMPT_COMBINED }}"
+            echo "<!-- file: $f -->" >> "${{ env.PROMPT_COMBINED }}"
+            echo >> "${{ env.PROMPT_COMBINED }}"
+            cat "$f" >> "${{ env.PROMPT_COMBINED }}"
+            echo >> "${{ env.PROMPT_COMBINED }}"
+          done <<'EOF'
           ${{ env.SPEC_FILES }}
-          EOF_SPECS
+          EOF
           cp -f "${{ env.PROMPT_COMBINED }}" "${{ env.PROMPT_FILE }}"
 
       - name: "Run Codex"
@@ -135,7 +160,7 @@ jobs:
         run: |
           set -euo pipefail
           echo "=== git status ==="
-          git status --porcelain=v1
+          git status --porcelain=v1 || true
           echo "=== diff stat ==="
           git diff --stat || true
           if git status --porcelain=v1 | grep -q .; then
