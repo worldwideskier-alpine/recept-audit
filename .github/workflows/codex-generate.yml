@@ -1,21 +1,32 @@
 name: "Codex Generate (spec-driven)"
 
 on:
+  workflow_call:
+    inputs:
+      mode:
+        description: "実行モード: full（全生成）/ incremental（差分）"
+        required: false
+        default: "full"
+        type: string
+      model:
+        description: "OpenAI モデル名（任意）"
+        required: false
+        default: ""
+        type: string
+    secrets:
+      OPENAI_API_KEY:
+        description: "OpenAI API Key"
+        required: true
   workflow_dispatch:
     inputs:
       mode:
-        description: "実行モード（full=全生成 / incremental=差分）"
+        description: "実行モード: full（全生成）/ incremental（差分）"
         required: false
         default: "full"
       model:
-        description: "利用するモデル名（未指定可）"
+        description: "OpenAI モデル名（任意）"
         required: false
         default: ""
-  push:
-    branches: ["main"]
-    paths:
-      - "spec/**"
-      - ".github/workflows/codex-generate.yml"
 
 permissions:
   contents: write
@@ -24,140 +35,121 @@ permissions:
 jobs:
   generate:
     name: "generate"
-    runs-on: ubuntu-latest
-
+    runs-on: "ubuntu-latest"
     env:
-      # 仕様書（存在するものだけを順に結合）
       SPEC_FILES: "spec/generation.txt spec/testing.txt spec/environment.txt spec/functional.txt"
       PROMPT_FILE: "ai/prompt.md"
       DEFECTS_DIR: "ai/defects"
+      ALLOW_MODE: "${{ inputs.mode }}"
       OPENAI_MODEL_DEFAULT: ""
-      ALLOW_MODE: "${{ github.event.inputs.mode || 'full' }}"
 
     steps:
       - name: "Checkout"
-        uses: actions/checkout@v4
+        uses: "actions/checkout@v4"
 
       - name: "Setup Node"
-        uses: actions/setup-node@v4
+        uses: "actions/setup-node@v4"
         with:
-          node-version: "20"
-          cache: "npm"
+            node-version: "20"
 
       - name: "Preflight: check OPENAI_API_KEY"
-        shell: bash
+        shell: "bash"
         run: |
           set -Eeuo pipefail
           if [ -z "${{ secrets.OPENAI_API_KEY }}" ]; then
-            echo "::error::OPENAI_API_KEY is missing in repo secrets"
+            echo "::error::OPENAI_API_KEY is missing"
             exit 1
           fi
 
       - name: "Prepare folders"
-        shell: bash
+        shell: "bash"
         run: |
           set -Eeuo pipefail
-          mkdir -p "$(dirname "$PROMPT_FILE")" "$DEFECTS_DIR"
+          mkdir -p "$(dirname "${PROMPT_FILE}")" "${DEFECTS_DIR}"
 
       - name: "Compose prompt from specs (no heredoc)"
-        shell: bash
+        shell: "bash"
         run: |
           set -Eeuo pipefail
-          : > "$PROMPT_FILE"
-          for f in $SPEC_FILES; do
-            if [ -f "$f" ]; then
-              printf '%s\n' '---' "<!-- file: '"$f"' -->" >> "$PROMPT_FILE"
-              sed -e 's/\r$//' "$f" >> "$PROMPT_FILE"
-              printf '\n' >> "$PROMPT_FILE"
+          : > "${PROMPT_FILE}"
+          for f in ${SPEC_FILES}; do
+            if [ -f "${f}" ]; then
+              printf '%s\n' '---' "<!-- file: '"${f}"' -->" >> "${PROMPT_FILE}"
+              sed -e 's/\r$//' "${f}" >> "${PROMPT_FILE}"
+              printf '\n' >> "${PROMPT_FILE}"
             fi
           done
-          if [ ! -s "$PROMPT_FILE" ]; then
-            echo "::error::No spec files found to compose prompt."
+          if [ ! -s "${PROMPT_FILE}" ]; then
+            echo "::error::No spec files found."
             exit 1
           fi
 
-      - name: "Scaffold minimal workspace (no heredoc, no multiline vars)"
-        shell: bash
+      - name: "Scaffold minimal workspace"
+        shell: "bash"
         run: |
           set -Eeuo pipefail
           printf '%s\n' \
-            'src' \
-            'tests' \
-            'tools' \
-            'storage' \
-            'evidence/static' \
-            'evidence/runtime' \
-            'evidence/pkg' \
-            'evidence/verify' \
-            'dist' \
-          | while IFS= read -r d; do
-              mkdir -p "$d"
-            done
+            "src" "tests" "tools" "storage" \
+            "evidence/static" "evidence/runtime" "evidence/pkg" "evidence/verify" \
+            "dist" \
+          | while IFS= read -r d; do mkdir -p "${d}"; done
 
       - name: "Run Codex (pass 1)"
-        id: codex1
-        uses: openai/codex-action@main
+        id: "codex1"
+        uses: "openai/codex-action@main"
         with:
           openai-api-key: "${{ secrets.OPENAI_API_KEY }}"
           prompt-file: "${{ env.PROMPT_FILE }}"
-          model: "${{ github.event.inputs.model || env.OPENAI_MODEL_DEFAULT }}"
+          model: "${{ inputs.model || env.OPENAI_MODEL_DEFAULT }}"
           sandbox: "workspace-write"
 
-      - name: "Validate PHP require/include (simple check)"
-        shell: bash
+      - name: "Validate PHP require/include"
+        shell: "bash"
         run: |
           set -Eeuo pipefail
-          : > "$DEFECTS_DIR/missing-requires.txt"
+          : > "${DEFECTS_DIR}/missing-requires.txt"
           mapfile -t php_files < <(git ls-files -- '*.php' 2>/dev/null || true)
           if [ "${#php_files[@]}" -gt 0 ]; then
             for f in "${php_files[@]}"; do
-              # ざっくり抽出（シングル/ダブルクォート対応）
-              mapfile -t targets < <(grep -Eo "require(_once)?\s*\(\s*['\"][^'\"]+['\"]\s*\)|include(_once)?\s*\(\s*['\"][^'\"]+['\"]\s*\)" "$f" \
+              mapfile -t targets < <(grep -Eo "require(_once)?\s*\(\s*['\"][^'\"]+['\"]\s*\)|include(_once)?\s*\(\s*['\"][^'\"]+['\"]\s*\)" "${f}" \
                 | sed -E "s/.*\(['\"]([^'\"]+)['\"]\).*/\1/")
               for t in "${targets[@]}"; do
-                # 相対パスはファイル基準で解決
-                if [[ "$t" != /* ]]; then
-                  base="$(dirname "$f")"
-                  path="$base/$t"
-                else
-                  path="$t"
-                fi
-                if [ ! -f "$path" ]; then
-                  printf '%s\t%s -> %s\n' "MISSING" "$f" "$t" >> "$DEFECTS_DIR/missing-requires.txt"
+                if [[ "${t}" != /* ]]; then base="$(dirname "${f}")"; path="${base}/${t}"; else path="${t}"; fi
+                if [ ! -f "${path}" ]; then
+                  printf '%s\t%s -> %s\n' "MISSING" "${f}" "${t}" >> "${DEFECTS_DIR}/missing-requires.txt"
                 fi
               done
             done
           fi
-
-          if [ -s "$DEFECTS_DIR/missing-requires.txt" ]; then
-            echo "::warning::Some required/include files are missing. See $DEFECTS_DIR/missing-requires.txt"
+          if [ -s "${DEFECTS_DIR}/missing-requires.txt" ]; then
+            echo "::warning::Missing include/require detected. See ${DEFECTS_DIR}/missing-requires.txt"
           fi
 
       - name: "Show diff summary"
-        shell: bash
+        shell: "bash"
         run: |
           set -Eeuo pipefail
           git status --porcelain=v1 || true
           git diff --stat || true
 
       - name: "Configure git author"
-        shell: bash
+        shell: "bash"
         run: |
           set -Eeuo pipefail
           git config --global user.email "ci-bot@example.invalid"
           git config --global user.name  "CI Bot"
 
       - name: "Create Pull Request"
-        uses: peter-evans/create-pull-request@v7
+        uses: "peter-evans/create-pull-request@v7"
         with:
           token: "${{ github.token }}"
           branch: "ai/codex/batch-${{ github.run_id }}"
           base: "main"
-          title: "AI: codegen (${{ env.ALLOW_MODE }})"
+          title: "AI: codegen (${{ inputs.mode }})"
           body: |
             Automated code generation from specs.
-            - mode: `${{ env.ALLOW_MODE }}`
-            - model: `${{ github.event.inputs.model || 'default' }}`
+            - mode: `${{ inputs.mode }}`
+            - model: `${{ inputs.model || 'default' }}`
             - defects: see `ai/defects/` if present
           add-paths: |
             .
