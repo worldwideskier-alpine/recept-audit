@@ -1,203 +1,326 @@
-name: "Codex Generate (spec-driven, supports full wipe)"
+name: "Codex Generate (spec_fixed_v3)"
 
 on:
   workflow_dispatch:
     inputs:
       mode:
-        description: "実行モード: full（全面再生成） / incremental（差分）"
-        required: false
-        default: "full"
-      model:
-        description: "OpenAI モデル（未指定ならデフォルト）"
-        required: false
-        default: ""
-  workflow_call:
-    inputs:
-      mode:
-        required: false
-        default: "full"
-        type: string
-      model:
-        required: false
-        default: ""
-        type: string
-    secrets:
-      OPENAI_API_KEY:
+        description: "生成モード: full（更地から一式）/ incremental（差分更新）"
+        type: choice
         required: true
+        default: full
+        options: [full, incremental]
+      env_profile:
+        description: "環境プロファイル: base / dev / prod"
+        type: choice
+        required: true
+        default: base
+        options: [base, dev, prod]
+      model:
+        description: "(任意) OpenAI モデル指定（空なら既定）"
+        required: false
+        default: ""
 
 permissions:
-  contents: "write"
-  pull-requests: "write"
+  contents: write
+  pull-requests: write
 
-env:
-  SPEC_FILES: |
-    spec/generation.txt
-    spec/testing.txt
-    spec/environment.txt
-    spec/functional.txt
-  PROMPT_FILE: "ai/prompt.md"
-  PROMPT_COMBINED: "ai/prompt.combined.md"
+concurrency:
+  group: "codex-${{ github.ref }}"
+  cancel-in-progress: false
 
 jobs:
   generate:
-    name: "generate"
-    runs-on: "ubuntu-latest"
-
+    runs-on: ubuntu-latest
+    env:
+      # 既定の安全デフォルト（file-globs.yml が読めない場合のフォールバック）
+      ALLOWED_WRITE_DEFAULT: |
+        src/**
+        tests/**
+        tools/**
+        storage/**
+        evidence/**
+        dist/**
+        .htaccess
+        app.php
+        env-lite.php
+        health-lite.php
+        COMPLIANCE.json
+      REQUIRED_DIRS_DEFAULT: |
+        src
+        tests
+        tools
+        storage
+        evidence/static
+        evidence/runtime
+        evidence/pkg
+        evidence/verify
+        dist
     steps:
       - name: "Checkout"
-        uses: "actions/checkout@v4"
-        with:
-          fetch-depth: 0
+        uses: actions/checkout@v4
 
-      - name: "Preflight: check OPENAI_API_KEY"
-        shell: "bash"
+      - name: "Preflight: OPENAI_API_KEY"
+        shell: bash
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
         run: |
-          set -euo pipefail
-          if [ -z "${{ secrets.OPENAI_API_KEY }}" ]; then
-            echo "::error::OPENAI_API_KEY is missing."
-            exit 1
+          set -Eeuo pipefail
+          if [ -z "${OPENAI_API_KEY:-}" ]; then
+            echo "::error::OPENAI_API_KEY is empty (Secrets)"; exit 1
           fi
+          echo "OPENAI_API_KEY present"
 
-      - name: "Full mode: wipe workspace (keep spec/, ai/, .github/)"
-        if: ${{ inputs.mode == 'full' }}
-        shell: "bash"
+      - name: "Gather spec files (ordered)"
+        id: gather
+        shell: bash
         run: |
-          set -euo pipefail
+          set -Eeuo pipefail
+          printf "" > ai/.keep
+          mkdir -p ai
 
-          # keep 判定（./ の有無どちらでも可）
-          keep() {
-            rel="${1#./}"
-            if [[ "$rel" =~ ^(spec/|ai/|\.github/) ]]; then
-              return 0
+          # 生成用プロンプトを作る（順序を固定）
+          PROMPT="ai/prompt.md"
+          : > "$PROMPT"
+
+          add_file() {
+            local f="$1"
+            if [ -f "$f" ]; then
+              printf "\n\n---\n\n# %s\n\n" "$f" >> "$PROMPT"
+              cat "$f" >> "$PROMPT"
+            else
+              echo "WARN: missing $f" >&2
             fi
-            return 1
           }
 
-          echo "::group::Wipe (git-tracked files)"
-          # Git 管理ファイルは 1 件ずつ安全に判定
-          while IFS= read -r -d '' f; do
-            if keep "$f"; then
-              echo "keep: $f"
-            else
-              git rm -f -- "$f"
-            fi
-          done < <(git ls-files -z)
-          echo "::endgroup::"
-
-          echo "::group::Wipe (untracked files)"
-          # 非 Git 管理のファイルも除去
-          while IFS= read -r -d '' f; do
-            if keep "$f"; then
-              echo "keep: $f"
-            else
-              rm -f -- "$f"
-            fi
-          done < <(git ls-files -z --others --exclude-standard)
-          echo "::endgroup::"
-
-          # 空ディレクトリ掃除（.git/ は除外）
-          find . -type d -empty -not -path "./.git" -not -path "./.git/*" -delete || true
-
-          echo "::notice::Workspace wiped (protected kept)."
-
-      - name: "Assert specs exist (after wipe)"
-        shell: "bash"
-        run: |
-          set -euo pipefail
-          missing=0
-          while IFS= read -r f; do
-            [ -z "$f" ] && continue
-            if [ ! -f "$f" ]; then
-              echo "::error::Spec file not found: $f"
-              missing=1
-            else
-              echo "ok: $f"
-            fi
-          done <<'EOF'
-          ${{ env.SPEC_FILES }}
-          EOF
-          if [ "$missing" -ne 0 ]; then
-            exit 1
+          # 1) AGENTS.md（任意）
+          if [ -f AGENTS.md ]; then
+            printf "# AGENTS.md（方針）\n\n" >> "$PROMPT"
+            cat AGENTS.md >> "$PROMPT"
           fi
 
-      - name: "Build prompt from specs"
-        id: "build_prompt"
-        shell: "bash"
+          # 2) foundation
+          add_file "spec/foundation/policies.md"
+          add_file "spec/foundation/contracts.md"
+          add_file "spec/foundation/file-globs.yml"
+
+          # 3) tests（概要とゲート定義）
+          add_file "spec/tests/policies.md"
+          add_file "spec/tests/gate-matrix.yml"
+
+          # 4) env（方針＋選択プロファイル＋Apache正本）
+          add_file "spec/env/policies.md"
+          profile="spec/env/profiles/${{ github.event.inputs.env_profile || 'base' }}.yml"
+          add_file "$profile"
+          add_file "spec/env/apache/htaccess.bnorm.conf"
+
+          # 5) features（機能の正本）
+          add_file "spec/features/policies.md"
+          add_file "spec/features/endpoints.md"
+          add_file "spec/features/provider_setup.md"
+          add_file "spec/features/data_model.md"
+          add_file "spec/features/schema.required.json"
+          add_file "spec/features/env_matrix.json"
+          add_file "spec/features/imports.md"
+          add_file "spec/features/cli.md"
+          add_file "spec/features/cron.md"
+          add_file "spec/features/ui_rbac.md"
+          add_file "spec/features/logs.md"
+          add_file "spec/features/acceptance_e2e.md"
+
+          # 先頭に実行タスクを明示（生成方針/AHR/出力期待）
+          TASK="ai/task.md"
+          : > "$TASK"
+          printf "# TASK\n\n" >> "$TASK"
+          printf "- mode: %s\n" "${{ inputs.mode }}"
+          printf "- env_profile: %s\n" "${{ inputs.env_profile }}"
+          printf "\n## 要求\n" >> "$TASK"
+          printf "1) %s モードで、仕様に従い **必要ファイルを一式生成/更新** すること（言語/FW固定は仕様準拠）。\n" "${{ inputs.mode }}"
+          printf "2) `spec/foundation/file-globs.yml` の `allowed_write` に **厳密に従う** こと（フォールバックは ALLOWED_WRITE_DEFAULT）。\n" >> "$TASK"
+          printf "3) `spec/tests/runner/run_checks.sh` が **合格** すること（失敗時は最小差分で自己修復=AHRし、再検査）。\n" >> "$TASK"
+          printf "4) 合格時は `dist/package.zip` を作成（pack provenance を満たす）。\n" >> "$TASK"
+          printf "\n---\n" >> "$TASK"
+
+          # 合成
+          cat "$TASK" "$PROMPT" > ai/COMPOSITE_PROMPT.md
+          wc -c ai/COMPOSITE_PROMPT.md
+
+      - name: "Scaffold minimal workspace"
+        shell: bash
         run: |
-          set -euo pipefail
-          mkdir -p ai
-          : > "${{ env.PROMPT_COMBINED }}"
-          {
-            echo "# Codex generation prompt"
-            echo
-            echo "- MODE: ${{ inputs.mode }}"
-            echo
-          } >> "${{ env.PROMPT_COMBINED }}"
+          set -Eeuo pipefail
+          # 既定ディレクトリ
+          while IFS= read -r d; do
+            [ -n "$d" ] && mkdir -p "$d"
+          done <<'EOFREQ'
+          src
+          tests
+          tools
+          storage
+          evidence/static
+          evidence/runtime
+          evidence/pkg
+          evidence/verify
+          dist
+EOFREQ
 
-          while IFS= read -r f; do
-            [ -z "$f" ] && continue
-            echo >> "${{ env.PROMPT_COMBINED }}"
-            echo "<!-- file: $f -->" >> "${{ env.PROMPT_COMBINED }}"
-            echo >> "${{ env.PROMPT_COMBINED }}"
-            cat "$f" >> "${{ env.PROMPT_COMBINED }}"
-            echo >> "${{ env.PROMPT_COMBINED }}"
-          done <<'EOF'
-          ${{ env.SPEC_FILES }}
-          EOF
-          cp -f "${{ env.PROMPT_COMBINED }}" "${{ env.PROMPT_FILE }}"
+      - name: "git config (bot identity)"
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          git config user.name "codex-bot"
+          git config user.email "codex-bot@example.invalid"
 
-      - name: "Run Codex"
-        uses: "openai/codex-action@main"
+      # Codex 実行（Attempt 1）
+      - name: "Run Codex (attempt 1)"
+        id: codex1
+        uses: openai/codex-action@main
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
         with:
-          openai-api-key: "${{ secrets.OPENAI_API_KEY }}"
-          prompt-file: "${{ env.PROMPT_COMBINED }}"
-          model: "${{ inputs.model || '' }}"
+          openai-api-key: ${{ secrets.OPENAI_API_KEY }}
+          prompt-file: "ai/COMPOSITE_PROMPT.md"
           sandbox: "workspace-write"
+          model: "${{ inputs.model }}"
 
-      - name: "Show diff summary"
-        id: "diff"
-        shell: "bash"
+      - name: "Make test runner executable (if not)"
+        shell: bash
         run: |
-          set -euo pipefail
-          echo "=== git status ==="
-          git status --porcelain=v1 || true
-          echo "=== diff stat ==="
-          git diff --stat || true
-          if git status --porcelain=v1 | grep -q .; then
-            echo "changed=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "changed=false" >> "$GITHUB_OUTPUT"
+          set -Eeuo pipefail
+          if [ -f spec/tests/runner/run_checks.sh ]; then
+            chmod +x spec/tests/runner/run_checks.sh
+          fi
+          if [ -f spec/tests/tools/polyglot_lint.sh ]; then
+            chmod +x spec/tests/tools/polyglot_lint.sh
+          fi
+          if [ -f spec/tests/tools/render_smoke.sh ]; then
+            chmod +x spec/tests/tools/render_smoke.sh
+          fi
+          if [ -f spec/tests/tools/verify_report.sh ]; then
+            chmod +x spec/tests/tools/verify_report.sh
           fi
 
-      - name: "Configure git author"
-        if: ${{ steps.diff.outputs.changed == 'true' }}
-        shell: "bash"
+      - name: "Run tests (attempt 1)"
+        id: test1
+        continue-on-error: true
+        shell: bash
         run: |
-          set -euo pipefail
-          git config --global user.email "github-actions[bot]@users.noreply.github.com"
-          git config --global user.name  "github-actions[bot]"
+          set -Eeuo pipefail
+          if [ ! -f spec/tests/runner/run_checks.sh ]; then
+            echo "::error::spec/tests/runner/run_checks.sh not found"; exit 1
+          fi
+          bash spec/tests/runner/run_checks.sh
+          echo "exit_code=$?" >> "$GITHUB_OUTPUT"
+
+      # 失敗したら最小差分の AHR を 1 回だけ実施
+      - name: "Auto-Heal & Retry: build fix context"
+        if: ${{ steps.test1.outputs.exit_code != '0' }}
+        id: fixctx
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          mkdir -p ai
+          FIX="ai/fix_context.txt"
+          : > "$FIX"
+          [ -f COMPLIANCE.json ] && { printf "## COMPLIANCE.json\n" >> "$FIX"; cat COMPLIANCE.json >> "$FIX"; printf "\n---\n" >> "$FIX"; } || true
+          for f in evidence/static/POLYGLOT_LINT.err evidence/static/RENDER_SMOKE.err; do
+            [ -f "$f" ] && { printf "## %s\n" "$f" >> "$FIX"; tail -n 200 "$f" >> "$FIX"; printf "\n---\n" >> "$FIX"; }
+          done
+          printf "## Instruction\n" >> "$FIX"
+          printf "上記ログに基づき、最小差分で修正して tests を PASS させてください。\n" >> "$FIX"
+          cat ai/COMPOSITE_PROMPT.md "$FIX" > ai/COMPOSITE_PROMPT_FIX.md
+          wc -c ai/COMPOSITE_PROMPT_FIX.md
+
+      - name: "Run Codex (attempt 2 - AHR)"
+        if: ${{ steps.test1.outputs.exit_code != '0' }}
+        id: codex2
+        uses: openai/codex-action@main
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        with:
+          openai-api-key: ${{ secrets.OPENAI_API_KEY }}
+          prompt-file: "ai/COMPOSITE_PROMPT_FIX.md"
+          sandbox: "workspace-write"
+          model: "${{ inputs.model }}"
+
+      - name: "Run tests (attempt 2)"
+        if: ${{ steps.test1.outputs.exit_code != '0' }}
+        id: test2
+        continue-on-error: false
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          bash spec/tests/runner/run_checks.sh
+
+      # allowed_write に従ってステージング
+      - name: "Resolve allowed_write (file-globs.yml or default)"
+        id: allow
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          ALLOWED="$GITHUB_WORKSPACE/ai/allowed.txt"
+          : > "$ALLOWED"
+          if [ -f spec/foundation/file-globs.yml ]; then
+            # 簡易抽出（yq無しで最小実装）
+            awk 'f{print} /allowed_write:/{f=1} /^(scaffold:|forbidden_write:)/{f=0}' spec/foundation/file-globs.yml \
+              | grep -E '^\s*-\s*' | sed -E 's/^\s*-\s*"?([^"]+)"?/\1/' >> "$ALLOWED" || true
+          fi
+
+          if ! grep -q . "$ALLOWED"; then
+            printf "%s\n" "${ALLOWED_WRITE_DEFAULT}" >> "$ALLOWED"
+          fi
+
+          echo "Allowed patterns:"
+          cat "$ALLOWED"
+
+          # 一旦すべての変更を差し戻し、allowed のみ add
+          git reset
+          git checkout -- .
+          git add -A :/
+          git reset
+
+          while IFS= read -r pat; do
+            [ -z "$pat" ] && continue
+            git add -f $pat 2>/dev/null || true
+          done < "$ALLOWED"
+
+          echo "Staged files:"
+          git status --porcelain
+
+      - name: "Package dist (zip) after PASS"
+        if: ${{ success() }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          mkdir -p dist
+          # 代表的な領域のみをパッケージ
+          zip -qr dist/package.zip src tests tools public app.php env-lite.php health-lite.php .htaccess COMPLIANCE.json 2>/dev/null || true
+          if [ -f dist/package.zip ]; then
+            echo "ZIP_READY_OK" > evidence/pkg/ZIP_READY_OK.txt
+          fi
+
+      - name: "Upload artifact (package.zip / evidence)"
+        if: ${{ success() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: "codex-artifacts-${{ github.run_id }}"
+          path: |
+            dist/package.zip
+            evidence/**
 
       - name: "Create Pull Request"
-        if: ${{ steps.diff.outputs.changed == 'true' }}
-        uses: "peter-evans/create-pull-request@v7"
+        if: ${{ success() }}
+        uses: peter-evans/create-pull-request@v7
         with:
-          token: "${{ secrets.GITHUB_TOKEN }}"
-          add-paths: |
-            .
-          commit-message: "chore(ai): apply Codex generation"
-          title: "AI: Codex updates (mode=${{ inputs.mode }})"
+          title: "AI: Codex generate (${{ inputs.mode }} / env:${{ inputs.env_profile }})"
           body: |
-            Automated changes generated by Codex.
-            - mode: `${{ inputs.mode }}`
-            - model: `${{ inputs.model || 'default' }}`
-            - specs: `${{ env.SPEC_FILES }}`
+            Automated generation from spec_fixed_v3:
+            - foundation/tests/env/features (ordered composite prompt)
+            - AHR: up to 1 retry
+            - Tests: spec/tests/runner/run_checks.sh
+
+            Artifacts:
+            - dist/package.zip (if present)
+          commit-message: "chore(ai): codex generate (${{ inputs.mode }} / env:${{ inputs.env_profile }})"
           branch: "ai/codex/batch-${{ github.run_id }}"
           base: "main"
-          signoff: false
           delete-branch: true
-
-      - name: "No changes"
-        if: ${{ steps.diff.outputs.changed != 'true' }}
-        shell: "bash"
-        run: |
-          echo "No changes to commit."
