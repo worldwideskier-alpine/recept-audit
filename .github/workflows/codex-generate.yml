@@ -4,27 +4,29 @@ on:
   workflow_call:
     inputs:
       mode:
-        description: "実行モード: full（全生成）/ incremental（差分）"
+        description: "実行モード: full（全生成） / incremental（差分）"
+        type: string
         required: false
         default: "full"
-        type: string
       model:
         description: "OpenAI モデル名（任意）"
+        type: string
         required: false
         default: ""
-        type: string
     secrets:
       OPENAI_API_KEY:
-        description: "OpenAI API Key"
         required: true
+
   workflow_dispatch:
     inputs:
       mode:
-        description: "実行モード: full（全生成）/ incremental（差分）"
+        description: "実行モード: full（全生成） / incremental（差分）"
+        type: string
         required: false
         default: "full"
       model:
         description: "OpenAI モデル名（任意）"
+        type: string
         required: false
         default: ""
 
@@ -37,121 +39,142 @@ jobs:
     name: "generate"
     runs-on: "ubuntu-latest"
     env:
-      SPEC_FILES: "spec/generation.txt spec/testing.txt spec/environment.txt spec/functional.txt"
-      PROMPT_FILE: "ai/prompt.md"
-      DEFECTS_DIR: "ai/defects"
-      ALLOW_MODE: "${{ inputs.mode }}"
-      OPENAI_MODEL_DEFAULT: ""
+      OPENAI_API_KEY: "${{ secrets.OPENAI_API_KEY }}"
+      MODE: "${{ inputs.mode }}"
+      MODEL: "${{ inputs.model }}"
 
     steps:
       - name: "Checkout"
         uses: "actions/checkout@v4"
 
-      - name: "Setup Node"
-        uses: "actions/setup-node@v4"
-        with:
-            node-version: "20"
-
-      - name: "Preflight: check OPENAI_API_KEY"
+      # ※『full』時だけ “生成物フォルダ” を安全に初期化（空ディレクトリは生成しない）
+      #   ここでは一般的に生成対象になりやすい場所だけを限定クリアします。
+      - name: "Clean generated targets (full mode)"
+        if: "${{ env.MODE == 'full' }}"
         shell: "bash"
         run: |
-          set -Eeuo pipefail
-          if [ -z "${{ secrets.OPENAI_API_KEY }}" ]; then
-            echo "::error::OPENAI_API_KEY is missing"
-            exit 1
-          fi
-
-      - name: "Prepare folders"
-        shell: "bash"
-        run: |
-          set -Eeuo pipefail
-          mkdir -p "$(dirname "${PROMPT_FILE}")" "${DEFECTS_DIR}"
-
-      - name: "Compose prompt from specs (no heredoc)"
-        shell: "bash"
-        run: |
-          set -Eeuo pipefail
-          : > "${PROMPT_FILE}"
-          for f in ${SPEC_FILES}; do
-            if [ -f "${f}" ]; then
-              printf '%s\n' '---' "<!-- file: '"${f}"' -->" >> "${PROMPT_FILE}"
-              sed -e 's/\r$//' "${f}" >> "${PROMPT_FILE}"
-              printf '\n' >> "${PROMPT_FILE}"
+          set -euo pipefail
+          to_clean=( "src" "tests" "tools" "storage" "logs" "dist" )
+          for d in "${to_clean[@]}"; do
+            if [ -e "$d" ]; then
+              git rm -r --ignore-unmatch -f "$d" || true
+              rm -rf "$d"
             fi
           done
-          if [ ! -s "${PROMPT_FILE}" ]; then
-            echo "::error::No spec files found."
+
+      # 仕様分割ディレクトリから自動検出して結合（順序は foundation → env-profiles → features → tests）
+      # ここでは ‘<<’ ヒアドキュメントを一切使いません。printf と cat のみで構築します。
+      - name: "Compose composite prompt from spec/"
+        id: "prompt"
+        shell: "bash"
+        run: |
+          set -euo pipefail
+          mkdir -p ai
+          : > ai/prompt.md
+
+          # 収集（特定拡張子に限定）＆安定ソート
+          mapfile -t FILES < <(
+            find spec -type f \
+              \( -path "spec/foundation/*" -o -path "spec/env-profiles/*" -o -path "spec/features/*" -o -path "spec/tests/*" \) \
+              \( -name "*.md" -o -name "*.txt" -o -name "*.yaml" -o -name "*.yml" -o -name "*.json" \) \
+              -print | LC_ALL=C sort
+          )
+
+          if [ "${#FILES[@]}" -eq 0 ]; then
+            echo "::warning::No spec files detected under spec/{foundation,env-profiles,features,tests}"
+          fi
+
+          add_file () {
+            local f="$1"
+            printf "\n\n<!-- file: %s -->\n\n" "$f" >> ai/prompt.md
+            cat "$f" >> ai/prompt.md
+            printf "\n" >> ai/prompt.md
+          }
+
+          # foundation → env-profiles → features → tests の順で結合
+          for group in "foundation" "env-profiles" "features" "tests"; do
+            for f in "${FILES[@]}"; do
+              case "$f" in
+                spec/${group}/*)
+                  add_file "$f"
+                  ;;
+              esac
+            done
+          done
+
+          echo "PROMPT=ai/prompt.md" >> "$GITHUB_OUTPUT"
+
+      # Codex 実行（モデルは任意、未指定ならアクション既定値）
+      - name: "Run Codex"
+        uses: "openai/codex-action@main"
+        with:
+          openai-api-key: "${{ env.OPENAI_API_KEY }}"
+          prompt-file: "${{ steps.prompt.outputs.PROMPT }}"
+          model: "${{ env.MODEL }}"
+          sandbox: "workspace-write"
+
+      # 生成後に .github や spec 等、保護領域への変更が混入していないかを拒否
+      - name: "Guard: reject edits under protected paths"
+        shell: "bash"
+        run: |
+          set -euo pipefail
+          # 変更が無ければスキップ
+          if [ -z "$(git status --porcelain)" ]; then
+            exit 0
+          fi
+
+          # 書き換え禁止の保護パス（ワイルドカード許容）
+          PROTECTS=( ".github/**" "spec/**" "evidence/**" "dist/**" )
+          reject=0
+
+          # 変更ファイルを1行ずつ走査
+          while IFS= read -r path; do
+            for pat in "${PROTECTS[@]}"; do
+              if [[ "$path" == $pat ]]; then
+                echo "::error::blocked change: $path"
+                reject=1
+              fi
+            done
+          done < <(git status --porcelain | awk '{print $2}')
+
+          if [ "$reject" -eq 1 ]; then
+            echo "::error::Protected paths were modified."
             exit 1
           fi
 
-      - name: "Scaffold minimal workspace"
-        shell: "bash"
-        run: |
-          set -Eeuo pipefail
-          printf '%s\n' \
-            "src" "tests" "tools" "storage" \
-            "evidence/static" "evidence/runtime" "evidence/pkg" "evidence/verify" \
-            "dist" \
-          | while IFS= read -r d; do mkdir -p "${d}"; done
-
-      - name: "Run Codex (pass 1)"
-        id: "codex1"
-        uses: "openai/codex-action@main"
-        with:
-          openai-api-key: "${{ secrets.OPENAI_API_KEY }}"
-          prompt-file: "${{ env.PROMPT_FILE }}"
-          model: "${{ inputs.model || env.OPENAI_MODEL_DEFAULT }}"
-          sandbox: "workspace-write"
-
-      - name: "Validate PHP require/include"
-        shell: "bash"
-        run: |
-          set -Eeuo pipefail
-          : > "${DEFECTS_DIR}/missing-requires.txt"
-          mapfile -t php_files < <(git ls-files -- '*.php' 2>/dev/null || true)
-          if [ "${#php_files[@]}" -gt 0 ]; then
-            for f in "${php_files[@]}"; do
-              mapfile -t targets < <(grep -Eo "require(_once)?\s*\(\s*['\"][^'\"]+['\"]\s*\)|include(_once)?\s*\(\s*['\"][^'\"]+['\"]\s*\)" "${f}" \
-                | sed -E "s/.*\(['\"]([^'\"]+)['\"]\).*/\1/")
-              for t in "${targets[@]}"; do
-                if [[ "${t}" != /* ]]; then base="$(dirname "${f}")"; path="${base}/${t}"; else path="${t}"; fi
-                if [ ! -f "${path}" ]; then
-                  printf '%s\t%s -> %s\n' "MISSING" "${f}" "${t}" >> "${DEFECTS_DIR}/missing-requires.txt"
-                fi
-              done
-            done
-          fi
-          if [ -s "${DEFECTS_DIR}/missing-requires.txt" ]; then
-            echo "::warning::Missing include/require detected. See ${DEFECTS_DIR}/missing-requires.txt"
-          fi
-
+      # 差分サマリ（あくまで情報表示）
       - name: "Show diff summary"
         shell: "bash"
         run: |
-          set -Eeuo pipefail
           git status --porcelain=v1 || true
           git diff --stat || true
 
+      # 変更無しなら終了
+      - name: "Exit early if no changes"
+        shell: "bash"
+        run: |
+          if [ -z "$(git status --porcelain)" ]; then
+            echo "No changes to commit."
+            exit 0
+          fi
+
+      # コミット用の簡易アイデンティティ設定
       - name: "Configure git author"
         shell: "bash"
         run: |
-          set -Eeuo pipefail
-          git config --global user.email "ci-bot@example.invalid"
-          git config --global user.name  "CI Bot"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git config --global user.name  "github-actions[bot]"
 
-      - name: "Create Pull Request"
+      # ブランチ作成・コミット・PR 作成
+      - name: "Create PR"
         uses: "peter-evans/create-pull-request@v7"
         with:
-          token: "${{ github.token }}"
+          token: "${{ secrets.GITHUB_TOKEN }}"
           branch: "ai/codex/batch-${{ github.run_id }}"
           base: "main"
-          title: "AI: codegen (${{ inputs.mode }})"
-          body: |
-            Automated code generation from specs.
-            - mode: `${{ inputs.mode }}`
-            - model: `${{ inputs.model || 'default' }}`
-            - defects: see `ai/defects/` if present
-          add-paths: |
-            .
+          title: "AI: apply Codex changes"
+          body: "Automated changes generated from spec with mode `${{ env.MODE }}`."
+          commit-message: "chore(ai): apply Codex changes (mode=${{ env.MODE }})"
           signoff: false
-          draft: false
+          delete-branch: true
+          labels: "ai, codex, automated"
