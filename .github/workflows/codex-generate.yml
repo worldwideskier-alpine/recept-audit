@@ -9,7 +9,7 @@ on:
         default: "full"
         type: string
       model:
-        description: "OpenAI モデル名 (任意)"
+        description: "OpenAI モデル名 (任意: 例 gpt-5-codex / gpt-5 / gpt-4.1)"
         required: false
         default: ""
         type: string
@@ -27,7 +27,7 @@ on:
         type: choice
         options: ["full", "incremental"]
       model:
-        description: "OpenAI モデル名 (任意)"
+        description: "OpenAI モデル名 (任意: 例 gpt-5-codex / gpt-5 / gpt-4.1)"
         required: false
         default: ""
         type: string
@@ -42,29 +42,35 @@ jobs:
     runs-on: "ubuntu-latest"
 
     env:
+      # 仕様のルート/サブディレクトリ
       SPEC_ROOT: "spec"
       SPEC_DIRS: "foundation env-profiles features tests"
+      # 生成物/媒介ファイル
       PROMPT_FILE: "ai/prompt.md"
       PATCH_FILE: "ai/patch.diff"
+      # モデル（未指定時の既定は gpt-4o-mini にしています。gpt-5-codex が使えるなら dispatcher 側で inputs.model に指定してください）
       MODEL_DEFAULT: "gpt-4o-mini"
       OPENAI_MODEL: "${{ inputs.model }}"
       MODE: "${{ inputs.mode }}"
+      # OpenAI
       OPENAI_API_KEY: "${{ secrets.OPENAI_API_KEY }}"
+      # 企業プロキシ・専用エンドポイントを使う場合だけ設定（未設定なら公式）
+      OPENAI_BASE_URL: "${{ vars.OPENAI_BASE_URL }}"
 
     steps:
       - name: "Checkout"
-        uses: "actions/checkout@v4"
+        uses: actions/checkout@v4
 
       - name: "Setup Node (cache if lock exists)"
         if: ${{ hashFiles('**/package-lock.json', '**/npm-shrinkwrap.json', '**/yarn.lock') != '' }}
-        uses: "actions/setup-node@v4"
+        uses: actions/setup-node@v4
         with:
           node-version: "20"
           cache: "npm"
 
       - name: "Setup Node (no cache)"
         if: ${{ hashFiles('**/package-lock.json', '**/npm-shrinkwrap.json', '**/yarn.lock') == '' }}
-        uses: "actions/setup-node@v4"
+        uses: actions/setup-node@v4
         with:
           node-version: "20"
 
@@ -109,7 +115,6 @@ jobs:
           fi
           rm -f "$tmp_list"
 
-          # ---- OUTPUT CONTRACT (MUST) ----
           {
             printf "\n## OUTPUT CONTRACT (MUST)\n\n"
             printf -- "- Return a single Unified Diff patch rooted at the repository.\n"
@@ -127,9 +132,22 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          MODEL="${OPENAI_MODEL:-$MODEL_DEFAULT}"
 
-          # 入力は --rawfile で安全に取り込み、-n で定数JSONを構築
+          # --- model & endpoint sanitize ---
+          _in="${OPENAI_MODEL:-}"
+          MODEL="$MODEL_DEFAULT"
+          if [ -n "$_in" ]; then
+            case "$_in" in
+              # 代表的な有効パターンのみ通す（それ以外は既定にフォールバック）
+              gpt-*|o* ) MODEL="$_in" ;;
+              * ) echo "note: unknown model '$_in' -> fallback to $MODEL_DEFAULT" ;;
+            esac
+          fi
+          BASE="${OPENAI_BASE_URL:-https://api.openai.com}"
+          echo "Using model: $MODEL"
+          echo "Base URL  : $BASE"
+
+          # --- build request json safely ---
           jq -n \
             --arg model "$MODEL" \
             --rawfile prompt "$PROMPT_FILE" \
@@ -137,21 +155,20 @@ jobs:
               model: $model,
               temperature: 0.1,
               max_tokens: 4096,
-              messages: [
-                {
-                  role: "user",
-                  content: ($prompt + "\n\n[MUST OUTPUT] Return only a unified diff patch (UTF-8), repository root. No prose. No code fences.")
-                }
-              ]
+              messages: [{
+                role: "user",
+                content: ($prompt + "\n\n[MUST OUTPUT] Return only a unified diff patch (UTF-8), repository root. No prose. No code fences.")
+              }]
             }' > ai/request.json
 
+          # --- call API ---
           resp_with_code="$(mktemp)"
           curl -sS \
             -H "Authorization: Bearer ${OPENAI_API_KEY}" \
             -H "Content-Type: application/json" \
             -w "\n%{http_code}\n" \
             -d @ai/request.json \
-            https://api.openai.com/v1/chat/completions \
+            "${BASE%/}/v1/chat/completions" \
             | tee "$resp_with_code" >/dev/null
 
           status="$(tail -n1 "$resp_with_code")"
@@ -160,13 +177,17 @@ jobs:
 
           if [ "${status}" -ge 300 ]; then
             echo "::error::OpenAI error ${status}"
+            echo "---- request (trimmed) ----"
+            head -c 800 ai/request.json; echo
+            echo "---- response body ----"
+            cat ai/response.json || true
             exit 3
           fi
 
           # extract text
           jq -r '.choices[0].message.content // empty' ai/response.json > ai/out.txt
 
-          # strip code fences if present (先頭/末尾の ``` を落とす)
+          # strip code fences if present
           sed -E -e '1{/^```[a-zA-Z-]*[[:space:]]*$/d;}' -e '${/^```[[:space:]]*$/d;}' -i ai/out.txt || true
 
           # drop any preamble lines before diff header
