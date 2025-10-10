@@ -150,7 +150,6 @@ jobs:
               '{
                 model: $model,
                 max_output_tokens: 4096,
-                text_format: { type: "text" },
                 input: [
                   {
                     role: "user",
