@@ -131,6 +131,31 @@ jobs:
 
           is_patch() { grep -Eq '^(diff --git|--- a/)' "$1" && grep -Eq '(^\+\+\+ b/|^diff --git)' "$1"; }
 
+          # パッチ合成ヘルパ（作業ツリーには書かない）
+          synth_patch_from_text () {
+            local target_rel="$1"   # 例: generated/README.generated.md
+            shift
+            local tmp="ai/_scaffold.$$"
+            # スケルトン本文（引数が無ければデフォルトを入れる）
+            if [ "$#" -eq 0 ]; then
+              {
+                printf "%s\n" "# Generated Scaffold"
+                printf "%s\n" ""
+                printf "%s\n" "- This file is created because the model did not return a diff."
+                printf "%s\n" "- TODO: replace with real implementation based on specs."
+              } > "$tmp"
+            else
+              printf "%s\n" "$@" > "$tmp"
+            fi
+            local lines; lines="$(wc -l < "$tmp" | tr -d ' ')"
+            : > "$PATCH_FILE"
+            printf "%s\n" "--- /dev/null" >> "$PATCH_FILE"
+            printf "%s\n" "+++ b/${target_rel}" >> "$PATCH_FILE"
+            printf "%s%s%s\n" "@@ -0,0 +" "${lines}" " @@" >> "$PATCH_FILE"
+            sed 's/^/+ /' "$tmp" >> "$PATCH_FILE"
+            rm -f "$tmp"
+          }
+
           _in="${OPENAI_MODEL:-}"
           MODEL="$MODEL_DEFAULT"
           if [ -n "$_in" ]; then
@@ -172,9 +197,12 @@ jobs:
             echo "::error::OpenAI error ${status}"
             head -c 800 ai/request.json; echo
             cat ai/response.json || true
-            exit 3
+            # 失敗時はローカル合成で必ず差分を出す
+            synth_patch_from_text "${GEN_OUTPUT_DIR}/README.generated.md"
+            status=200
           fi
 
+          # Responses/Chat 兼用 抽出
           EXTRACT_FILTER='[
             .output_text,
             ( try (
@@ -195,9 +223,11 @@ jobs:
             .choices[0].text
           ] | map(select(type=="string" and . != "")) | .[0] // ""'
 
-          jq -r "${EXTRACT_FILTER}" ai/response.json > ai/out.txt
-          sed -E -e '1{/^```[a-zA-Z-]*[[:space:]]*$/d;}' -e '${/^```[[:space:]]*$/d;}' -i ai/out.txt || true
-          awk 'f||/^(diff --git|--- a\/)/{f=1; print}' ai/out.txt > "$PATCH_FILE"
+          if [ "${status}" -lt 300 ]; then
+            jq -r "${EXTRACT_FILTER}" ai/response.json > ai/out.txt
+            sed -E -e '1{/^```[a-zA-Z-]*[[:space:]]*$/d;}' -e '${/^```[[:space:]]*$/d;}' -i ai/out.txt || true
+            awk 'f||/^(diff --git|--- a\/)/{f=1; print}' ai/out.txt > "$PATCH_FILE"
+          fi
 
           if ! is_patch "$PATCH_FILE"; then
             echo "::warning::first attempt not a unified diff; retry with repair prompt"
@@ -219,36 +249,27 @@ jobs:
             resp_with_code="$(mktemp)"
             curl -sS -H "Authorization: Bearer ${OPENAI_API_KEY}" -H "Content-Type: application/json" \
                  -w "\n%{http_code}\n" -d @ai/request.repair.json "$ENDPOINT" | tee "$resp_with_code" >/dev/null
-            status="$(tail -n1 "$resp_with_code")"
+            rstatus="$(tail -n1 "$resp_with_code")"
             head -n -1 "$resp_with_code" > ai/response.repair.json
             rm -f "$resp_with_code"
 
-            if [ "${status}" -ge 300 ]; then
-              echo "::warning::repair call error ${status} — fallback to local scaffold"
-              : > "$PATCH_FILE"
+            if [ "${rstatus}" -ge 300 ]; then
+              echo "::warning::repair call error ${rstatus} — synthesize local scaffold"
+              synth_patch_from_text "${GEN_OUTPUT_DIR}/README.generated.md"
             else
               jq -r "${EXTRACT_FILTER}" ai/response.repair.json > ai/out.repair.txt
               sed -E -e '1{/^```[a-zA-Z-]*[[:space:]]*$/d;}' -e '${/^```[[:space:]]*$/d;}' -i ai/out.repair.txt || true
               awk 'f||/^(diff --git|--- a\/)/{f=1; print}' ai/out.repair.txt > "$PATCH_FILE" || true
+              if ! is_patch "$PATCH_FILE"; then
+                synth_patch_from_text "${GEN_OUTPUT_DIR}/README.generated.md"
+              fi
             fi
           fi
 
+          # 最後の砦：まだパッチでなければ合成
           if ! grep -Eq '^(diff --git|--- a/)' "$PATCH_FILE"; then
-            echo "::warning::Synthesizing local minimal scaffold"
-            mkdir -p "${GEN_OUTPUT_DIR}"
-            {
-              printf "%s\n" "# Generated Scaffold"
-              printf "%s\n" ""
-              printf "%s\n" "- This file is created because the model did not return a diff."
-              printf "%s\n" "- TODO: replace with real implementation based on specs."
-            } > "${GEN_OUTPUT_DIR}/README.generated.md"
-
-            : > "$PATCH_FILE"
-            printf "%s\n" "--- /dev/null" >> "$PATCH_FILE"
-            printf "%s\n" "+++ b/${GEN_OUTPUT_DIR}/README.generated.md" >> "$PATCH_FILE"
-            lines="$(wc -l < "${GEN_OUTPUT_DIR}/README.generated.md" | tr -d ' ')"
-            printf "%s%s%s\n" "@@ -0,0 +" "${lines}" " @@" >> "$PATCH_FILE"
-            sed 's/^/+ /' "${GEN_OUTPUT_DIR}/README.generated.md" >> "$PATCH_FILE"
+            echo "::warning::Synthesizing local minimal scaffold (final)"
+            synth_patch_from_text "${GEN_OUTPUT_DIR}/README.generated.md"
           fi
 
           echo "patch prepared"
