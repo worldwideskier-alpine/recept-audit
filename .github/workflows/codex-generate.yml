@@ -42,17 +42,13 @@ jobs:
     runs-on: "ubuntu-latest"
 
     env:
-      # 仕様のルート/サブディレクトリ
       SPEC_ROOT: "spec"
       SPEC_DIRS: "foundation env-profiles features tests"
-      # 生成物/媒介ファイル
       PROMPT_FILE: "ai/prompt.md"
       PATCH_FILE: "ai/patch.diff"
-      # モデル
       MODEL_DEFAULT: "gpt-4o-mini"
       OPENAI_MODEL: "${{ inputs.model }}"
       MODE: "${{ inputs.mode }}"
-      # 全ステップで参照可能に
       OPENAI_API_KEY: "${{ secrets.OPENAI_API_KEY }}"
 
     steps:
@@ -144,81 +140,6 @@ jobs:
           printf "%s\n" "const KEY = process.env.OPENAI_API_KEY;" >> tools/run_codex.js
           printf "%s\n" "function extractText(j){" >> tools/run_codex.js
           printf "%s\n" "  if (!j) return '';" >> tools/run_codex.js
-          printf "%s\n" "  if (typeof j.output_text === 'string') return j.output_text;" >> tools/run_codex.js
-          printf "%s\n" "  if (Array.isArray(j.output_text)) return j.output_text.join('');" >> tools/run_codex.js
-          printf "%s\n" "  if (typeof j.output === 'string') return j.output;" >> tools/run_codex.js
-          printf "%s\n" "  if (Array.isArray(j.output)) return j.output.map(x => (typeof x==='string'?x:(x?.text||x?.content||''))).join('');" >> tools/run_codex.js
           printf "%s\n" "  if (j.choices && j.choices.length){" >> tools/run_codex.js
           printf "%s\n" "    const c0=j.choices[0];" >> tools/run_codex.js
-          printf "%s\n" "    if (c0?.message?.content){ if (Array.isArray(c0.message.content)) return c0.message.content.map(c=>c.text||c.string||'').join(''); return c0.message.content; }" >> tools/run_codex.js
-          printf "%s\n" "    if (typeof c0?.text==='string') return c0.text;" >> tools/run_codex.js
-          printf "%s\n" "  }" >> tools/run_codex.js
-          printf "%s\n" "  if (typeof j.data==='string') return j.data;" >> tools/run_codex.js
-          printf "%s\n" "  return '';" >> tools/run_codex.js
-          printf "%s\n" "}" >> tools/run_codex.js
-          printf "%s\n" "if (!KEY) { console.error('OPENAI_API_KEY missing'); process.exit(2); }" >> tools/run_codex.js
-          printf "%s\n" "const prompt = fs.readFileSync(PROMPT_FILE, 'utf8');" >> tools/run_codex.js
-          printf "%s\n" "const body = JSON.stringify({ model: MODEL, temperature: 0.1, response_format: { type: 'text' }, max_output_tokens: 2048, input: [{ role: 'user', content: [{ type: 'text', text: prompt + '\\n\\n[MUST OUTPUT] Return only a unified diff patch (UTF-8), repository root. No prose. No code fences.' }] }] });" >> tools/run_codex.js
-          printf "%s\n" "const req = https.request({ hostname: 'api.openai.com', path: '/v1/responses', method: 'POST', headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer '+KEY } }, (res)=>{" >> tools/run_codex.js
-          printf "%s\n" "  let data=''; res.on('data',c=>data+=c); res.on('end',()=>{" >> tools/run_codex.js
-          printf "%s\n" "    if (res.statusCode>=300){ console.error('OpenAI error',res.statusCode); try{fs.writeFileSync('ai/response.error.json',data);}catch(e){} process.exit(3); }" >> tools/run_codex.js
-          printf "%s\n" "    try{" >> tools/run_codex.js
-          printf "%s\n" "      const j=JSON.parse(data);" >> tools/run_codex.js
-          printf "%s\n" "      let out=String(extractText(j)||'').trim();" >> tools/run_codex.js
-          printf "%s\n" "      // strip code fences if present" >> tools/run_codex.js
-          printf "%s\n" "      out = out.replace(/^\\`\\`\\`[a-zA-Z-]*\\n?/,'').replace(/\\n\\`\\`\\`\\s*$/,'').trim();" >> tools/run_codex.js
-          printf "%s\n" "      // cut any preamble before diff headers" >> tools/run_codex.js
-          printf "%s\n" "      const i1 = out.indexOf('diff --git'); const i2 = out.indexOf('--- a/'); const i = (i1>=0?i1:(i2>=0?i2:-1));" >> tools/run_codex.js
-          printf "%s\n" "      if (i>0) out = out.slice(i);" >> tools/run_codex.js
-          printf "%s\n" "      if (!out || out.indexOf('--- ')===-1 || out.indexOf('+++ ')===-1){ console.error('model did not return a unified diff'); try{fs.writeFileSync('ai/response.debug.json',data);}catch(e){} process.exit(4); }" >> tools/run_codex.js
-          printf "%s\n" "      fs.mkdirSync(path.dirname(PATCH_FILE),{recursive:true}); fs.writeFileSync(PATCH_FILE,out,'utf8'); console.log('patch written');" >> tools/run_codex.js
-          printf "%s\n" "    }catch(e){ console.error('parse error',e.message); try{fs.writeFileSync('ai/response.parse.json',data);}catch(_){} process.exit(5); }" >> tools/run_codex.js
-          printf "%s\n" "  });" >> tools/run_codex.js
-          printf "%s\n" "});" >> tools/run_codex.js
-          printf "%s\n" "req.on('error',err=>{ console.error('request error',err.message); process.exit(6); });" >> tools/run_codex.js
-          printf "%s\n" "req.write(body); req.end();" >> tools/run_codex.js
-
-      - name: "Run Codex (node, no chmod)"
-        shell: "bash"
-        run: |
-          set -euo pipefail
-          node -v
-          node tools/run_codex.js
-
-      - name: "Normalize & verify patch (no heredoc)"
-        shell: "bash"
-        run: |
-          set -euo pipefail
-          if [ ! -f "${PATCH_FILE}" ]; then
-            echo "::error::patch not found"
-            exit 1
-          fi
-          perl -pi -e 's/\r$//' "${PATCH_FILE}"
-          # accept either git-style or classic unified-diff headers
-          if grep -q "^diff --git" "${PATCH_FILE}"; then
-            echo "git-style patch detected"
-          elif grep -q "^--- a/" "${PATCH_FILE}" && grep -q "^\+\+\+ b/" "${PATCH_FILE}"; then
-            echo "unified patch detected"
-          else
-            echo "::error::not a unified diff"
-            exit 1
-          fi
-          echo "patch verified"
-
-      - name: "Upload response debug (if any)"
-        if: ${{ failure() }}
-        uses: "actions/upload-artifact@v4"
-        with:
-          name: "ai-response-debug"
-          path: "ai/*.json"
-          if-no-files-found: "ignore"
-
-      - name: "Upload prompt & patch (always)"
-        if: ${{ always() }}
-        uses: "actions/upload-artifact@v4"
-        with:
-          name: "ai-prompt-and-patch"
-          path: |
-            ai/prompt.md
-            ai/patch.diff
-          if-no-files-found: "ignore"
+          printf "%s\n" "    if (c0?.message?.content){ return (Array.isArray(c0.message.content)?c0.message.content.map
