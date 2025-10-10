@@ -1,3 +1,4 @@
+# .github/workflows/codex.yml
 name: "Codex Generate (dispatcher)"
 
 on:
@@ -7,7 +8,8 @@ on:
         description: "実行モード: full（全生成） / incremental（差分）"
         required: false
         default: "full"
-        type: string
+        type: choice
+        options: ["full", "incremental"]
       model:
         description: "OpenAI モデル名（任意）"
         required: false
@@ -17,18 +19,22 @@ on:
     branches: ["main"]
     paths:
       - "spec/**"
+      - ".github/workflows/codex.yml"
       - ".github/workflows/codex-generate.yml"
+      - "tools/run_codex.js"
 
 permissions:
-  contents: write
-  pull-requests: write
+  contents: "write"
+  pull-requests: "write"
 
 jobs:
   generate:
-    # ローカルの再利用ワークフローを参照する時は先頭に ./ が必須
-    uses: ./.github/workflows/codex-generate.yml
+    name: "Call reusable workflow"
+    # 同一リポジトリ内の再利用ワークフローをパス指定で呼び出します。
+    uses: "./.github/workflows/codex-generate.yml"
     with:
-      mode:  ${{ inputs.mode  != '' && inputs.mode  || 'full' }}
-      model: ${{ inputs.model != '' && inputs.model || ''     }}
-    secrets:
-      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+      # workflow_dispatch で未入力の場合や push イベント時でも安全に既定値へフォールバック
+      mode: "${{ inputs.mode != '' && inputs.mode || 'full' }}"
+      model: "${{ inputs.model != '' && inputs.model || '' }}"
+    # 呼び出し先（codex-generate.yml の workflow_call）へシークレットを引き継ぐ
+    secrets: "inherit"
