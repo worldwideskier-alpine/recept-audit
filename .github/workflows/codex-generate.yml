@@ -47,57 +47,54 @@ jobs:
       CODEX_BRANCH: "ai/codex/batch-${{ github.run_id }}"
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - name: "Checkout"
+        uses: "actions/checkout@v4"
 
-      # ---- lock がある場合のみ cache を有効化 ----
-      - name: Setup Node (with cache)
-        if: ${{ hashFiles('**/package-lock.json','**/npm-shrinkwrap.json','**/yarn.lock') != '' }}
-        uses: actions/setup-node@v4
+      # ---- lock がある場合のみ cache 有効化（配列指定で YAML を堅牢化） ----
+      - name: "Setup Node (with cache)"
+        if: "${{ hashFiles('**/package-lock.json', '**/npm-shrinkwrap.json', '**/yarn.lock') != '' }}"
+        uses: "actions/setup-node@v4"
         with:
-          node-version: 20
-          cache: npm
-          cache-dependency-path: |
-            **/package-lock.json
-            **/npm-shrinkwrap.json
-            **/yarn.lock
+          node-version: "20"
+          cache: "npm"
+          cache-dependency-path: ["**/package-lock.json", "**/npm-shrinkwrap.json", "**/yarn.lock"]
 
-      - name: Setup Node (no cache)
-        if: ${{ hashFiles('**/package-lock.json','**/npm-shrinkwrap.json','**/yarn.lock') == '' }}
-        uses: actions/setup-node@v4
+      - name: "Setup Node (no cache)"
+        if: "${{ hashFiles('**/package-lock.json', '**/npm-shrinkwrap.json', '**/yarn.lock') == '' }}"
+        uses: "actions/setup-node@v4"
         with:
-          node-version: 20
+          node-version: "20"
 
-      - name: Preflight: API key
-        shell: bash
+      - name: "Preflight: API key"
+        shell: "bash"
         run: |
           set -eu
           [ -n "${{ secrets.OPENAI_API_KEY }}" ] || { echo "::error::OPENAI_API_KEY is not set"; exit 1; }
 
-      - name: Compose prompt from spec (no-heredoc)
-        shell: bash
+      - name: "Compose prompt from spec (no-heredoc)"
+        shell: "bash"
         run: |
           set -eu
-          mkdir -p ai
-          : > "$PROMPT_FILE"
-          for d in $SPEC_DIRS; do
-            [ -d "$SPEC_ROOT/$d" ] || continue
-            echo "## $d" >> "$PROMPT_FILE"
-            find "$SPEC_ROOT/$d" -type f \( -name '*.md' -o -name '*.txt' -o -name '*.yaml' -o -name '*.yml' -o -name '*.json' \) \
+          mkdir -p "ai"
+          : > "${PROMPT_FILE}"
+          for d in ${SPEC_DIRS}; do
+            [ -d "${SPEC_ROOT}/${d}" ] || continue
+            echo "## ${d}" >> "${PROMPT_FILE}"
+            find "${SPEC_ROOT}/${d}" -type f \( -name "*.md" -o -name "*.txt" -o -name "*.yaml" -o -name "*.yml" -o -name "*.json" \) \
               | LC_ALL=C sort \
               | while read -r f; do
-                  printf "\n\n# file: %s\n\n" "$f" >> "$PROMPT_FILE"
-                  cat "$f" >> "$PROMPT_FILE"
+                  printf "\n\n# file: %s\n\n" "${f}" >> "${PROMPT_FILE}"
+                  cat "${f}" >> "${PROMPT_FILE}"
                 done
           done
-          echo "::notice::Prompt composed at $PROMPT_FILE"
+          echo "::notice::Prompt composed at ${PROMPT_FILE}"
 
-      - name: Install runtime deps (auto detect)
-        shell: bash
+      - name: "Install runtime deps (auto detect)"
+        shell: "bash"
         run: |
           set -eu
-          if [ -f package.json ]; then
-            if [ -f package-lock.json ] || [ -f npm-shrinkwrap.json ] || [ -f yarn.lock ]; then
+          if [ -f "package.json" ]; then
+            if [ -f "package-lock.json" ] || [ -f "npm-shrinkwrap.json" ] || [ -f "yarn.lock" ]; then
               npm ci
             else
               npm install --no-audit --no-fund
@@ -106,36 +103,36 @@ jobs:
             echo "::notice::No package.json; skip npm install"
           fi
 
-      - name: Verify runner script
-        shell: bash
+      - name: "Verify runner script"
+        shell: "bash"
         run: |
           set -eu
-          [ -f tools/run_codex.js ] || { echo "::error::tools/run_codex.js is missing. Commit the script."; exit 1; }
+          [ -f "tools/run_codex.js" ] || { echo "::error::tools/run_codex.js is missing. Commit the script."; exit 1; }
 
-      - name: Run Codex (node, no chmod)
+      - name: "Run Codex (node, no chmod)"
         env:
-          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-          OPENAI_MODEL: ${{ env.OPENAI_MODEL }}
-          MODEL_DEFAULT: ${{ env.MODEL_DEFAULT }}
-          MODE: ${{ env.MODE }}
-          PROMPT_FILE: ${{ env.PROMPT_FILE }}
+          OPENAI_API_KEY: "${{ secrets.OPENAI_API_KEY }}"
+          OPENAI_MODEL: "${{ env.OPENAI_MODEL }}"
+          MODEL_DEFAULT: "${{ env.MODEL_DEFAULT }}"
+          MODE: "${{ env.MODE }}"
+          PROMPT_FILE: "${{ env.PROMPT_FILE }}"
         run: |
-          node tools/run_codex.js
+          node "tools/run_codex.js"
 
-      - name: Show diff summary
-        shell: bash
+      - name: "Show diff summary"
+        shell: "bash"
         run: |
           set -euo pipefail
           git status --porcelain=v1 || true
           echo
           git diff --stat || true
 
-      - name: Create Pull Request
-        if: ${{ !cancelled() }}
-        uses: peter-evans/create-pull-request@v6
+      - name: "Create Pull Request"
+        if: "${{ !cancelled() }}"
+        uses: "peter-evans/create-pull-request@v6"
         with:
           commit-message: "chore(ai): apply codegen (mode=${{ inputs.mode }})"
           title: "AI: apply Codex changes (mode=${{ inputs.mode }})"
           body: "Automated code generation based on /spec. Prompt: ${{ env.PROMPT_FILE }}"
-          branch: ${{ env.CODEx_BRANCH }}
+          branch: "${{ env.CODEX_BRANCH }}"
           delete-branch: true
