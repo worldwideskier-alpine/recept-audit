@@ -39,7 +39,6 @@ jobs:
       MODE: "${{ inputs.mode }}"
       OPENAI_API_KEY: "${{ secrets.OPENAI_API_KEY }}"
       OPENAI_BASE_URL: "${{ vars.OPENAI_BASE_URL }}"
-      # 生成先を固定（ここに最低1ファイル以上を必ず作る）
       GEN_OUTPUT_DIR: "generated"
 
     steps:
@@ -79,7 +78,6 @@ jobs:
           printf "%s\n" "## Mode: ${MODE}" >> "$PROMPT_FILE"
           printf "%s\n" "" >> "$PROMPT_FILE"
 
-          # 変更ファイル拾い（incremental） or 全文
           tmp_list="$(mktemp)"
           if [ "${MODE:-full}" = "incremental" ]; then
             git fetch --depth=50 origin || true
@@ -108,18 +106,15 @@ jobs:
           fi
           rm -f "$tmp_list"
 
-          # タスク契約：常に何かを生成する
           {
             printf "\n## TASK CONTRACT (MUST)\n\n"
             printf -- "- Read the specs above and *generate implementation code* and/or *tests*.\n"
             printf -- "- You MUST produce at least one file change.\n"
             printf -- "- Default output location is '%s/'. Create new files there unless the spec explicitly maps to existing paths.\n" "${GEN_OUTPUT_DIR}"
             printf -- "- Prefer TypeScript/Node.js 20 if language is not specified; otherwise follow the spec.\n"
-            printf -- "- Use clean structure, minimal dependencies, and include brief file-level comments (in English or Japanese per spec).\n"
             printf -- "- If information is missing, generate a best-effort scaffold with TODO comments.\n"
           } >> "$PROMPT_FILE"
 
-          # 出力契約：必ず diff、no-op 禁止
           {
             printf "\n## OUTPUT CONTRACT (STRICT)\n\n"
             printf -- "- Return a single Unified Diff patch rooted at the repository.\n"
@@ -134,7 +129,7 @@ jobs:
         run: |
           set -euo pipefail
 
-          is_patch() { grep -Eq '^(diff --git|--- a/)' "$1" && grep -Eq '(^\\+\\+\\+ b/|^diff --git)' "$1"; }
+          is_patch() { grep -Eq '^(diff --git|--- a/)' "$1" && grep -Eq '(^\+\+\+ b/|^diff --git)' "$1"; }
 
           _in="${OPENAI_MODEL:-}"
           MODEL="$MODEL_DEFAULT"
@@ -147,7 +142,6 @@ jobs:
 
           SYSTEM_CONTRACT=$'You are a patch generator. Always output a unified diff (UTF-8) rooted at repository with at least one file changed. Default output directory is '"${GEN_OUTPUT_DIR}"$'/ . Do not return a no-op. If spec is ambiguous, generate a minimal scaffold under that directory with TODO comments. No prose, no code fences.'
 
-          # --- build request（Responses: temperature を送らない）---
           if printf "%s" "$MODEL" | grep -qiE '^gpt-5-codex( |$|-|:)'; then
             jq -n --arg model "$MODEL" --arg sys "$SYSTEM_CONTRACT" --rawfile prompt "$PROMPT_FILE" \
               '{
@@ -168,7 +162,6 @@ jobs:
             ENDPOINT="${BASE%/}/v1/chat/completions"
           fi
 
-          # --- call ---
           resp_with_code="$(mktemp)"
           curl -sS -H "Authorization: Bearer ${OPENAI_API_KEY}" -H "Content-Type: application/json" \
                -w "\n%{http_code}\n" -d @ai/request.json "$ENDPOINT" | tee "$resp_with_code" >/dev/null
@@ -182,7 +175,6 @@ jobs:
             exit 3
           fi
 
-          # robust extract（Responses / Chat 兼用）
           EXTRACT_FILTER='[
             .output_text,
             ( try (
@@ -241,29 +233,26 @@ jobs:
             fi
           fi
 
-          # 最終フォールバック：必ず差分を作る（スケルトン README をローカル生成）
           if ! grep -Eq '^(diff --git|--- a/)' "$PATCH_FILE"; then
             echo "::warning::Synthesizing local minimal scaffold"
-            TS="$(date -u +"%Y-%m-%dT%H:%M:%SZ")"
             mkdir -p "${GEN_OUTPUT_DIR}"
             {
-              echo "# Generated Scaffold"
-              echo
-              echo "- Timestamp: ${TS}"
-              echo "- This file is created because the model did not return a diff."
-              echo "- TODO: replace with real implementation based on specs."
+              printf "%s\n" "# Generated Scaffold"
+              printf "%s\n" ""
+              printf "%s\n" "- This file is created because the model did not return a diff."
+              printf "%s\n" "- TODO: replace with real implementation based on specs."
             } > "${GEN_OUTPUT_DIR}/README.generated.md"
 
             : > "$PATCH_FILE"
             printf "%s\n" "--- /dev/null" >> "$PATCH_FILE"
             printf "%s\n" "+++ b/${GEN_OUTPUT_DIR}/README.generated.md" >> "$PATCH_FILE"
-            printf "%s\n" "@@ -0,0 +1,5 @@" >> "$PATCH_FILE"
+            lines="$(wc -l < "${GEN_OUTPUT_DIR}/README.generated.md" | tr -d ' ')"
+            printf "%s%s%s\n" "@@ -0,0 +" "${lines}" " @@" >> "$PATCH_FILE"
             sed 's/^/+ /' "${GEN_OUTPUT_DIR}/README.generated.md" >> "$PATCH_FILE"
           fi
 
           echo "patch prepared"
 
-      # ---------- apply patch → PR ----------
       - name: "Apply patch to working tree"
         shell: bash
         run: |
@@ -289,7 +278,6 @@ jobs:
           delete-branch: true
           labels: "codex, automation"
 
-      # ---------- artifacts ----------
       - name: "Upload response debug (if any)"
         if: ${{ failure() }}
         uses: actions/upload-artifact@v4
