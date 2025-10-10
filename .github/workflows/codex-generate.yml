@@ -128,94 +128,55 @@ jobs:
           printf "%s\n" "-placeholder" >> "$PROMPT_FILE"
           printf "%s\n" "+placeholder" >> "$PROMPT_FILE"
 
-      - name: "Create tools/run_codex.js (heredoc, quoted)"
+      - name: "Create tools/run_codex.js (no heredoc)"
         shell: "bash"
         run: |
           set -euo pipefail
           mkdir -p tools ai
-          cat > tools/run_codex.js <<'JS'
-'use strict';
-const fs = require('fs');
-const path = require('path');
-const https = require('https');
-
-const PROMPT_FILE = process.env.PROMPT_FILE || 'ai/prompt.md';
-const PATCH_FILE  = process.env.PATCH_FILE  || 'ai/patch.diff';
-const MODEL = (process.env.OPENAI_MODEL && process.env.OPENAI_MODEL.length>0) ? process.env.OPENAI_MODEL : (process.env.MODEL_DEFAULT||'gpt-4o-mini');
-const KEY = process.env.OPENAI_API_KEY;
-
-function extractText(j){
-  if (!j) return '';
-  if (typeof j.output_text === 'string') return j.output_text;
-  if (Array.isArray(j.output_text)) return j.output_text.join('');
-  if (typeof j.output === 'string') return j.output;
-  if (Array.isArray(j.output)) return j.output.map(x => (typeof x==='string'?x:(x?.text||x?.content||''))).join('');
-  if (j.choices && j.choices.length){
-    const c0=j.choices[0];
-    if (c0?.message?.content){
-      if (Array.isArray(c0.message.content)) return c0.message.content.map(c=>c.text||c.string||'').join('');
-      return c0.message.content;
-    }
-    if (typeof c0?.text==='string') return c0.text;
-  }
-  if (typeof j.data==='string') return j.data;
-  return '';
-}
-
-if (!KEY) { console.error('OPENAI_API_KEY missing'); process.exit(2); }
-
-const prompt = fs.readFileSync(PROMPT_FILE, 'utf8');
-const body = JSON.stringify({
-  model: MODEL,
-  temperature: 0.1,
-  response_format: { type: 'text' },
-  input: [{
-    role: 'user',
-    content: prompt + '\n\n[MUST OUTPUT] Return only a unified diff patch (UTF-8), repository root. No prose. No code fences.'
-  }]
-});
-
-const req = https.request(
-  { hostname: 'api.openai.com', path: '/v1/responses', method: 'POST',
-    headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer '+KEY } },
-  (res)=>{
-    let data='';
-    res.on('data',c=>data+=c);
-    res.on('end',()=>{
-      if (res.statusCode>=300){
-        console.error('OpenAI error',res.statusCode);
-        try{ fs.writeFileSync('ai/response.error.json',data); }catch(e){}
-        process.exit(3);
-      }
-      try{
-        const j=JSON.parse(data);
-        let out=String(extractText(j)||'').trim();
-        // strip code fences if present
-        out = out.replace(/^\`\`\`[a-zA-Z-]*\n?/,'').replace(/\n\`\`\`\s*$/,'').trim();
-        // cut any preamble before diff headers
-        const i1 = out.indexOf('diff --git');
-        const i2 = out.indexOf('--- a/');
-        const i = (i1>=0 ? i1 : (i2>=0 ? i2 : -1));
-        if (i>0) out = out.slice(i);
-        if (!out || out.indexOf('--- ')===-1 || out.indexOf('+++ ')===-1){
-          console.error('model did not return a unified diff');
-          try{ fs.writeFileSync('ai/response.debug.json',data); }catch(e){}
-          process.exit(4);
-        }
-        fs.mkdirSync(path.dirname(PATCH_FILE),{recursive:true});
-        fs.writeFileSync(PATCH_FILE,out,'utf8');
-        console.log('patch written');
-      }catch(e){
-        console.error('parse error',e.message);
-        try{ fs.writeFileSync('ai/response.parse.json',data); }catch(_){}
-        process.exit(5);
-      }
-    });
-  }
-);
-req.on('error',err=>{ console.error('request error',err.message); process.exit(6); });
-req.write(body); req.end();
-JS
+          rm -f tools/run_codex.js
+          printf "%s\n" "'use strict';" >> tools/run_codex.js
+          printf "%s\n" "const fs = require('fs');" >> tools/run_codex.js
+          printf "%s\n" "const path = require('path');" >> tools/run_codex.js
+          printf "%s\n" "const https = require('https');" >> tools/run_codex.js
+          printf "%s\n" "const PROMPT_FILE = process.env.PROMPT_FILE || 'ai/prompt.md';" >> tools/run_codex.js
+          printf "%s\n" "const PATCH_FILE  = process.env.PATCH_FILE  || 'ai/patch.diff';" >> tools/run_codex.js
+          printf "%s\n" "const MODEL = (process.env.OPENAI_MODEL && process.env.OPENAI_MODEL.length>0) ? process.env.OPENAI_MODEL : (process.env.MODEL_DEFAULT||'gpt-4o-mini');" >> tools/run_codex.js
+          printf "%s\n" "const KEY = process.env.OPENAI_API_KEY;" >> tools/run_codex.js
+          printf "%s\n" "function extractText(j){" >> tools/run_codex.js
+          printf "%s\n" "  if (!j) return '';" >> tools/run_codex.js
+          printf "%s\n" "  if (typeof j.output_text === 'string') return j.output_text;" >> tools/run_codex.js
+          printf "%s\n" "  if (Array.isArray(j.output_text)) return j.output_text.join('');" >> tools/run_codex.js
+          printf "%s\n" "  if (typeof j.output === 'string') return j.output;" >> tools/run_codex.js
+          printf "%s\n" "  if (Array.isArray(j.output)) return j.output.map(x => (typeof x==='string'?x:(x?.text||x?.content||''))).join('');" >> tools/run_codex.js
+          printf "%s\n" "  if (j.choices && j.choices.length){" >> tools/run_codex.js
+          printf "%s\n" "    const c0=j.choices[0];" >> tools/run_codex.js
+          printf "%s\n" "    if (c0?.message?.content){ if (Array.isArray(c0.message.content)) return c0.message.content.map(c=>c.text||c.string||'').join(''); return c0.message.content; }" >> tools/run_codex.js
+          printf "%s\n" "    if (typeof c0?.text==='string') return c0.text;" >> tools/run_codex.js
+          printf "%s\n" "  }" >> tools/run_codex.js
+          printf "%s\n" "  if (typeof j.data==='string') return j.data;" >> tools/run_codex.js
+          printf "%s\n" "  return '';" >> tools/run_codex.js
+          printf "%s\n" "}" >> tools/run_codex.js
+          printf "%s\n" "if (!KEY) { console.error('OPENAI_API_KEY missing'); process.exit(2); }" >> tools/run_codex.js
+          printf "%s\n" "const prompt = fs.readFileSync(PROMPT_FILE, 'utf8');" >> tools/run_codex.js
+          printf "%s\n" "const body = JSON.stringify({ model: MODEL, temperature: 0.1, response_format: { type: 'text' }, input: [{ role: 'user', content: prompt + '\n\n[MUST OUTPUT] Return only a unified diff patch (UTF-8), repository root. No prose. No code fences.' }] });" >> tools/run_codex.js
+          printf "%s\n" "const req = https.request({ hostname: 'api.openai.com', path: '/v1/responses', method: 'POST', headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer '+KEY } }, (res)=>{" >> tools/run_codex.js
+          printf "%s\n" "  let data=''; res.on('data',c=>data+=c); res.on('end',()=>{" >> tools/run_codex.js
+          printf "%s\n" "    if (res.statusCode>=300){ console.error('OpenAI error',res.statusCode); try{fs.writeFileSync('ai/response.error.json',data);}catch(e){} process.exit(3); }" >> tools/run_codex.js
+          printf "%s\n" "    try{" >> tools/run_codex.js
+          printf "%s\n" "      const j=JSON.parse(data);" >> tools/run_codex.js
+          printf "%s\n" "      let out=String(extractText(j)||'').trim();" >> tools/run_codex.js
+          printf "%s\n" "      // strip code fences if present" >> tools/run_codex.js
+          printf "%s\n" "      out = out.replace(/^\`\`\`[a-zA-Z-]*\n?/,'').replace(/\n\`\`\`\s*$/,'').trim();" >> tools/run_codex.js
+          printf "%s\n" "      // cut any preamble before diff headers" >> tools/run_codex.js
+          printf "%s\n" "      const i1 = out.indexOf('diff --git'); const i2 = out.indexOf('--- a/'); const i = (i1>=0?i1:(i2>=0?i2:-1));" >> tools/run_codex.js
+          printf "%s\n" "      if (i>0) out = out.slice(i);" >> tools/run_codex.js
+          printf "%s\n" "      if (!out || out.indexOf('--- ')===-1 || out.indexOf('+++ ')===-1){ console.error('model did not return a unified diff'); try{fs.writeFileSync('ai/response.debug.json',data);}catch(e){} process.exit(4); }" >> tools/run_codex.js
+          printf "%s\n" "      fs.mkdirSync(path.dirname(PATCH_FILE),{recursive:true}); fs.writeFileSync(PATCH_FILE,out,'utf8'); console.log('patch written');" >> tools/run_codex.js
+          printf "%s\n" "    }catch(e){ console.error('parse error',e.message); try{fs.writeFileSync('ai/response.parse.json',data);}catch(_){} process.exit(5); }" >> tools/run_codex.js
+          printf "%s\n" "  });" >> tools/run_codex.js
+          printf "%s\n" "});" >> tools/run_codex.js
+          printf "%s\n" "req.on('error',err=>{ console.error('request error',err.message); process.exit(6); });" >> tools/run_codex.js
+          printf "%s\n" "req.write(body); req.end();" >> tools/run_codex.js
 
       - name: "Run Codex (node, no chmod)"
         shell: "bash"
