@@ -4,7 +4,7 @@ on:
   workflow_call:
     inputs:
       mode:
-        description: "実行モード: full（全生成）/ incremental（差分）"
+        description: "実行モード: full（全生成） / incremental（差分）"
         required: false
         type: string
         default: "full"
@@ -20,7 +20,7 @@ on:
   workflow_dispatch:
     inputs:
       mode:
-        description: "実行モード: full（全生成）/ incremental（差分）"
+        description: "実行モード: full（全生成） / incremental（差分）"
         required: false
         default: "full"
         type: string
@@ -36,73 +36,67 @@ permissions:
 
 jobs:
   generate:
-    runs-on: ubuntu-latest
+    runs-on: "ubuntu-latest"
 
     env:
-      # 仕様書のルートとサブディレクトリ
-      SPEC_ROOT: spec
+      SPEC_ROOT: "spec"
       SPEC_DIRS: "foundation env-profiles features tests"
 
-      # 生成物（AI 入出力）
-      PROMPT_FILE: ai/prompt.md
-      PATCH_FILE:  ai/patch.diff
+      PROMPT_FILE: "ai/prompt.md"
+      PATCH_FILE:  "ai/patch.diff"
 
-      # 実行モード/モデル（未指定時のフォールバック）
       MODE:         ${{ inputs.mode  != '' && inputs.mode  || 'full' }}
       OPENAI_MODEL: ${{ inputs.model != '' && inputs.model || 'gpt-4o-mini' }}
 
-      # 作業ブランチ名
-      CODEX_BRANCH: ai/codex/batch-${{ github.run_id }}
+      CODEX_BRANCH: "ai/codex/batch-${{ github.run_id }}"
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - name: "Checkout"
+        uses: "actions/checkout@v4"
 
-      - name: Setup Node (no cache)
-        uses: actions/setup-node@v4
+      - name: "Setup Node (no cache)"
+        uses: "actions/setup-node@v4"
         with:
-          node-version: 20
+          node-version: "20"
 
-      - name: Preflight: API key
-        shell: bash
+      - name: "Preflight: API key"
+        shell: "bash"
         run: |
           set -euo pipefail
           if [ -z "${{ secrets.OPENAI_API_KEY }}" ]; then
-            echo "::error::OPENAI_API_KEY is not set"; exit 1
+            echo "::error::OPENAI_API_KEY is not set"
+            exit 1
           fi
 
-      - name: Compose prompt from spec (no-heredoc)
-        shell: bash
+      - name: "Compose prompt from spec (no-heredoc)"
+        shell: "bash"
         run: |
           set -euo pipefail
           mkdir -p ai
           : > "$PROMPT_FILE"
 
-          printf '%s\n' "# Codex generation prompt" >> "$PROMPT_FILE"
-          printf '%s\n' "mode: $MODE" >> "$PROMPT_FILE"
-          printf '%s\n' "openai_model: $OPENAI_MODEL" >> "$PROMPT_FILE"
-          printf '%s\n' "---" >> "$PROMPT_FILE"
+          printf '%s\n' "# Codex generation prompt"            >> "$PROMPT_FILE"
+          printf '%s\n' "mode: $MODE"                           >> "$PROMPT_FILE"
+          printf '%s\n' "openai_model: $OPENAI_MODEL"           >> "$PROMPT_FILE"
+          printf '%s\n' "---"                                   >> "$PROMPT_FILE"
 
           for d in $SPEC_DIRS; do
             [ -d "$SPEC_ROOT/$d" ] || continue
-            # 拡張子は md/txt/yaml/yml/json を対象
             while IFS= read -r -d '' f; do
-              printf '%s\n' ""                              >> "$PROMPT_FILE"
-              printf '%s\n' "--- file: $f ---"             >> "$PROMPT_FILE"
-              sed 's/\r$//' "$f"                           >> "$PROMPT_FILE"
-              printf '\n'                                  >> "$PROMPT_FILE"
+              printf '%s\n' ""                        >> "$PROMPT_FILE"
+              printf '%s\n' "--- file: $f ---"        >> "$PROMPT_FILE"
+              sed 's/\r$//' "$f"                      >> "$PROMPT_FILE"
+              printf '\n'                             >> "$PROMPT_FILE"
             done < <(find "$SPEC_ROOT/$d" -type f \
-                \( -name '*.md' -o -name '*.txt' -o -name '*.yaml' -o -name '*.yml' -o -name '*.json' \) \
-                -print0 | sort -z)
+                    \( -name '*.md' -o -name '*.txt' -o -name '*.yaml' -o -name '*.yml' -o -name '*.json' \) \
+                    -print0 | sort -z)
           done
 
-      - name: Prepare codex client (no-heredoc)
-        shell: bash
+      - name: "Prepare codex client (no-heredoc)"
+        shell: "bash"
         run: |
           set -euo pipefail
           mkdir -p tools
-
-          # tools/run_codex.js を here-doc を使わずに生成
           F="tools/run_codex.js"
           : > "$F"
           printf '%s\n' \
@@ -121,10 +115,8 @@ jobs:
             "" \
             "const sys = [" \
             "  'You are an assistant that outputs ONLY a unified diff (patch).'," \
-            "  'No explanations, no markdown fences, no prose. Output must start with ' +" \
-            "    'diff --git and be a valid unified diff that can be applied at repo root.'," \
-            "  'If a file is new, include the full file content in the patch.'," \
-            "  'Do not rename or move files unless explicitly specified by the specs.'," \
+            "  'No explanations, no markdown fences, no prose. Output must start with diff --git.'," \
+            "  'If a file is new, include the full file content in the patch.'" \
             "].join(' ');" \
             "" \
             "const user = fs.readFileSync(PROMPT, 'utf8');" \
@@ -141,45 +133,31 @@ jobs:
             "" \
             "  const res = await fetch('https://api.openai.com/v1/chat/completions', {" \
             "    method: 'POST'," \
-            "    headers: {" \
-            "      'Authorization': 'Bearer ' + API_KEY," \
-            "      'Content-Type': 'application/json'" \
-            "    }," \
+            "    headers: { 'Authorization': 'Bearer ' + API_KEY, 'Content-Type': 'application/json' }," \
             "    body: JSON.stringify(body)" \
             "  });" \
-            "" \
             "  if (!res.ok) { console.error('OpenAI API error: ' + res.status); process.exit(2); }" \
             "  const json = await res.json();" \
             "  let out = (json.choices && json.choices[0] && json.choices[0].message && json.choices[0].message.content) || '';" \
-            "" \
-            "  // コードフェンスに包まれてきた場合の抽出" \
             "  const m = out.match(/```(?:diff|patch)?\\n([\\s\\S]*?)```/);" \
             "  if (m && m[1]) out = m[1];" \
-            "" \
             "  out = out.replace(/\\r/g, '');" \
-            "" \
-            "  // 先頭が diff でなければ失敗扱い" \
-            "  if (!/^diff --git /m.test(out)) {" \
-            "    console.error('model did not return a unified diff');" \
-            "    process.exit(4);" \
-            "  }" \
-            "" \
+            "  if (!/^diff --git /m.test(out)) { console.error('model did not return a unified diff'); process.exit(4); }" \
             "  fs.mkdirSync(path.dirname(PATCH), { recursive: true });" \
             "  fs.writeFileSync(PATCH, out, 'utf8');" \
             "  console.log('patch written:', PATCH);" \
             "}" \
-            "" \
             "main().catch(err => { console.error(err); process.exit(3); });" \
           >> "$F"
 
-      - name: Verify runner script
-        shell: bash
+      - name: "Verify runner script"
+        shell: "bash"
         run: |
           set -euo pipefail
           [ -f tools/run_codex.js ] || { echo "::error::tools/run_codex.js is missing"; exit 1; }
 
-      - name: Run Codex (node, no chmod)
-        shell: bash
+      - name: "Run Codex (node, no chmod)"
+        shell: "bash"
         env:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
         run: |
@@ -187,8 +165,8 @@ jobs:
           node -v
           node tools/run_codex.js
 
-      - name: Normalize & verify patch (no heredoc)
-        shell: bash
+      - name: "Normalize & verify patch (no heredoc)"
+        shell: "bash"
         env:
           PATCH_FILE: ${{ env.PATCH_FILE }}
         run: |
@@ -208,12 +186,12 @@ jobs:
             '    txt = txt + "\n"' \
             'p.write_text(txt, encoding="utf-8")' \
             'print("patch verified")' \
-            > "$PY"
+          > "$PY"
           python3 "$PY"
 
-      - name: Apply patch & commit
-        id: apply
-        shell: bash
+      - name: "Apply patch & commit"
+        id: "apply"
+        shell: "bash"
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -223,8 +201,6 @@ jobs:
           git config --global user.name  "github-actions[bot]"
 
           git checkout -b "$CODEX_BRANCH"
-
-          # パッチ適用（失敗時は落とす）
           git apply --whitespace=fix --reject "$PATCH_FILE"
 
           if [ -z "$(git status --porcelain)" ]; then
@@ -237,10 +213,42 @@ jobs:
           git commit -m "chore(ai): codex generation (mode=${MODE}, model=${OPENAI_MODEL})"
           echo "has_changes=1" >> "$GITHUB_OUTPUT"
 
-      - name: Push branch
-        if: steps.apply.outputs.has_changes == '1'
-        shell: bash
+      - name: "Push branch"
+        if: ${{ steps.apply.outputs.has_changes == '1' }}
+        shell: "bash"
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-         
+          set -euo pipefail
+          git push -u origin "$CODEX_BRANCH"
+
+      - name: "Create Pull Request"
+        if: ${{ steps.apply.outputs.has_changes == '1' }}
+        uses: "actions/github-script@v7"
+        with:
+          script: |
+            const {owner, repo} = context.repo;
+            const head = process.env.BRANCH;
+            const base = "main";
+            try {
+              const {data: pr} = await github.pulls.create({
+                owner, repo, head, base,
+                title: "Codex generation",
+                body: "Automated generation based on specs."
+              });
+              core.info(`PR: ${pr.html_url}`);
+            } catch (e) {
+              if (e.status === 422) {
+                core.warning("PR already exists (possibly force-pushed earlier).");
+              } else {
+                throw e;
+              }
+            }
+        env:
+          BRANCH: ${{ env.CODEX_BRANCH }}
+
+      - name: "Show diff summary"
+        shell: "bash"
+        run: |
+          set -euo pipefail
+          git --no-pager diff --stat || true
