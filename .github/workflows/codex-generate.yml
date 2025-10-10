@@ -58,7 +58,7 @@ jobs:
 
       - name: "Setup Node (cache if lock exists)"
         if: ${{ hashFiles('**/package-lock.json', '**/npm-shrinkwrap.json', '**/yarn.lock') != '' }}
-        uses: actions/setup-node@v4"
+        uses: actions/setup-node@v4
         with:
           node-version: "20"
           cache: "npm"
