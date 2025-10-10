@@ -15,21 +15,12 @@ on:
         default: ""
         type: string
 
+  # 仕様の変更だけで自動起動させる。workflowやtools/ai配下の変更では起動しない
   push:
-    branches: ["main"]
-    # 仕様の変更のみで起動。workflow本体の編集では起動しない
+    branches:
+      - "main"
     paths:
       - "spec/**"
-      - "foundation/**"
-      - "env-profiles/**"
-      - "features/**"
-      - "tests/**"
-      - ".github/workflows/codex.yml"
-    paths-ignore:
-      - ".github/workflows/codex-generate.yml"
-      - ".github/workflows/codex-cleanup.yml"
-      - "tools/**"
-      - "ai/**"
 
 permissions:
   contents: write
@@ -37,7 +28,7 @@ permissions:
 
 jobs:
   generate:
-    # コミットメッセージに [skip-codex] があれば push では起動しない
+    # push時、コミットメッセージに [skip-codex] があれば起動しない保険
     if: ${{ github.event_name != 'push' || !contains(github.event.head_commit.message, '[skip-codex]') }}
     uses: ".github/workflows/codex-generate.yml"
     with:
