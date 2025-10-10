@@ -1,3 +1,4 @@
+# .github/workflows/codex.yml
 name: "Codex Generate (dispatcher)"
 
 on:
@@ -15,10 +16,9 @@ on:
         default: ""
         type: string
 
-  # 仕様の変更だけで自動起動させる。workflowやtools/ai配下の変更では起動しない
   push:
-    branches:
-      - "main"
+    branches: ["main"]
+    # 仕様書更新時のみ起動させたい場合は paths で限定
     paths:
       - "spec/**"
 
@@ -28,10 +28,12 @@ permissions:
 
 jobs:
   generate:
-    # push時、コミットメッセージに [skip-codex] があれば起動しない保険
+    # push時、コミットメッセージに [skip-codex] があればスキップ
     if: ${{ github.event_name != 'push' || !contains(github.event.head_commit.message, '[skip-codex]') }}
-    uses: ".github/workflows/codex-generate.yml"
+    # ローカル再利用ワークフロー呼び出しは必ず "./" を付ける
+    uses: ./.github/workflows/codex-generate.yml
     with:
       mode: "${{ inputs.mode || 'full' }}"
       model: "${{ inputs.model || '' }}"
+    # 秘密情報はそのまま継承
     secrets: inherit
