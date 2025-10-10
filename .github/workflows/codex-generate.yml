@@ -4,7 +4,7 @@ on:
   workflow_call:
     inputs:
       mode:
-        description: "実行モード: full（全生成） / incremental（差分）"
+        description: "実行モード: full（全生成）/ incremental（差分）"
         required: false
         default: "full"
         type: string
@@ -15,11 +15,14 @@ on:
         type: string
     secrets:
       OPENAI_API_KEY:
+        description: "OpenAI API Key"
         required: true
+
+  # 手動実行でも試せるように（任意）
   workflow_dispatch:
     inputs:
       mode:
-        description: "実行モード: full（全生成） / incremental（差分）"
+        description: "実行モード: full（全生成）/ incremental（差分）"
         required: false
         default: "full"
         type: string
@@ -36,180 +39,116 @@ permissions:
 jobs:
   generate:
     runs-on: "ubuntu-latest"
+
     env:
+      # v3 仕様の分割構成（固定ファイル名のみ記述。内容は specs 側で運用）
       PROMPT_FILE: "ai/prompt.md"
-      COMPOSITE_PROMPT: "ai/prompt.combined.md"
-      MISSING_FILE: "ai/missing_deps.txt"
+      DEFECTS_DIR: "ai/defects"
+      # ここでは固定の分割ファイルのみを列挙（大きな旧仕様書は列挙しない）
+      SPEC_FOUNDATION: "spec/foundation/README.md spec/foundation/file-globs.yml spec/foundation/language.json"
+      SPEC_ENVS: "spec/env-profiles/*.yml"
+      SPEC_FEATURES: "spec/features/*.md spec/features/*.yml spec/features/*.json"
+      SPEC_TESTS: "spec/tests/**/*.md spec/tests/**/*.yml spec/tests/**/*.json"
+      # 生成の許可ルールはリポジトリ固定の allowlist で管理
+      ALLOWLIST_FILE: "ai/allowlist.txt"
+
     steps:
       - name: "Checkout"
         uses: "actions/checkout@v4"
-        with:
-          fetch-depth: 0
 
-      - name: "Preflight"
+      - name: "Preflight: check OPENAI_API_KEY"
         shell: "bash"
         run: |
           set -euo pipefail
-          git config --global user.email "github-actions[bot]@users.noreply.github.com"
-          git config --global user.name "github-actions[bot]"
-          mkdir -p ai
+          if [ -z "${OPENAI_API_KEY:-}" ]; then
+            echo "::error::OPENAI_API_KEY is missing"
+            exit 1
+          fi
+          echo "OPENAI_API_KEY present"
 
-      - name: "Build prompt from specs (auto collect; no heredoc)"
+      - name: "Build composite prompt from specs"
         shell: "bash"
         run: |
           set -euo pipefail
-          : > "${COMPOSITE_PROMPT}"
 
-          add() {
-            local f="$1"
-            [ -f "$f" ] || return 0
-            printf '\n\n<!-- file: %s -->\n\n' "$f" >> "${COMPOSITE_PROMPT}"
-            cat "$f" >> "${COMPOSITE_PROMPT}"
-          }
+          mkdir -p "ai" "ai/defects"
+          : > "${PROMPT_FILE}"
 
-          # spec 以下のテキスト/構造化ファイルをすべて収集（順序はソート）
-          while IFS= read -r -d '' f; do
-            add "$f"
-          done < <(
-            find spec -type f \
-              \( -name "*.md" -o -name "*.txt" -o -name "*.yml" -o -name "*.yaml" -o -name "*.json" \) \
-              -print0 | sort -z
-          )
+          add() { [ -f "$1" ] && { printf "\n\n# %s\n\n" "$1" >> "${PROMPT_FILE}"; cat "$1" >> "${PROMPT_FILE}"; }; }
 
-          # Authoring rules（最小限・言語非依存）
+          # foundation
+          for f in ${SPEC_FOUNDATION}; do add "$f"; done
+          # env profiles
+          for f in ${SPEC_ENVS}; do add "$f"; done
+          # features
+          for f in ${SPEC_FEATURES}; do add "$f"; done
+          # tests (仕様に添付されたサンプルや制約など)
+          for f in ${SPEC_TESTS}; do add "$f"; done
+
+          # 末尾にガイドライン（短文）
           {
             echo
             echo "<!-- authoring-rules -->"
-            echo
             echo "RULES"
-            echo "- When code references local files (relative imports), create missing files with minimal but working implementation AND tests."
-            echo "- Do not modify files under 'spec/'."
-            echo "- Place tests under 'tests/'. Put source under language-idiomatic directories (e.g. 'src/')."
-            echo "- Produce runnable, cohesive changes."
-          } >> "${COMPOSITE_PROMPT}"
-
-          cp "${COMPOSITE_PROMPT}" "${PROMPT_FILE}"
-
-      - name: "Scan repository for missing local dependencies (multi-lang)"
-        id: "scan"
-        shell: "bash"
-        run: |
-          set -euo pipefail
-          mkdir -p ai
-          OUT="${MISSING_FILE}"
-          : > "${OUT}"
-
-          add_missing () {
-            local ref="$1"
-            local base="${2:-.}"
-            local found="no"
-            for p in "$ref" "${ref#./}"; do
-              if [ -f "${base}/${p}" ]; then found="yes"; break; fi
-            done
-            if [ "${found}" = "no" ]; then
-              printf '%s\n' "${ref}" >> "${OUT}"
-            fi
-          }
-
-          # PHP: require/include（相対のみ）
-          mapfile -t PHPREFS < <(grep -RPho --include='*.php' \
-            '(?:require|include)(?:_once)?\s*\(?\s*["'"'"'](\.{1,2}/[^"'"'"']+)["'"'"']\s*\)?' . 2>/dev/null \
-            | sed -E "s/.*['\"]([^'\"]+)['\"].*/\1/" | sort -u || true)
-          for r in "${PHPREFS[@]:-}"; do add_missing "$r" "."; done
-
-          # JS/TS: import/require/dynamic import（相対のみ）
-          mapfile -t JSREFS < <(grep -RPho --include='*.{js,jsx,ts,tsx,mjs,cjs}' \
-            '(?:import\s+[^;]*from\s*|require\s*\(|import\s*\()\s*["'"'"'](\.{1,2}/[^"'"'"']+)["'"'"']' . 2>/dev/null \
-            | sed -E "s/.*['\"]([^'\"]+)['\"].*/\1/" | sort -u || true)
-          for r in "${JSREFS[@]:-}"; do add_missing "$r" "."; done
-
-          # C/C++: #include "local.h"
-          mapfile -t CREFS < <(grep -RPho --include='*.{c,cc,cpp,h,hpp}' \
-            '#\s*include\s*"([^"]+)"' . 2>/dev/null \
-            | sed -E 's/.*"([^"]+)".*/\1/' | sort -u || true)
-          for r in "${CREFS[@]:-}"; do add_missing "$r" "."; done
-
-          # Shell: source ./x / . ./x
-          mapfile -t SHREFS < <(grep -RPho --include='*.{sh,bash}' \
-            '(?:source|\.)\s+(\.{1,2}/[^ \t;#]+)' . 2>/dev/null \
-            | sed -E 's/.*\s+(\.{1,2}\/[^ \t;#]+).*/\1/' | sort -u || true)
-          for r in "${SHREFS[@]:-}"; do add_missing "$r" "."; done
-
-          # Ruby: require_relative 'x'
-          mapfile -t RBREFS < <(grep -RPho --include='*.rb' \
-            'require_relative\s*["'"'"']([^"'"'"']+)["'"'"']' . 2>/dev/null \
-            | sed -E "s/.*['\"]([^'\"]+)['\"].*/\1/" | sort -u || true)
-          for r in "${RBREFS[@]:-}"; do
-            if [ -f "$r" ] || [ -f "${r}.rb" ]; then :; else
-              printf '%s\n' "$r (or ${r}.rb)" >> "${OUT}"
-            fi
-          done
-
-          # Python: relative import（from .foo import ...）
-          mapfile -t PYREFS < <(grep -RPho --include='*.py' \
-            'from\s+(\.[\w\.]+)\s+import' . 2>/dev/null \
-            | sed -E 's/.*from\s+(\.[A-Za-z0-9_\.]+)\s+.*/\1/' | sort -u || true)
-          for mod in "${PYREFS[@]:-}"; do
-            path="${mod//./\/}"; path="${path#./}"
-            cand1="${path}/__init__.py"; cand2="${path}.py"
-            [ -f "${cand1}" ] || [ -f "${cand2}" ] || printf '%s\n' "$mod (map to ${path}.py or ${path}/__init__.py)" >> "${OUT}"
-          done
-
-          COUNT=$(wc -l < "${OUT}" 2>/dev/null || echo "0")
-          echo "missing_count=${COUNT}" >> "${GITHUB_OUTPUT}"
-          echo "missing_file=${OUT}" >> "${GITHUB_OUTPUT}"
-
-      - name: "Append missing-deps to prompt (if any)"
-        if: "${{ steps.scan.outputs.missing_count != '0' }}"
-        shell: "bash"
-        run: |
-          set -euo pipefail
-          {
-            echo
-            echo "### Missing local dependencies (detected by scanner)"
-            cat "${MISSING_FILE}"
+            echo "- 生成は idempotent。tests/ 配下に動作するテストを必ず同梱。"
+            echo "- 既存ファイルがある場合は上書き可。仕様が勝つ。"
+            echo "- 曖昧な場合は最小実装を生成し、tests で補う。"
+            echo "<!-- /authoring-rules -->"
           } >> "${PROMPT_FILE}"
 
-      - name: "Run Codex (workspace-write)"
-        uses: "openai/codex-action@main"
+      - name: "Guard: forbid touching protected paths"
+        shell: "bash"
+        run: |
+          set -euo pipefail
+          # 触ってはいけない場所（必要なら拡張）
+          PROTECTS=".git/** .github/** dist/** evidence/**"
+          echo "${PROTECTS}" | tr " " "\n" > "${ALLOWLIST_FILE}"
+
+      - name: "Run Codex"
+        id: "codex"
+        uses: "openai/codex-action@v2"
         with:
           openai-api-key: "${{ secrets.OPENAI_API_KEY }}"
           prompt-file: "${{ env.PROMPT_FILE }}"
-          model: "${{ inputs.model }}"
+          model: "${{ inputs.model || 'gpt-4.1-mini' }}"
           sandbox: "workspace-write"
-        continue-on-error: false
 
       - name: "Show diff summary"
         shell: "bash"
         run: |
           set -euo pipefail
           git status --porcelain=v1 || true
-          git --no-pager diff --stat || true
+          git diff --stat || true
 
-      - name: "Stop if nothing changed"
-        shell: "bash"
-        run: |
-          set -euo pipefail
-          if [ -z "$(git status --porcelain=v1)" ]; then
-            echo "No changes produced by Codex. Exiting."
-            exit 0
-          fi
-
-      - name: "Configure git author (bot)"
+      - name: "Configure git author"
         shell: "bash"
         run: |
           set -euo pipefail
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
-          git config --global user.name "github-actions[bot]"
-          git add -A
-          git commit -m "chore(ai): apply Codex changes (spec-driven)"
+          git config --global user.name  "github-actions[bot]"
 
-      - name: "Create Pull Request"
-        uses: "peter-evans/create-pull-request@v7"
-        with:
-          token: "${{ secrets.GITHUB_TOKEN }}"
-          branch: "ai/codex/batch-${{ github.run_id }}"
-          base: "main"
-          title: "AI: Codex updates"
-          body: "Automated changes generated by Codex from specs. Includes fixes for missing local dependencies (if any)."
-          labels: "ai,codex"
+      - name: "Commit and create PR (if changes)"
+        shell: "bash"
+        env:
+          MODE: "${{ inputs.mode || 'full' }}"
+        run: |
+          set -euo pipefail
+
+          if git diff --quiet && git diff --cached --quiet; then
+            echo "No changes; skipping PR."
+            exit 0
+          fi
+
+          BRANCH="ai/codex/batch-${GITHUB_RUN_ID}"
+          git checkout -b "${BRANCH}"
+          git add -A
+          git commit -m "chore(ai): apply Codex changes (mode=${MODE})"
+
+          # PR を作成
+          gh pr create \
+            --title "AI: Codex changes (mode=${MODE})" \
+            --body  "Automated changes generated by Codex from specs." \
+            --base  "main" \
+            --head  "${BRANCH}" || true
+        env:
+          GH_TOKEN: "${{ secrets.GITHUB_TOKEN }}"
