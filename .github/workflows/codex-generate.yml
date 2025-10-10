@@ -52,7 +52,7 @@ jobs:
       MODEL_DEFAULT: "gpt-4o-mini"
       OPENAI_MODEL: "${{ inputs.model }}"
       MODE: "${{ inputs.mode }}"
-      # ★ ここを追加（全ステップで参照可）
+      # 全ステップで参照可能に
       OPENAI_API_KEY: "${{ secrets.OPENAI_API_KEY }}"
 
     steps:
@@ -113,6 +113,21 @@ jobs:
           fi
           rm -f "$tmp_list"
 
+          # ---- OUTPUT CONTRACT (MUST) ----
+          printf "%s\n" "" >> "$PROMPT_FILE"
+          printf "%s\n" "## OUTPUT CONTRACT (MUST)" >> "$PROMPT_FILE"
+          printf "%s\n" "" >> "$PROMPT_FILE"
+          printf "%s\n" "- Return a single Unified Diff patch rooted at the repository." >> "$PROMPT_FILE"
+          printf "%s\n" "- No prose, no explanations, no code fences, no headings." >> "$PROMPT_FILE"
+          printf "%s\n" "- Start with either 'diff --git' lines or with '--- a/' then '+++ b/'." >> "$PROMPT_FILE"
+          printf "%s\n" "- If truly no changes are required, emit a minimal no-op patch touching 'ai/.noop':" >> "$PROMPT_FILE"
+          printf "%s\n" "" >> "$PROMPT_FILE"
+          printf "%s\n" "--- a/ai/.noop" >> "$PROMPT_FILE"
+          printf "%s\n" "+++ b/ai/.noop" >> "$PROMPT_FILE"
+          printf "%s\n" "@@ -1 +1 @@" >> "$PROMPT_FILE"
+          printf "%s\n" "-placeholder" >> "$PROMPT_FILE"
+          printf "%s\n" "+placeholder" >> "$PROMPT_FILE"
+
       - name: "Create tools/run_codex.js (no heredoc)"
         shell: "bash"
         run: |
@@ -143,47 +158,7 @@ jobs:
           printf "%s\n" "}" >> tools/run_codex.js
           printf "%s\n" "if (!KEY) { console.error('OPENAI_API_KEY missing'); process.exit(2); }" >> tools/run_codex.js
           printf "%s\n" "const prompt = fs.readFileSync(PROMPT_FILE, 'utf8');" >> tools/run_codex.js
-          printf "%s\n" "const body = JSON.stringify({ model: MODEL, input: [{ role: 'user', content: prompt + '\\n\\nReturn only a unified diff patch (UTF-8), root at repository.' }] });" >> tools/run_codex.js
+          printf "%s\n" "const body = JSON.stringify({ model: MODEL, temperature: 0.1, response_format: { type: 'text' }, input: [{ role: 'user', content: prompt + '\\n\\n[MUST OUTPUT] Return only a unified diff patch (UTF-8), repository root. No prose. No code fences.' }] });" >> tools/run_codex.js
           printf "%s\n" "const req = https.request({ hostname: 'api.openai.com', path: '/v1/responses', method: 'POST', headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer '+KEY } }, (res)=>{" >> tools/run_codex.js
           printf "%s\n" "  let data=''; res.on('data',c=>data+=c); res.on('end',()=>{" >> tools/run_codex.js
-          printf "%s\n" "    if (res.statusCode>=300){ console.error('OpenAI error',res.statusCode); try{fs.writeFileSync('ai/response.error.json',data);}catch(e){} process.exit(3); }" >> tools/run_codex.js
-          printf "%s\n" "    try{" >> tools/run_codex.js
-          printf "%s\n" "      const j=JSON.parse(data);" >> tools/run_codex.js
-          printf "%s\n" "      const out=String(extractText(j)||'').trim();" >> tools/run_codex.js
-          printf "%s\n" "      if (!out || out.indexOf('--- ')===-1 || out.indexOf('+++ ')===-1){ console.error('model did not return a unified diff'); try{fs.writeFileSync('ai/response.debug.json',data);}catch(e){} process.exit(4); }" >> tools/run_codex.js
-          printf "%s\n" "      fs.mkdirSync(path.dirname(PATCH_FILE),{recursive:true}); fs.writeFileSync(PATCH_FILE,out,'utf8'); console.log('patch written');" >> tools/run_codex.js
-          printf "%s\n" "    }catch(e){ console.error('parse error',e.message); try{fs.writeFileSync('ai/response.parse.json',data);}catch(_){} process.exit(5); }" >> tools/run_codex.js
-          printf "%s\n" "  });" >> tools/run_codex.js
-          printf "%s\n" "});" >> tools/run_codex.js
-          printf "%s\n" "req.on('error',err=>{ console.error('request error',err.message); process.exit(6); });" >> tools/run_codex.js
-          printf "%s\n" "req.write(body); req.end();" >> tools/run_codex.js
-
-      - name: "Run Codex (node, no chmod)"
-        shell: "bash"
-        run: |
-          set -euo pipefail
-          node -v
-          node tools/run_codex.js
-
-      - name: "Normalize & verify patch (no heredoc)"
-        shell: "bash"
-        run: |
-          set -euo pipefail
-          if [ ! -f "${PATCH_FILE}" ]; then
-            echo "::error::patch not found"
-            exit 1
-          fi
-          perl -pi -e 's/\r$//' "${PATCH_FILE}"
-          if ! grep -q "^--- " "${PATCH_FILE}" || ! grep -q "^+++ " "${PATCH_FILE}"; then
-            echo "::error::not a unified diff"
-            exit 1
-          fi
-          echo "patch verified"
-
-      - name: "Upload response debug (if any)"
-        if: ${{ failure() }}
-        uses: "actions/upload-artifact@v4"
-        with:
-          name: "ai-response-debug"
-          path: "ai/*.json"
-          if-no-files-found: "ignore"
+          printf "%s\n" "    if (res.statusCode>=300){ console.error('OpenAI
