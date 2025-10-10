@@ -1,80 +1,74 @@
 name: "Codex Generate (spec-driven)"
 
 on:
-  workflow_dispatch:
+  workflow_call:
     inputs:
       mode:
-        description: "実行モード: full(全生成) / incremental(差分)"
+        description: "実行モード: full（全生成） / incremental（差分）"
         required: false
         default: "full"
         type: string
       model:
         description: "OpenAI モデル名（任意）"
         required: false
-        default: "gpt-5-codex"
+        default: ""
         type: string
-
-  workflow_call:
-    inputs:
-      mode:
-        required: false
-        type: string
-        default: "full"
-      model:
-        required: false
-        type: string
-        default: "gpt-5-codex"
     secrets:
       OPENAI_API_KEY:
+        description: "OpenAI API Key"
         required: true
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "実行モード: full（全生成） / incremental（差分）"
+        required: false
+        default: "full"
+        type: string
+      model:
+        description: "OpenAI モデル名（任意）"
+        required: false
+        default: ""
+        type: string
 
 permissions:
   contents: write
   pull-requests: write
 
-concurrency:
-  group: "codex-${{ github.ref }}"
-  cancel-in-progress: false
-
 jobs:
   generate:
-    name: "generate"
     runs-on: "ubuntu-latest"
 
     env:
-      # 仕様書の在処（フォルダ構成は spec_fixed_v3 の想定。無ければワイルドカード収集）
-      SPEC_ROOT: "spec"
+      # 仕様ディレクトリ（foundation / env-profiles / features / tests）
+      SPEC_DIRS: "spec/foundation spec/env-profiles spec/features spec/tests"
       PROMPT_FILE: "ai/prompt.md"
-      MODE: "${{ inputs.mode }}"
-      MODEL_INPUT: "${{ inputs.model }}"
-      OPENAI_API_KEY: "${{ secrets.OPENAI_API_KEY }}"
-      BRANCH_NAME: "ai/codex/batch-${{ github.run_id }}"
-      ALLOW_EMPTY_PR: "false"
+      PATCH_FILE: "ai/patch.diff"
+      NORM_PATCH: "ai/patch.norm.diff"
+      MODEL_DEFAULT: "gpt-4.1-mini" # 任意。inputs.model が空ならこれを使う
 
     steps:
       - name: "Checkout"
         uses: "actions/checkout@v4"
+
+      - name: "Setup Node"
+        uses: "actions/setup-node@v4"
         with:
-          fetch-depth: 0
+          node-version: "20"
+          cache: "npm"
 
       - name: "Preflight: API key"
         shell: "bash"
         run: |
           set -euo pipefail
-          if [ -z "${OPENAI_API_KEY:-}" ]; then
-            echo "::error::OPENAI_API_KEY is missing"
+          mkdir -p ai tools
+          if [ -z "${{ secrets.OPENAI_API_KEY }}" ]; then
+            echo "::error::OPENAI_API_KEY is missing."
             exit 1
           fi
+          echo "OPENAI_API_KEY present."
 
-      - name: "Scaffold working dirs"
-        shell: "bash"
-        run: |
-          set -euo pipefail
-          for d in ai tests evidence; do
-            [ -d "$d" ] || mkdir -p "$d"
-          done
-
-      - name: "Collect spec → build prompt.md"
+      # 仕様をまとめてプロンプト化（heredoc 不使用）
+      - name: "Compose prompt from spec (no-heredoc)"
         shell: "bash"
         run: |
           set -euo pipefail
@@ -82,174 +76,174 @@ jobs:
           PROMPT="${PROMPT_FILE}"
           : > "${PROMPT}"
 
-          add_section () {
-            local title="$1"; shift
-            printf "# %s\n\n" "${title}" >> "${PROMPT}"
-            for f in "$@"; do
-              [ -f "$f" ] || continue
-              printf "\n---\n" >> "${PROMPT}"
-              printf "## file: %s\n\n" "$f" >> "${PROMPT}"
-              sed 's/\r$//' "$f" >> "${PROMPT}"
-              printf "\n" >> "${PROMPT}"
-            done
-            printf "\n" >> "${PROMPT}"
-          }
+          # ヘッダ
+          printf "%s\n" "# Codex generation prompt" >> "${PROMPT}"
+          printf "%s\n" "" >> "${PROMPT}"
+          printf "%s\n" "## MODE: ${{ inputs.mode }}" >> "${PROMPT}"
+          printf "%s\n" "" >> "${PROMPT}"
 
-          # 既定の並び（存在すれば順に結合。無ければワイルドカードで拾う）
-          mapfile -t FOUND_FOUNDATION < <(find "${SPEC_ROOT}/foundation" -type f 2>/dev/null | sort || true)
-          mapfile -t FOUND_ENV       < <(find "${SPEC_ROOT}/env-profiles" -type f 2>/dev/null | sort || true)
-          mapfile -t FOUND_FEATURES  < <(find "${SPEC_ROOT}/features" -type f 2>/dev/null | sort || true)
-          mapfile -t FOUND_TESTS     < <(find "${SPEC_ROOT}/tests" -type f 2>/dev/null | sort || true)
+          # 仕様を順序通りに結合
+          for G in ${SPEC_DIRS}; do
+            if [ -d "$G" ]; then
+              # *.md / *.yml / *.yaml / *.json を昇順で
+              while IFS= read -r -d '' f; do
+                printf "%s\n" "--- file: ${f}" >> "${PROMPT}"
+                cat "${f}" >> "${PROMPT}"
+                printf "\n\n" >> "${PROMPT}"
+              done < <(find "$G" -type f \( -name "*.md" -o -name "*.yml" -o -name "*.yaml" -o -name "*.json" \) -print0 | sort -z)
+            fi
+          done
 
-          if [ "${#FOUND_FOUNDATION[@]}" -eq 0 ] && [ "${#FOUND_ENV[@]}" -eq 0 ] && \
-             [ "${#FOUND_FEATURES[@]}" -eq 0 ] && [ "${#FOUND_TESTS[@]}" -eq 0 ]; then
-            # 何も無い場合は spec/ 配下の全てを対象にする
-            mapfile -t ALL < <(find "${SPEC_ROOT}" -type f \( -name "*.md" -o -name "*.txt" -o -name "*.yml" -o -name "*.yaml" -o -name "*.json" \) | sort || true)
-            add_section "All specs" "${ALL[@]}"
-          else
-            [ "${#FOUND_FOUNDATION[@]}" -gt 0 ] && add_section "0) foundation" "${FOUND_FOUNDATION[@]}"
-            [ "${#FOUND_ENV[@]}"       -gt 0 ] && add_section "1) env-profiles" "${FOUND_ENV[@]}"
-            [ "${#FOUND_FEATURES[@]}"  -gt 0 ] && add_section "2) features" "${FOUND_FEATURES[@]}"
-            [ "${#FOUND_TESTS[@]}"     -gt 0 ] && add_section "3) tests" "${FOUND_TESTS[@]}"
-          fi
+          # 生成ルール（最小限/汎用）
+          printf "%s\n" "<!-- authoring-rules -->" >> "${PROMPT}"
+          printf "%s\n" "You must output ONLY ONE Git unified diff at repository root." >> "${PROMPT}"
+          printf "%s\n" "No prose, no code fences, no preface. Create missing files/dirs." >> "${PROMPT}"
+          printf "%s\n" "Never touch .git or .github. Tests under tests/ only." >> "${PROMPT}"
+          printf "%s\n" "<!-- /authoring-rules -->" >> "${PROMPT}"
 
-          # 生成方針（強制ルール）を最後に追記
-          {
-            echo ""
-            echo "----"
-            echo "## Authoring rules (MUST FOLLOW)"
-            echo "- Output only a single unified diff (git-compatible) that applies cleanly at the repository root."
-            echo "- Create missing files or directories as needed."
-            echo "- Put all verifiable tests under 'tests/'."
-            echo "- Do NOT modify files under '.git' or '.github'."
-            echo "- Keep spec files under 'spec/' untouched."
-            echo "- Prefer creating minimal working scaffolds over skipping ambiguous pieces."
-            echo "- Patch must be self-contained (no prose, no code fences)."
-            echo "- Mode: ${MODE}"
-          } >> "${PROMPT}"
+      # Codex 呼び出し：Node ワンファイルを printf で生成 → 実行
+      - name: "Prepare codex client (no-heredoc)"
+        shell: "bash"
+        run: |
+          set -euo pipefail
+          mkdir -p tools
 
-          echo "Built prompt at: ${PROMPT}"
-          wc -lc "${PROMPT}" || true
+          JS="tools/run_codex.js"
+          : > "${JS}"
 
-      - name: "Run Codex (inline via OpenAI API → unified diff)"
+          printf "%s\n" "const fs = require('fs');" >> "${JS}"
+          printf "%s\n" "const https = require('https');" >> "${JS}"
+          printf "%s\n" "const API_KEY = process.env.OPENAI_API_KEY;" >> "${JS}"
+          printf "%s\n" "const MODEL = (process.env.INPUT_MODEL && process.env.INPUT_MODEL.trim()) ? process.env.INPUT_MODEL.trim() : process.env.MODEL_DEFAULT;" >> "${JS}"
+          printf "%s\n" "const prompt = fs.readFileSync(process.env.PROMPT_FILE, 'utf8');" >> "${JS}"
+          printf "%s\n" "const body = JSON.stringify({" >> "${JS}"
+          printf "%s\n" "  model: MODEL," >> "${JS}"
+          printf "%s\n" "  messages: [" >> "${JS}"
+          printf "%s\n" "    {role:'system', content:'You are a careful code-generation agent. Output ONLY ONE Git unified diff (as produced by git diff --no-index --binary --full-index --src-prefix=a/ --dst-prefix=b/). No prose, no code fences, no explanations. Create missing files/dirs. All tests under tests/. Never touch .git or .github.'}," >> "${JS}"
+          printf "%s\n" "    {role:'user', content: prompt}" >> "${JS}"
+          printf "%s\n" "  ]," >> "${JS}"
+          printf "%s\n" "  temperature: 0.2," >> "${JS}"
+          printf "%s\n" "  max_tokens: 8000" >> "${JS}"
+          printf "%s\n" "});" >> "${JS}"
+          printf "%s\n" "const req = https.request({" >> "${JS}"
+          printf "%s\n" "  method: 'POST'," >> "${JS}"
+          printf "%s\n" "  hostname: 'api.openai.com'," >> "${JS}"
+          printf "%s\n" "  path: '/v1/chat/completions'," >> "${JS}"
+          printf "%s\n" "  headers: {" >> "${JS}"
+          printf "%s\n" "    'Content-Type': 'application/json'," >> "${JS}"
+          printf "%s\n" "    'Authorization': 'Bearer ' + API_KEY" >> "${JS}"
+          printf "%s\n" "  }" >> "${JS}"
+          printf "%s\n" "}, (res) => {" >> "${JS}"
+          printf "%s\n" "  let data='';" >> "${JS}"
+          printf "%s\n" "  res.on('data', (c)=> data+=c);" >> "${JS}"
+          printf "%s\n" "  res.on('end', ()=> {" >> "${JS}"
+          printf "%s\n" "    if (res.statusCode!>=200 && res.statusCode<300) {}" >> "${JS}"
+          printf "%s\n" "    try {" >> "${JS}"
+          printf "%s\n" "      const j = JSON.parse(data);" >> "${JS}"
+          printf "%s\n" "      const txt = (j.choices && j.choices[0] && j.choices[0].message && j.choices[0].message.content) ? j.choices[0].message.content : '';" >> "${JS}"
+          printf "%s\n" "      fs.mkdirSync('ai', {recursive:true});" >> "${JS}"
+          printf "%s\n" "      fs.writeFileSync(process.env.PATCH_FILE, txt, 'utf8');" >> "${JS}"
+          printf "%s\n" "      console.log('Patch saved to', process.env.PATCH_FILE);" >> "${JS}"
+          printf "%s\n" "    } catch(e) {" >> "${JS}"
+          printf "%s\n" "      console.error('OpenAI response parse error:', e);" >> "${JS}"
+          printf "%s\n" "      console.error(data);" >> "${JS}"
+          printf "%s\n" "      process.exit(1);" >> "${JS}"
+          printf "%s\n" "    }" >> "${JS}"
+          printf "%s\n" "  });" >> "${JS}"
+          printf "%s\n" "});" >> "${JS}"
+          printf "%s\n" "req.on('error', (e)=>{ console.error(e); process.exit(1); });" >> "${JS}"
+          printf "%s\n" "req.write(body);" >> "${JS}"
+          printf "%s\n" "req.end();" >> "${JS}"
+
+      - name: "Run Codex (call OpenAI)"
+        shell: "bash"
+        env:
+          OPENAI_API_KEY: "${{ secrets.OPENAI_API_KEY }}"
+          INPUT_MODEL: "${{ inputs.model }}"
+        run: |
+          set -euo pipefail
+          node tools/run_codex.js
+
+      # ここが今回の肝：パッチ正規化＋複数戦略で適用
+      - name: "Normalize & apply patch (multi-try)"
         shell: "bash"
         run: |
           set -euo pipefail
 
-          MODEL="${MODEL_INPUT:-gpt-5-codex}"
-          FALLBACK_MODEL="gpt-4.1-mini"
-          REQ="ai/request.json"
-          RES="ai/response.json"
-          PATCH="ai/patch.diff"
+          SRC="${PATCH_FILE}"
+          NORM="${NORM_PATCH}"
 
-          SYSTEM="You are a careful code-generation agent. Read the spec and output ONLY one unified diff patch that applies cleanly at repo root. No prose, no fences. Create missing files. Ensure tests under 'tests/' are updated/added. Avoid touching '.git' or '.github'."
+          if [ ! -s "${SRC}" ]; then
+            echo "::error::${SRC} is empty."
+            exit 1
+          fi
 
-          USER_CONTENT="$(cat "${PROMPT_FILE}")"
+          # 1) CRLF, コードフェンス、前置き説明の除去（diff --git から始める）
+          awk '{
+            sub(/\r$/,"");
+            if ($0 ~ /^```/) next;
+            if (seen) { print; next }
+            if ($0 ~ /^diff --git /){ print; seen=1; next }
+          }' "${SRC}" > "${NORM}" || true
 
-          printf '{'                         > "${REQ}"
-          printf '"model":"%s",' "${MODEL}" >> "${REQ}"
-          printf '"input":[{"role":"system","content":%s},{"role":"user","content":%s}],' \
-            "$(jq -Rsa @json <<< "${SYSTEM}")" \
-            "$(jq -Rsa @json <<< "${USER_CONTENT}")" >> "${REQ}"
-          printf '"temperature":0,'          >> "${REQ}"
-          printf '"max_output_tokens":64000' >> "${REQ}"
-          printf '}\n'                       >> "${REQ}"
+          # diff --git が無ければ ---/+++ からも試行
+          if ! grep -q '^diff --git ' "${NORM}" 2>/dev/null; then
+            awk '{
+              sub(/\r$/,"");
+              if ($0 ~ /^```/) next;
+              if (seen) { print; next }
+              if ($0 ~ /^(\-\-\- |\+\+\+ )/){ print; seen=1; next }
+            }' "${SRC}" > "${NORM}" || true
+          fi
 
-          call_api () {
-            local req="$1"; local out="$2"; local endpoint="$3"
-            curl -sS -f \
-              -H "Authorization: Bearer ${OPENAI_API_KEY}" \
-              -H "Content-Type: application/json" \
-              -d @"${req}" \
-              "https://api.openai.com${endpoint}" > "${out}"
+          # 末尾に改行追加
+          printf "\n" >> "${NORM}"
+
+          echo "---- normalized patch head ----"
+          sed -n '1,120p' "${NORM}" || true
+          echo "--------------------------------"
+
+          try() {
+            echo "::group::git apply $*"
+            if git apply "$@" "${NORM}"; then
+              echo "git apply $* : OK"
+              echo "::endgroup::"
+              return 0
+            else
+              s=$?
+              echo "git apply $* : NG (exit ${s})"
+              echo "::endgroup::"
+              return ${s}
+            fi
           }
 
-          STATUS=0
-          call_api "${REQ}" "${RES}" "/v1/responses" || STATUS=$?
-
-          if [ "${STATUS}" -ne 0 ]; then
-            # フォールバック（/v1/chat/completions）
-            printf '{'                                > "${REQ}.chat"
-            printf '"model":"%s",' "${MODEL}"        >> "${REQ}.chat"
-            printf '"messages":[{"role":"system","content":%s},{"role":"user","content":%s}],' \
-              "$(jq -Rsa @json <<< "${SYSTEM}")" \
-              "$(jq -Rsa @json <<< "${USER_CONTENT}")" >> "${REQ}.chat"
-            printf '"temperature":0'                  >> "${REQ}.chat"
-            printf '}\n'                              >> "${REQ}.chat"
-            if ! call_api "${REQ}.chat" "${RES}" "/v1/chat/completions"; then
-              # モデルが存在しない・権限無し等 → フォールバックモデルで再試行
-              for M in "${FALLBACK_MODEL}"; do
-                printf '{'                                > "${REQ}.chat"
-                printf '"model":"%s",' "${M}"            >> "${REQ}.chat"
-                printf '"messages":[{"role":"system","content":%s},{"role":"user","content":%s}],' \
-                  "$(jq -Rsa @json <<< "${SYSTEM}")" \
-                  "$(jq -Rsa @json <<< "${USER_CONTENT}")" >> "${REQ}.chat"
-                printf '"temperature":0'                  >> "${REQ}.chat"
-                printf '}\n'                              >> "${REQ}.chat"
-                if call_api "${REQ}.chat" "${RES}" "/v1/chat/completions"; then
-                  MODEL="${M}"
-                  break
-                fi
-              done
-            fi
-          fi
-
-          OUTPUT_TEXT="$(jq -r '.output_text // .choices[0].message.content // ""' "${RES}")"
-          if [ -z "${OUTPUT_TEXT}" ] || [ "${OUTPUT_TEXT}" = "null" ]; then
-            echo "::error::OpenAI response did not contain usable text"
-            jq . "${RES}" || true
-            exit 1
-          fi
-
-          CLEANED="$(printf "%s\n" "${OUTPUT_TEXT}" \
-            | sed 's/\r$//' \
-            | awk 'BEGIN{f=1} /^```/{next} {print}')"
-
-          if printf "%s" "${CLEANED}" | grep -qE '^(diff |--- )'; then
-            printf "%s" "${CLEANED}" \
-              | awk 'BEGIN{s=0} /^diff |^--- /{s=1} {if(s)print}' > "${PATCH}"
-          else
-            printf "%s" "${CLEANED}" > "${PATCH}"
-          fi
-
-          echo "----- Patch preview (head) -----"
-          head -n 120 "${PATCH}" || true
-          echo "-------------------------------"
-
-          if ! git apply --index --reject --whitespace=fix "${PATCH}"; then
-            echo "::error::Failed to apply patch. See ai/patch.diff"
-            exit 1
-          fi
+          # 2) 順に戦略を変えて適用
+          try --index --check \
+          || try --index --whitespace=fix \
+          || try --index --unidiff-zero \
+          || try --index --reject \
+          || {
+               echo "::error::Patch still cannot be applied. Showing diagnostics…"
+               wc -l "${NORM}" || true
+               sed -n '1,200p' "${NORM}" || true
+               exit 1
+             }
 
       - name: "Show diff summary"
         shell: "bash"
         run: |
           set -euo pipefail
-          git status --porcelain=v1 || true
-          echo ""
+          git status --porcelain=1 || true
           git diff --stat || true
 
-      - name: "Configure git author"
-        shell: "bash"
-        run: |
-          set -euo pipefail
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git config user.name  "github-actions[bot]"
-
-      - name: "Create or update PR"
+      - name: "Create PR"
         uses: "peter-evans/create-pull-request@v6"
         with:
-          branch: "${{ env.BRANCH_NAME }}"
-          delete-branch: true
-          title: "AI: codex update (mode=${{ env.MODE }}, model=${{ env.MODEL_INPUT }})"
-          commit-message: "ai: apply codex patch (mode=${{ env.MODE }}, model=${{ env.MODEL_INPUT }})"
-          body: |
-            Auto-generated by Codex workflow.
-            - Mode: `${{ env.MODE }}`
-            - Model: `${{ env.MODEL_INPUT }}`
-          labels: "codex, automated"
-          draft: false
+          token: "${{ github.token }}"
+          branch: "ai/codex/batch-${{ github.run_id }}"
+          title: "AI: apply Codex changes (mode=${{ inputs.mode }})"
+          commit-message: "ai: update from spec (mode=${{ inputs.mode }})"
+          body: "Automated update from spec. Model: `${{ inputs.model || env.MODEL_DEFAULT }}`"
           signoff: false
-          add-paths: |
-            .
-          token: "${{ secrets.GITHUB_TOKEN }}"
+          draft: false
+          delete-branch: true
