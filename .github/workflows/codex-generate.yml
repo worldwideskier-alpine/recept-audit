@@ -69,17 +69,17 @@ jobs:
           node-version: "20"
 
       - name: "Preflight: API key"
-        shell: "bash"
+        shell: bash
         run: |
           set -euo pipefail
           if [ -z "${OPENAI_API_KEY:-}" ]; then
             echo "::error::OPENAI_API_KEY is not set"
             exit 1
           fi
-          mkdir -p "ai" "tools"
+          mkdir -p ai
 
       - name: "Compose prompt from spec (no-heredoc)"
-        shell: "bash"
+        shell: bash
         run: |
           set -euo pipefail
           : > "$PROMPT_FILE"
@@ -110,36 +110,91 @@ jobs:
           rm -f "$tmp_list"
 
           # ---- OUTPUT CONTRACT (MUST) ----
-          printf "%s\n" "" >> "$PROMPT_FILE"
-          printf "%s\n" "## OUTPUT CONTRACT (MUST)" >> "$PROMPT_FILE"
-          printf "%s\n" "" >> "$PROMPT_FILE"
-          printf "%s\n" "- Return a single Unified Diff patch rooted at the repository." >> "$PROMPT_FILE"
-          printf "%s\n" "- No prose, no explanations, no code fences, no headings." >> "$PROMPT_FILE"
-          printf "%s\n" "- Start with either 'diff --git' lines or with '--- a/' then '+++ b/'." >> "$PROMPT_FILE"
-          printf "%s\n" "- If truly no changes are required, emit a minimal no-op patch touching 'ai/.noop':" >> "$PROMPT_FILE"
-          printf "%s\n" "" >> "$PROMPT_FILE"
-          printf "%s\n" "--- a/ai/.noop" >> "$PROMPT_FILE"
-          printf "%s\n" "+++ b/ai/.noop" >> "$PROMPT_FILE"
-          printf "%s\n" "@@ -1 +1 @@" >> "$PROMPT_FILE"
-          printf "%s\n" "-placeholder" >> "$PROMPT_FILE"
-          printf "%s\n" "+placeholder" >> "$PROMPT_FILE"
+          {
+            printf "\n## OUTPUT CONTRACT (MUST)\n\n"
+            printf -- "- Return a single Unified Diff patch rooted at the repository.\n"
+            printf -- "- No prose, no explanations, no code fences, no headings.\n"
+            printf -- "- Start with either 'diff --git' lines or with '--- a/' then '+++ b/'.\n"
+            printf -- "- If truly no changes are required, emit a minimal no-op patch touching 'ai/.noop':\n\n"
+            printf -- "--- a/ai/.noop\n"
+            printf -- "+++ b/ai/.noop\n"
+            printf -- "@@ -1 +1 @@\n"
+            printf -- "-placeholder\n"
+            printf -- "+placeholder\n"
+          } >> "$PROMPT_FILE"
 
-      - name: "Create tools/run_codex.js (no heredoc)"
-        shell: "bash"
+      - name: "Call OpenAI (curl + jq, no heredoc)"
+        shell: bash
         run: |
           set -euo pipefail
-          mkdir -p tools ai
-          rm -f tools/run_codex.js
-          printf "%s\n" "'use strict';" >> tools/run_codex.js
-          printf "%s\n" "const fs = require('fs');" >> tools/run_codex.js
-          printf "%s\n" "const path = require('path');" >> tools/run_codex.js
-          printf "%s\n" "const https = require('https');" >> tools/run_codex.js
-          printf "%s\n" "const PROMPT_FILE = process.env.PROMPT_FILE || 'ai/prompt.md';" >> tools/run_codex.js
-          printf "%s\n" "const PATCH_FILE  = process.env.PATCH_FILE  || 'ai/patch.diff';" >> tools/run_codex.js
-          printf "%s\n" "const MODEL = (process.env.OPENAI_MODEL && process.env.OPENAI_MODEL.length>0) ? process.env.OPENAI_MODEL : (process.env.MODEL_DEFAULT||'gpt-4o-mini');" >> tools/run_codex.js
-          printf "%s\n" "const KEY = process.env.OPENAI_API_KEY;" >> tools/run_codex.js
-          printf "%s\n" "function extractText(j){" >> tools/run_codex.js
-          printf "%s\n" "  if (!j) return '';" >> tools/run_codex.js
-          printf "%s\n" "  if (j.choices && j.choices.length){" >> tools/run_codex.js
-          printf "%s\n" "    const c0=j.choices[0];" >> tools/run_codex.js
-          printf "%s\n" "    if (c0?.message?.content){ return (Array.isArray(c0.message.content)?c0.message.content.map
+          MODEL="${OPENAI_MODEL:-$MODEL_DEFAULT}"
+
+          # build request json safely (no quoting地獄)
+          jq -Rs --arg model "$MODEL" '
+          {
+            model: $model,
+            temperature: 0.1,
+            max_tokens: 4096,
+            messages: [
+              {
+                role: "user",
+                content: . + "\n\n[MUST OUTPUT] Return only a unified diff patch (UTF-8), repository root. No prose. No code fences."
+              }
+            ]
+          }' < "$PROMPT_FILE" > ai/request.json
+
+          # call API and capture status code
+          resp_with_code="$(mktemp)"
+          curl -sS -H "Authorization: Bearer '"$OPENAI_API_KEY"'" \
+              -H "Content-Type: application/json" \
+              -w "\n%{http_code}\n" \
+              -d @ai/request.json \
+              https://api.openai.com/v1/chat/completions \
+              | tee "$resp_with_code" >/dev/null
+
+          status="$(tail -n1 "$resp_with_code")"
+          head -n -1 "$resp_with_code" > ai/response.json
+          rm -f "$resp_with_code"
+
+          if [ "${status}" -ge 300 ]; then
+            echo "::error::OpenAI error ${status}"
+            exit 3
+          fi
+
+          # extract text
+          jq -r '.choices[0].message.content // empty' ai/response.json > ai/out.txt
+
+          # strip code fences if present
+          #   先頭 ```xxxx の1行 と 末尾 ``` を削る（存在すれば）
+          sed -E -e '1{/^```[a-zA-Z-]*[[:space:]]*$/d;}' -e '${/^```[[:space:]]*$/d;}' -i ai/out.txt || true
+
+          # drop any preamble lines before diff header
+          awk 'f||/^(diff --git|--- a\/)/{f=1; print}' ai/out.txt > "$PATCH_FILE"
+
+          # verify diff format (git形式 or 統一diff)
+          if ! grep -Eq '^(diff --git|--- a/)' "$PATCH_FILE" || ! grep -Eq '(^\+\+\+ b/|^diff --git)' "$PATCH_FILE"; then
+            echo "::error::model did not return a unified diff"
+            exit 4
+          fi
+          echo "patch verified"
+
+      - name: "Upload response debug (if any)"
+        if: ${{ failure() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: "ai-response-debug"
+          path: |
+            ai/request.json
+            ai/response.json
+            ai/out.txt
+          if-no-files-found: ignore
+
+      - name: "Upload prompt & patch (always)"
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: "ai-prompt-and-patch"
+          path: |
+            ai/prompt.md
+            ai/patch.diff
+          if-no-files-found: ignore
