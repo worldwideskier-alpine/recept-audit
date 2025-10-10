@@ -1,87 +1,82 @@
-#!/usr/bin/env node
-/**
- * Run Codex via OpenAI Responses API and write a unified diff to ai/patch.diff.
- * - No external deps (Node >=18 with global fetch).
- * - PROMPT_FILE (default: ai/prompt.md)
- * - PATCH_FILE  (default: ai/patch.diff)
- * - model: INPUT_MODEL > MODEL_DEFAULT > 'gpt-4.1-mini'
- */
+"use strict";
 
-const fs = require("fs/promises");
+const fs = require("fs");
 const path = require("path");
 
+// Node 18+ は fetch が同梱
+const fetchFn = global.fetch;
+
+const API_KEY = process.env.OPENAI_API_KEY;
+const MODEL   = process.env.OPENAI_MODEL || "gpt-4o-mini";
+const PROMPT  = process.env.PROMPT_FILE;
+const PATCH   = process.env.PATCH_FILE;
+
+if (!API_KEY) {
+  console.error("missing OPENAI_API_KEY");
+  process.exit(1);
+}
+if (!PROMPT || !fs.existsSync(PROMPT)) {
+  console.error("prompt not found: " + PROMPT);
+  process.exit(1);
+}
+
+const systemMsg = [
+  "You output ONLY a unified diff (patch).",
+  "No explanations, no markdown fences, no prose.",
+  "Output must start with 'diff --git '.",
+  "For new files, include full file contents in the patch."
+].join(" ");
+
+const userMsg = fs.readFileSync(PROMPT, "utf8");
+
 async function main() {
-  const apiKey = process.env.OPENAI_API_KEY || "";
-  if (!apiKey) {
-    console.error("ERROR: OPENAI_API_KEY is empty."); process.exit(2);
-  }
-
-  const model =
-    process.env.INPUT_MODEL ||
-    process.env.MODEL_DEFAULT ||
-    "gpt-4.1-mini";
-
-  const promptFile = process.env.PROMPT_FILE || "ai/prompt.md";
-  const patchFile  = process.env.PATCH_FILE  || "ai/patch.diff";
-
-  let userPrompt = "";
-  try {
-    userPrompt = await fs.readFile(promptFile, "utf-8");
-  } catch (e) {
-    console.error(`ERROR: failed to read ${promptFile}`); console.error(e);
-    process.exit(2);
-  }
-
-  const systemPrompt = [
-    "You are a rigorous code generation engine.",
-    "Return ONLY a unified diff (git patch) that applies cleanly to the current repository.",
-    "No explanations, no code fences. UTF-8, POSIX newlines."
-  ].join(" ");
-
   const body = {
-    model,
-    input: [
-      { role: "system", content: systemPrompt },
-      { role: "user",   content: userPrompt }
+    model: MODEL,
+    messages: [
+      { role: "system", content: systemMsg },
+      { role: "user",   content: userMsg }
     ],
-    temperature: 0.1,
+    temperature: 0.1
   };
 
-  const res = await fetch("https://api.openai.com/v1/responses", {
+  const res = await fetchFn("https://api.openai.com/v1/chat/completions", {
     method: "POST",
     headers: {
-      "Authorization": `Bearer ${apiKey}`,
-      "Content-Type": "application/json",
+      "Authorization": "Bearer " + API_KEY,
+      "Content-Type": "application/json"
     },
-    body: JSON.stringify(body),
+    body: JSON.stringify(body)
   });
 
   if (!res.ok) {
-    const txt = await res.text().catch(()=>"");
-    console.error(`ERROR: OpenAI API failed (status ${res.status}).`);
-    console.error(txt);
-    process.exit(3);
+    console.error("OpenAI API error: " + res.status);
+    const t = await res.text().catch(() => "");
+    if (t) console.error(t);
+    process.exit(2);
   }
 
-  const data = await res.json();
+  const json = await res.json();
+  let out =
+    json?.choices?.[0]?.message?.content ?? "";
 
-  // Responses API からテキスト抽出（出力形式の揺れに耐性）
-  const text =
-    data.output_text ||
-    (Array.isArray(data.output)
-      ? data.output.map(o => (o?.content?.[0]?.text?.value) || "").join("")
-      : "") ||
-    (data.choices?.[0]?.message?.content || "");
+  // 万一コードフェンスが返ってきた時の保険
+  const m = out.match(/```(?:diff|patch)?\n([\s\S]*?)```/);
+  if (m && m[1]) out = m[1];
 
-  if (!text || (!/\ndiff --git /.test(text) && !/^--- /.test(text))) {
-    console.error("ERROR: model did not return a unified diff.");
-    console.error(String(text).slice(0, 600));
+  // 改行正規化
+  out = out.replace(/\r/g, "");
+
+  if (!/^diff --git /m.test(out)) {
+    console.error("model did not return a unified diff");
     process.exit(4);
   }
 
-  await fs.mkdir(path.dirname(patchFile), { recursive: true });
-  await fs.writeFile(patchFile, text, "utf-8");
-  console.log(`Wrote patch: ${patchFile} (${text.length} bytes)`);
+  fs.mkdirSync(path.dirname(PATCH), { recursive: true });
+  fs.writeFileSync(PATCH, out.endsWith("\n") ? out : out + "\n", "utf8");
+  console.log("patch written:", PATCH);
 }
 
-main().catch(e => { console.error("FATAL:", e); process.exit(1); });
+main().catch(err => {
+  console.error(err);
+  process.exit(3);
+});
