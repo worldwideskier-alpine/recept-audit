@@ -50,7 +50,6 @@ jobs:
       OPENAI_MODEL: "${{ inputs.model }}"
       MODE: "${{ inputs.mode }}"
       OPENAI_API_KEY: "${{ secrets.OPENAI_API_KEY }}"
-      # 使っていればプロキシ/Enterprise エンドポイントに
       OPENAI_BASE_URL: "${{ vars.OPENAI_BASE_URL }}"
 
     steps:
@@ -59,7 +58,7 @@ jobs:
 
       - name: "Setup Node (cache if lock exists)"
         if: ${{ hashFiles('**/package-lock.json', '**/npm-shrinkwrap.json', '**/yarn.lock') != '' }}
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v4"
         with:
           node-version: "20"
           cache: "npm"
@@ -142,26 +141,30 @@ jobs:
           echo "Using model: $MODEL"
           echo "Base URL  : $BASE"
 
-          # --- route: Responses for gpt-5-codex / Chat for others ---
+          # --- route switch ---
           if printf "%s" "$MODEL" | grep -qiE '^gpt-5-codex( |$|-|:)'; then
-            # Responses API  (GPT-5-Codex は Chat では 404 になります) :contentReference[oaicite:1]{index=1}
+            # ===== Responses API (gpt-5-codex) =====
             jq -n \
               --arg model "$MODEL" \
               --rawfile prompt "$PROMPT_FILE" \
               '{
                 model: $model,
                 max_output_tokens: 4096,
+                response_format: { type: "text" },
                 input: [
                   {
                     role: "user",
-                    content: [ { type: "text", text: ($prompt + "\n\n[MUST OUTPUT] Return only a unified diff patch (UTF-8), repository root. No prose. No code fences.") } ]
+                    content: [
+                      { type: "input_text",
+                        text: ($prompt + "\n\n[MUST OUTPUT] Return only a unified diff patch (UTF-8), repository root. No prose. No code fences.") }
+                    ]
                   }
                 ]
               }' > ai/request.json
 
             ENDPOINT="${BASE%/}/v1/responses"
           else
-            # Chat Completions
+            # ===== Chat Completions (その他モデル) =====
             jq -n \
               --arg model "$MODEL" \
               --rawfile prompt "$PROMPT_FILE" \
@@ -180,6 +183,7 @@ jobs:
             ENDPOINT="${BASE%/}/v1/chat/completions"
           fi
 
+          # --- call ---
           resp_with_code="$(mktemp)"
           curl -sS \
             -H "Authorization: Bearer ${OPENAI_API_KEY}" \
@@ -194,18 +198,17 @@ jobs:
 
           if [ "${status}" -ge 300 ]; then
             echo "::error::OpenAI error ${status}"
-            echo "---- request (trimmed) ----"
-            head -c 800 ai/request.json; echo
-            echo "---- response body ----"
-            cat ai/response.json || true
+            echo "---- request (trimmed) ----"; head -c 800 ai/request.json; echo
+            echo "---- response body ----"; cat ai/response.json || true
             exit 3
           fi
 
-          # --- extract text (Responses or Chat の両対応) ---
+          # --- extract text (Responses/Chat 両対応) ---
           jq -r '
             ( .output_text ) //
             ( ( .output // [] ) | select(type=="array")
-                | map( if type=="string" then . else (.text // .content // "") end ) | join("") ) //
+                | map( if type=="string" then . else (.text // .content // "") end )
+                | join("") ) //
             ( .choices[0].message.content // .choices[0].text // "" )
           ' ai/response.json > ai/out.txt
 
