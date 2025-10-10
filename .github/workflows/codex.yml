@@ -1,4 +1,4 @@
-name: "Codex Generate (single)"
+name: "Codex"
 
 on:
   workflow_dispatch:
@@ -26,6 +26,7 @@ permissions:
 
 jobs:
   generate:
+    # push時にコミットメッセージへ [skip-codex] を含めると起動をスキップ
     if: ${{ github.event_name != 'push' || !contains(github.event.head_commit.message, '[skip-codex]') }}
     runs-on: ubuntu-latest
 
@@ -77,6 +78,7 @@ jobs:
           printf "%s\n" "## Mode: ${MODE}" >> "$PROMPT_FILE"
           printf "%s\n" "" >> "$PROMPT_FILE"
 
+          # MODE=incremental のとき spec/ の変更ファイルのみ（なければ全文）
           tmp_list="$(mktemp)"
           if [ "${MODE:-full}" = "incremental" ]; then
             git fetch --depth=50 origin || true
@@ -134,6 +136,7 @@ jobs:
             printf "%s\n" "+placeholder"    >> "$PATCH_FILE"
           }
 
+          # 有効モデル名
           _in="${OPENAI_MODEL:-}"
           MODEL="$MODEL_DEFAULT"
           if [ -n "$_in" ]; then
@@ -143,12 +146,15 @@ jobs:
           echo "Using model: $MODEL"
           echo "Base URL  : $BASE"
 
+          # 共通 system 契約
           SYSTEM_CONTRACT=$'You are a patch generator.\nMUST return ONLY a unified diff (UTF-8) rooted at repository.\nNo explanations, no prose, no code fences.\nIf unable, return exactly this no-op patch:\n--- a/ai/.noop\n+++ b/ai/.noop\n@@ -1 +1 @@\n-placeholder\n+placeholder'
 
+          # ---- リクエスト作成（Responses: temperature を送らない）----
           if printf "%s" "$MODEL" | grep -qiE '^gpt-5-codex( |$|-|:)'; then
             jq -n --arg model "$MODEL" --arg sys "$SYSTEM_CONTRACT" --rawfile prompt "$PROMPT_FILE" \
               '{
-                 model: $model, temperature: 0, max_output_tokens: 4096,
+                 model: $model,
+                 max_output_tokens: 4096,
                  input: [
                    { role: "system", content: [ { type: "input_text", text: $sys } ] },
                    { role: "user",   content: [ { type: "input_text", text: $prompt } ] }
@@ -166,6 +172,7 @@ jobs:
             EXTRACT_FILTER='( .choices[0].message.content // .choices[0].text // "" )'
           fi
 
+          # ---- 1st call ----
           resp_with_code="$(mktemp)"
           curl -sS -H "Authorization: Bearer ${OPENAI_API_KEY}" -H "Content-Type: application/json" \
                -w "\n%{http_code}\n" -d @ai/request.json "$ENDPOINT" | tee "$resp_with_code" >/dev/null
@@ -183,10 +190,12 @@ jobs:
           else
             echo "::warning::first attempt was not a unified diff; retrying with repair prompt"
             head -c 15000 ai/out.txt > ai/out.trim.txt || true
+
             REPAIR_SYS=$'You will be given some text.\nIf it already contains a unified diff, extract ONLY the diff.\nOtherwise, output exactly this no-op patch:\n--- a/ai/.noop\n+++ b/ai/.noop\n@@ -1 +1 @@\n-placeholder\n+placeholder'
+
             if printf "%s" "$MODEL" | grep -qiE '^gpt-5-codex( |$|-|:)'; then
               jq -n --arg model "$MODEL" --arg sys "$REPAIR_SYS" --rawfile prev ai/out.trim.txt \
-                '{ model: $model, temperature: 0, max_output_tokens: 4096,
+                '{ model: $model, max_output_tokens: 4096,
                    input: [ { role:"system",content:[{type:"input_text",text:$sys}] },
                             { role:"user",  content:[{type:"input_text",text:$prev}] } ] }' > ai/request.repair.json
             else
@@ -194,6 +203,7 @@ jobs:
                 '{ model: $model, temperature: 0, max_tokens: 2048,
                    messages: [ { role:"system",content:$sys }, { role:"user",content:$prev } ] }' > ai/request.repair.json
             fi
+
             resp_with_code="$(mktemp)"
             curl -sS -H "Authorization: Bearer ${OPENAI_API_KEY}" -H "Content-Type: application/json" \
                  -w "\n%{http_code}\n" -d @ai/request.repair.json "$ENDPOINT" | tee "$resp_with_code" >/dev/null
@@ -211,10 +221,11 @@ jobs:
                   echo "-placeholder"; echo "+placeholder"; } > "$PATCH_FILE"
               fi
             fi
+
             echo "patch verified (after repair or fallback)"
           fi
 
-      # -------- ここから適用→PR 作成 --------
+      # ---------- ここから：パッチ適用 → PR 作成 ----------
 
       - name: "Detect no-op patch"
         id: noop
@@ -232,33 +243,28 @@ jobs:
             echo "is_noop=false" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: "Apply patch & create branch"
+      - name: "Apply patch to working tree"
         if: ${{ steps.noop.outputs.is_noop != 'true' }}
         shell: bash
         run: |
           set -euo pipefail
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          BR="codex/autogen-${{ github.run_id }}"
-          git checkout -b "$BR"
-          git apply --whitespace=fix --index "$PATCH_FILE"
-          if git diff --staged --quiet; then
-            echo "No staged changes after applying patch. Nothing to commit."
-            echo "skip_pr=true" >> "$GITHUB_OUTPUT"
-          else
-            git commit -m "Codex: generate from specs (mode=${MODE:-full}, model=${OPENAI_MODEL:-$MODEL_DEFAULT})"
-            git push -u origin "$BR"
+          # 実際のファイルへ反映（インデックスは後段アクションが面倒見ます）
+          git apply --whitespace=fix "$PATCH_FILE"
+          if git diff --quiet; then
+            echo "No changes after applying patch."; exit 78 # neutral
           fi
 
       - name: "Create Pull Request"
         if: ${{ steps.noop.outputs.is_noop != 'true' }}
         uses: peter-evans/create-pull-request@v6
         with:
-          title: "Codex: generate from specs (mode=${{ env.MODE }}, model=${{ env.OPENAI_MODEL || env.MODEL_DEFAULT }})"
+          title: "Codex: generate from specs (mode=${{ env.MODE }}, model=${{ env.OPENAI_MODEL != '' && env.OPENAI_MODEL || env.MODEL_DEFAULT }})"
           body: |
             This PR was created automatically by Codex workflow.
             - Mode: `${{ env.MODE }}`
-            - Model: `${{ env.OPENAI_MODEL || env.MODEL_DEFAULT }}`
+            - Model: `${{ env.OPENAI_MODEL != '' && env.OPENAI_MODEL || env.MODEL_DEFAULT }}`
             - Source: `spec/` (foundation / env-profiles / features / tests)
           branch: "codex/autogen-${{ github.run_id }}"
           base: "main"
@@ -269,7 +275,7 @@ jobs:
         if: ${{ steps.noop.outputs.is_noop == 'true' }}
         run: echo "PR skipped because the generated patch was a no-op."
 
-      # -------- ここまで 適用→PR 作成 --------
+      # ---------- ここまで：適用 → PR 作成 ----------
 
       - name: "Upload response debug (if any)"
         if: ${{ failure() }}
