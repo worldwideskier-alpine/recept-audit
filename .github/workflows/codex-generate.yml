@@ -1,3 +1,4 @@
+# .github/workflows/codex-generate.yml
 name: "Codex Generate (spec-driven reusable)"
 
 on:
@@ -9,7 +10,7 @@ on:
         default: "full"
         type: string
       model:
-        description: "OpenAI モデル名 (任意: 例 gpt-5-codex / gpt-5 / gpt-4.1)"
+        description: "OpenAI モデル名 (例: gpt-5-codex / gpt-5 / gpt-4.1 / gpt-4o-mini)"
         required: false
         default: ""
         type: string
@@ -27,7 +28,7 @@ on:
         type: choice
         options: ["full", "incremental"]
       model:
-        description: "OpenAI モデル名 (任意: 例 gpt-5-codex / gpt-5 / gpt-4.1)"
+        description: "OpenAI モデル名 (例: gpt-5-codex / gpt-5 / gpt-4.1 / gpt-4o-mini)"
         required: false
         default: ""
         type: string
@@ -39,42 +40,41 @@ permissions:
 jobs:
   generate:
     name: "Generate from specs"
-    runs-on: "ubuntu-latest"
+    runs-on: ubuntu-latest
 
     env:
       # 仕様のルート/サブディレクトリ
-      SPEC_ROOT: "spec"
+      SPEC_ROOT: spec
       SPEC_DIRS: "foundation env-profiles features tests"
       # 生成物/媒介ファイル
-      PROMPT_FILE: "ai/prompt.md"
-      PATCH_FILE: "ai/patch.diff"
-      # モデル（未指定時の既定は gpt-4o-mini にしています。gpt-5-codex が使えるなら dispatcher 側で inputs.model に指定してください）
-      MODEL_DEFAULT: "gpt-4o-mini"
-      OPENAI_MODEL: "${{ inputs.model }}"
-      MODE: "${{ inputs.mode }}"
-      # OpenAI
-      OPENAI_API_KEY: "${{ secrets.OPENAI_API_KEY }}"
-      # 企業プロキシ・専用エンドポイントを使う場合だけ設定（未設定なら公式）
-      OPENAI_BASE_URL: "${{ vars.OPENAI_BASE_URL }}"
+      PROMPT_FILE: ai/prompt.md
+      PATCH_FILE: ai/patch.diff
+      # 既定モデル（未指定時に使用）
+      MODEL_DEFAULT: gpt-4o-mini
+      OPENAI_MODEL: ${{ inputs.model }}
+      MODE: ${{ inputs.mode }}
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+      # 企業プロキシなどを使う場合のみ設定（未設定なら公式 API）
+      OPENAI_BASE_URL: ${{ vars.OPENAI_BASE_URL }}
 
     steps:
-      - name: "Checkout"
+      - name: Checkout
         uses: actions/checkout@v4
 
-      - name: "Setup Node (cache if lock exists)"
+      - name: Setup Node (cache if lock exists)
         if: ${{ hashFiles('**/package-lock.json', '**/npm-shrinkwrap.json', '**/yarn.lock') != '' }}
         uses: actions/setup-node@v4
         with:
           node-version: "20"
-          cache: "npm"
+          cache: npm
 
-      - name: "Setup Node (no cache)"
+      - name: Setup Node (no cache)
         if: ${{ hashFiles('**/package-lock.json', '**/npm-shrinkwrap.json', '**/yarn.lock') == '' }}
         uses: actions/setup-node@v4
         with:
           node-version: "20"
 
-      - name: "Preflight: API key"
+      - name: Preflight: API key
         shell: bash
         run: |
           set -euo pipefail
@@ -84,7 +84,7 @@ jobs:
           fi
           mkdir -p ai
 
-      - name: "Compose prompt from spec (no-heredoc)"
+      - name: Compose prompt from spec (no-heredoc)
         shell: bash
         run: |
           set -euo pipefail
@@ -128,95 +128,27 @@ jobs:
             printf -- "+placeholder\n"
           } >> "$PROMPT_FILE"
 
-      - name: "Call OpenAI (curl + jq, no heredoc)"
+      - name: Call OpenAI (curl + jq, no heredoc)
         shell: bash
         run: |
           set -euo pipefail
+          BASE="${OPENAI_BASE_URL:-https://api.openai.com}"
 
-          # --- model & endpoint sanitize ---
+          # ---- モデル名のサニタイズ ----
           _in="${OPENAI_MODEL:-}"
           MODEL="$MODEL_DEFAULT"
           if [ -n "$_in" ]; then
             case "$_in" in
-              # 代表的な有効パターンのみ通す（それ以外は既定にフォールバック）
-              gpt-*|o* ) MODEL="$_in" ;;
+              gpt-*|o* ) MODEL="$_in" ;;  # 代表的な命名のみ許可
               * ) echo "note: unknown model '$_in' -> fallback to $MODEL_DEFAULT" ;;
             esac
           fi
-          BASE="${OPENAI_BASE_URL:-https://api.openai.com}"
           echo "Using model: $MODEL"
           echo "Base URL  : $BASE"
 
-          # --- build request json safely ---
-          jq -n \
-            --arg model "$MODEL" \
-            --rawfile prompt "$PROMPT_FILE" \
-            '{
-              model: $model,
-              temperature: 0.1,
-              max_tokens: 4096,
-              messages: [{
-                role: "user",
-                content: ($prompt + "\n\n[MUST OUTPUT] Return only a unified diff patch (UTF-8), repository root. No prose. No code fences.")
-              }]
-            }' > ai/request.json
-
-          # --- call API ---
-          resp_with_code="$(mktemp)"
-          curl -sS \
-            -H "Authorization: Bearer ${OPENAI_API_KEY}" \
-            -H "Content-Type: application/json" \
-            -w "\n%{http_code}\n" \
-            -d @ai/request.json \
-            "${BASE%/}/v1/chat/completions" \
-            | tee "$resp_with_code" >/dev/null
-
-          status="$(tail -n1 "$resp_with_code")"
-          head -n -1 "$resp_with_code" > ai/response.json
-          rm -f "$resp_with_code"
-
-          if [ "${status}" -ge 300 ]; then
-            echo "::error::OpenAI error ${status}"
-            echo "---- request (trimmed) ----"
-            head -c 800 ai/request.json; echo
-            echo "---- response body ----"
-            cat ai/response.json || true
-            exit 3
-          fi
-
-          # extract text
-          jq -r '.choices[0].message.content // empty' ai/response.json > ai/out.txt
-
-          # strip code fences if present
-          sed -E -e '1{/^```[a-zA-Z-]*[[:space:]]*$/d;}' -e '${/^```[[:space:]]*$/d;}' -i ai/out.txt || true
-
-          # drop any preamble lines before diff header
-          awk 'f||/^(diff --git|--- a\/)/{f=1; print}' ai/out.txt > "$PATCH_FILE"
-
-          # verify diff format (git形式 or 統一diff)
-          if ! grep -Eq '^(diff --git|--- a/)' "$PATCH_FILE" || ! grep -Eq '(^\+\+\+ b/|^diff --git)' "$PATCH_FILE"; then
-            echo "::error::model did not return a unified diff"
-            exit 4
-          fi
-          echo "patch verified"
-
-      - name: "Upload response debug (if any)"
-        if: ${{ failure() }}
-        uses: actions/upload-artifact@v4
-        with:
-          name: "ai-response-debug"
-          path: |
-            ai/request.json
-            ai/response.json
-            ai/out.txt
-          if-no-files-found: ignore
-
-      - name: "Upload prompt & patch (always)"
-        if: ${{ always() }}
-        uses: actions/upload-artifact@v4
-        with:
-          name: "ai-prompt-and-patch"
-          path: |
-            ai/prompt.md
-            ai/patch.diff
-          if-no-files-found: ignore
+          # ---- エンドポイント自動選択 ----
+          # gpt-5-pro / gpt-5-codex など Responses 専用・推奨モデルは /v1/responses に送る
+          API="chat"
+          case "$MODEL" in
+            *codex*|*Codex*|gpt-5-pro) API="responses" ;;
+          esac
