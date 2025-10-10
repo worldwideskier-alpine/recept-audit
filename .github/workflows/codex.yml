@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       mode:
-        description: "実行モード: full（全生成） / incremental（差分）"
+        description: "実行モード: full（全生成）/ incremental（差分）"
         required: false
         default: "full"
         type: string
@@ -17,6 +17,7 @@ on:
     branches: ["main"]
     paths:
       - "spec/**"
+      - "AGENTS.md"
       - ".github/workflows/codex.yml"
       - "ai/prompt.md"
 
@@ -26,7 +27,8 @@ permissions:
 
 jobs:
   generate:
-    uses: ".github/workflows/codex-generate.yml"
+    # 同一リポジトリ内の reusable workflow を呼ぶときは ./ を必ず付ける
+    uses: "./.github/workflows/codex-generate.yml"
     with:
       mode: "${{ inputs.mode || 'full' }}"
       model: "${{ inputs.model || '' }}"
