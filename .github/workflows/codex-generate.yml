@@ -1,57 +1,62 @@
-name: "Codex Generate (spec-driven, node-run, no-chmod, safe)"
+name: "Codex Generate (spec-driven, node-run)"
 
 on:
-  workflow_call:
-    inputs:
-      mode:
-        description: "実行モード: full（全生成）/ incremental（差分）"
-        required: false
-        default: "full"
-        type: string
-      model:
-        description: "OpenAI モデル名（未指定なら既定）"
-        required: false
-        default: ""
-        type: string
-    secrets:
-      OPENAI_API_KEY:
-        required: true
   workflow_dispatch:
     inputs:
       mode:
-        description: "実行モード: full（全生成）/ incremental（差分）"
+        description: "実行モード: full / incremental"
         required: false
         default: "full"
         type: string
       model:
-        description: "OpenAI モデル名（未指定なら既定）"
+        description: "OpenAI モデル名（任意）"
         required: false
         default: ""
         type: string
+  workflow_call:
+    inputs:
+      mode:
+        required: false
+        type: string
+        default: "full"
+      model:
+        required: false
+        type: string
+        default: ""
+    secrets:
+      OPENAI_API_KEY:
+        required: true
 
 permissions:
-  contents: write
-  pull-requests: write
+  contents: "write"
+  pull-requests: "write"
 
 jobs:
   generate:
     runs-on: "ubuntu-latest"
-
     env:
       SPEC_ROOT: "spec"
       SPEC_DIRS: "foundation env-profiles features tests"
       PROMPT_FILE: "ai/prompt.md"
-      MODE: "${{ inputs.mode }}"
-      MODEL_DEFAULT: "${{ inputs.model || 'gpt-4o-mini' }}"
-      OPENAI_MODEL: "${{ inputs.model }}"
+      OPENAI_DEFAULT: "gpt-4o-mini"
+      OPENAI_MODEL: "${{ inputs.model || '' }}"
+      MODE: "${{ inputs.mode || 'full' }}"
       CODEX_BRANCH: "ai/codex/batch-${{ github.run_id }}"
 
     steps:
       - name: "Checkout"
         uses: "actions/checkout@v4"
 
-      # ---- Node をシンプルにセットアップ（キャッシュなし＝配列事故を回避）----
+      # Node のキャッシュはロックファイルがある時のみ
+      - name: "Setup Node (cache if lock exists)"
+        if: "${{ hashFiles('**/package-lock.json', '**/npm-shrinkwrap.json', '**/yarn.lock') != '' }}"
+        uses: "actions/setup-node@v4"
+        with:
+          node-version: "20"
+          cache: "npm"
+
       - name: "Setup Node (no cache)"
+        if: "${{ hashFiles('**/package-lock.json', '**/npm-shrinkwrap.json', '**/yarn.lock') == '' }}"
         uses: "actions/setup-node@v4"
         with:
           node-version: "20"
@@ -59,57 +64,95 @@ jobs:
       - name: "Preflight: API key"
         shell: "bash"
         run: |
-          set -eu
-          [ -n "${{ secrets.OPENAI_API_KEY }}" ] || { echo "::error::OPENAI_API_KEY is not set"; exit 1; }
+          set -euo pipefail
+          if [ -z "${{ secrets.OPENAI_API_KEY }}" ]; then
+            echo "::error::OPENAI_API_KEY is not set"; exit 1
+          fi
 
       - name: "Compose prompt from spec (no-heredoc)"
         shell: "bash"
         run: |
-          set -eu
-          mkdir -p "ai"
-          : > "${PROMPT_FILE}"
-          for d in ${SPEC_DIRS}; do
-            [ -d "${SPEC_ROOT}/${d}" ] || continue
-            echo "## ${d}" >> "${PROMPT_FILE}"
-            find "${SPEC_ROOT}/${d}" -type f \( -name "*.md" -o -name "*.txt" -o -name "*.yaml" -o -name "*.yml" -o -name "*.json" \) \
-              | LC_ALL=C sort \
-              | while read -r f; do
-                  printf "\n\n# file: %s\n\n" "${f}" >> "${PROMPT_FILE}"
-                  cat "${f}" >> "${PROMPT_FILE}"
-                done
+          set -euo pipefail
+          mkdir -p ai
+          : > "$PROMPT_FILE"
+          # 1) 固定ヘッダ（厳格ルールを先頭に）
+          printf "%s\n" "OUTPUT ONLY UNIFIED DIFF. NO PROSE. NO MARKDOWN. NO FENCES." >> "$PROMPT_FILE"
+          printf "%s\n" "MODE=${MODE}" >> "$PROMPT_FILE"
+          printf "%s\n" "" >> "$PROMPT_FILE"
+          # 2) spec をグループ順に結合
+          for g in foundation env-profiles features tests; do
+            if [ -d "${SPEC_ROOT}/${g}" ]; then
+              while IFS= read -r -d '' f; do
+                echo "--- FILE: ${f#${SPEC_ROOT}/} ---" >> "$PROMPT_FILE"
+                cat "$f" >> "$PROMPT_FILE"
+                echo "" >> "$PROMPT_FILE"
+              done < <(find "${SPEC_ROOT}/${g}" -type f \( -name "*.md" -o -name "*.txt" -o -name "*.yml" -o -name "*.yaml" -o -name "*.json" \) -print0 | sort -z)
+            fi
           done
-          echo "::notice::Prompt composed at ${PROMPT_FILE}"
-
-      - name: "Verify runner script"
-        shell: "bash"
-        run: |
-          set -eu
-          [ -f "tools/run_codex.js" ] || { echo "::error::tools/run_codex.js is missing. Commit the script."; exit 1; }
 
       - name: "Run Codex (node, no chmod)"
+        shell: "bash"
         env:
           OPENAI_API_KEY: "${{ secrets.OPENAI_API_KEY }}"
-          OPENAI_MODEL: "${{ env.OPENAI_MODEL }}"
-          MODEL_DEFAULT: "${{ env.MODEL_DEFAULT }}"
-          MODE: "${{ env.MODE }}"
-          PROMPT_FILE: "${{ env.PROMPT_FILE }}"
         run: |
-          node "tools/run_codex.js"
+          set -euo pipefail
+          node --version
+          if [ ! -f "tools/run_codex.js" ]; then
+            echo "::error::tools/run_codex.js not found. Commit it to the repo."; exit 1
+          fi
+          node tools/run_codex.js
 
-      - name: "Show diff summary"
+      - name: "Normalize & verify patch"
         shell: "bash"
         run: |
           set -euo pipefail
-          git status --porcelain=v1 || true
-          echo
-          git diff --stat || true
+          python3 - << 'PY'
+import sys, re, pathlib
+p = pathlib.Path("ai/patch.diff")
+if not p.exists():
+    sys.exit("patch not found")
+txt = p.read_text(encoding="utf-8").replace("\r","")
+# 末尾空白除去
+txt = re.sub(r"[ \t]+(\n)", r"\1", txt)
+p.write_text(txt if txt.endswith("\n") else txt+"\n", encoding="utf-8")
+if not re.search(r"^diff --git ", txt, re.M):
+    sys.exit("not a unified diff")
+print("patch verified")
+PY
+
+      - name: "Apply patch"
+        shell: "bash"
+        run: |
+          set -euo pipefail
+          git config user.name "ci-bot"
+          git config user.email "ci-bot@example.invalid"
+          git checkout -B "$CODEX_BRANCH"
+          git reset --hard
+          git clean -fdx
+          git apply -p0 --index ai/patch.diff
+          git status --porcelain=v1
+          if [ -z "$(git status --porcelain=v1)" ]; then
+            echo "no changes to commit (unexpected)"; exit 1
+          fi
+          git commit -m "ci: apply codex patch"
+          git push -u origin "$CODEX_BRANCH"
 
       - name: "Create Pull Request"
-        if: "${{ !cancelled() }}"
         uses: "peter-evans/create-pull-request@v6"
         with:
-          commit-message: "chore(ai): apply codegen (mode=${{ inputs.mode }})"
-          title: "AI: apply Codex changes (mode=${{ inputs.mode }})"
-          body: "Automated code generation based on /spec. Prompt: ${{ env.PROMPT_FILE }}"
+          token: "${{ secrets.GITHUB_TOKEN }}"
+          commit-message: "ci: apply codex patch"
+          title: "Codex: apply changes"
+          body: "Automated patch from spec."
           branch: "${{ env.CODEX_BRANCH }}"
-          delete-branch: true
+          base: "main"
+
+      - name: "Upload raw & patch (debug)"
+        if: "always()"
+        uses: "actions/upload-artifact@v4"
+        with:
+          name: "codex-artifacts"
+          path: |
+            ai/_raw.txt
+            ai/patch.diff
+            ${PROMPT_FILE}
