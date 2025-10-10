@@ -129,28 +129,30 @@ jobs:
           set -euo pipefail
           MODEL="${OPENAI_MODEL:-$MODEL_DEFAULT}"
 
-          # build request json safely (no quoting地獄)
-          jq -Rs --arg model "$MODEL" '
-          {
-            model: $model,
-            temperature: 0.1,
-            max_tokens: 4096,
-            messages: [
-              {
-                role: "user",
-                content: . + "\n\n[MUST OUTPUT] Return only a unified diff patch (UTF-8), repository root. No prose. No code fences."
-              }
-            ]
-          }' < "$PROMPT_FILE" > ai/request.json
+          # 入力は --rawfile で安全に取り込み、-n で定数JSONを構築
+          jq -n \
+            --arg model "$MODEL" \
+            --rawfile prompt "$PROMPT_FILE" \
+            '{
+              model: $model,
+              temperature: 0.1,
+              max_tokens: 4096,
+              messages: [
+                {
+                  role: "user",
+                  content: ($prompt + "\n\n[MUST OUTPUT] Return only a unified diff patch (UTF-8), repository root. No prose. No code fences.")
+                }
+              ]
+            }' > ai/request.json
 
-          # call API and capture status code
           resp_with_code="$(mktemp)"
-          curl -sS -H "Authorization: Bearer '"$OPENAI_API_KEY"'" \
-              -H "Content-Type: application/json" \
-              -w "\n%{http_code}\n" \
-              -d @ai/request.json \
-              https://api.openai.com/v1/chat/completions \
-              | tee "$resp_with_code" >/dev/null
+          curl -sS \
+            -H "Authorization: Bearer ${OPENAI_API_KEY}" \
+            -H "Content-Type: application/json" \
+            -w "\n%{http_code}\n" \
+            -d @ai/request.json \
+            https://api.openai.com/v1/chat/completions \
+            | tee "$resp_with_code" >/dev/null
 
           status="$(tail -n1 "$resp_with_code")"
           head -n -1 "$resp_with_code" > ai/response.json
@@ -164,8 +166,7 @@ jobs:
           # extract text
           jq -r '.choices[0].message.content // empty' ai/response.json > ai/out.txt
 
-          # strip code fences if present
-          #   先頭 ```xxxx の1行 と 末尾 ``` を削る（存在すれば）
+          # strip code fences if present (先頭/末尾の ``` を落とす)
           sed -E -e '1{/^```[a-zA-Z-]*[[:space:]]*$/d;}' -e '${/^```[[:space:]]*$/d;}' -i ai/out.txt || true
 
           # drop any preamble lines before diff header
