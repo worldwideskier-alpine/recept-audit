@@ -1,4 +1,3 @@
-# .github/workflows/codex-generate.yml
 name: "Codex Generate (spec-driven reusable)"
 
 on:
@@ -18,6 +17,7 @@ on:
       OPENAI_API_KEY:
         description: "OpenAI API key"
         required: true
+
   workflow_dispatch:
     inputs:
       mode:
@@ -42,19 +42,23 @@ jobs:
     runs-on: "ubuntu-latest"
 
     env:
+      # 仕様のルート/サブディレクトリ
       SPEC_ROOT: "spec"
       SPEC_DIRS: "foundation env-profiles features tests"
+      # 生成物/媒介ファイル
       PROMPT_FILE: "ai/prompt.md"
       PATCH_FILE: "ai/patch.diff"
+      # モデル
       MODEL_DEFAULT: "gpt-4o-mini"
       OPENAI_MODEL: "${{ inputs.model }}"
       MODE: "${{ inputs.mode }}"
+      # ★ ここを追加（全ステップで参照可）
+      OPENAI_API_KEY: "${{ secrets.OPENAI_API_KEY }}"
 
     steps:
       - name: "Checkout"
         uses: "actions/checkout@v4"
 
-      # Lock があるときだけ Node の cache を有効化
       - name: "Setup Node (cache if lock exists)"
         if: ${{ hashFiles('**/package-lock.json', '**/npm-shrinkwrap.json', '**/yarn.lock') != '' }}
         uses: "actions/setup-node@v4"
@@ -96,13 +100,13 @@ jobs:
                 >> "$tmp_list"
             fi
           done
+
           if [ -s "$tmp_list" ]; then
             LC_ALL=C sort "$tmp_list" -o "$tmp_list"
             while IFS= read -r f; do
               printf "%s\n" "" >> "$PROMPT_FILE"
               printf "%s\n" "### $(basename "$f")" >> "$PROMPT_FILE"
               printf "%s\n" "" >> "$PROMPT_FILE"
-              # 改行コードを正規化
               sed -e 's/\r$//' "$f" >> "$PROMPT_FILE"
               printf "%s\n" "" >> "$PROMPT_FILE"
             done < "$tmp_list"
@@ -156,8 +160,6 @@ jobs:
 
       - name: "Run Codex (node, no chmod)"
         shell: "bash"
-        env:
-          OPENAI_API_KEY: "${{ secrets.OPENAI_API_KEY }}"
         run: |
           set -euo pipefail
           node -v
@@ -171,7 +173,6 @@ jobs:
             echo "::error::patch not found"
             exit 1
           fi
-          # 改行コードの正規化
           perl -pi -e 's/\r$//' "${PATCH_FILE}"
           if ! grep -q "^--- " "${PATCH_FILE}" || ! grep -q "^+++ " "${PATCH_FILE}"; then
             echo "::error::not a unified diff"
