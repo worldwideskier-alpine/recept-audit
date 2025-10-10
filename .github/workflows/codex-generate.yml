@@ -1,15 +1,16 @@
-name: "Codex Generate (spec-driven)"
+# .github/workflows/codex-generate.yml
+name: "Codex Generate (spec-driven reusable)"
 
 on:
   workflow_call:
     inputs:
       mode:
-        description: "実行モード: full / incremental"
+        description: "実行モード: full(全生成) / incremental(差分)"
         required: false
         default: "full"
         type: string
       model:
-        description: "OpenAI モデル名（任意）"
+        description: "OpenAI モデル名 (任意)"
         required: false
         default: ""
         type: string
@@ -17,17 +18,16 @@ on:
       OPENAI_API_KEY:
         description: "OpenAI API key"
         required: true
-
   workflow_dispatch:
     inputs:
       mode:
-        description: "実行モード: full / incremental"
+        description: "実行モード: full(全生成) / incremental(差分)"
         required: false
         default: "full"
         type: choice
         options: ["full", "incremental"]
       model:
-        description: "OpenAI モデル名（任意）"
+        description: "OpenAI モデル名 (任意)"
         required: false
         default: ""
         type: string
@@ -46,29 +46,25 @@ jobs:
       SPEC_DIRS: "foundation env-profiles features tests"
       PROMPT_FILE: "ai/prompt.md"
       PATCH_FILE: "ai/patch.diff"
-      ALLOWLIST_FILE: "ai/allowlist.txt"
       MODEL_DEFAULT: "gpt-4o-mini"
-      OPENAI_MODEL: "${{ inputs.model || '' }}"
-      MODE: "${{ inputs.mode || 'full' }}"
+      OPENAI_MODEL: "${{ inputs.model }}"
+      MODE: "${{ inputs.mode }}"
 
     steps:
       - name: "Checkout"
-        uses: actions/checkout@v4
+        uses: "actions/checkout@v4"
 
+      # Lock があるときだけ Node の cache を有効化
       - name: "Setup Node (cache if lock exists)"
         if: ${{ hashFiles('**/package-lock.json', '**/npm-shrinkwrap.json', '**/yarn.lock') != '' }}
-        uses: actions/setup-node@v4
+        uses: "actions/setup-node@v4"
         with:
           node-version: "20"
           cache: "npm"
-          cache-dependency-path: |
-            **/package-lock.json
-            **/npm-shrinkwrap.json
-            **/yarn.lock
 
       - name: "Setup Node (no cache)"
         if: ${{ hashFiles('**/package-lock.json', '**/npm-shrinkwrap.json', '**/yarn.lock') == '' }}
-        uses: actions/setup-node@v4
+        uses: "actions/setup-node@v4"
         with:
           node-version: "20"
 
@@ -76,154 +72,117 @@ jobs:
         shell: "bash"
         run: |
           set -euo pipefail
-          if [ -z "${{ secrets.OPENAI_API_KEY }}" ]; then
-            echo "::error::OPENAI_API_KEY is not set."; exit 1
+          if [ -z "${OPENAI_API_KEY:-}" ]; then
+            echo "::error::OPENAI_API_KEY is not set"
+            exit 1
           fi
+          mkdir -p "ai" "tools"
 
       - name: "Compose prompt from spec (no-heredoc)"
         shell: "bash"
         run: |
           set -euo pipefail
-          mkdir -p ai
           : > "$PROMPT_FILE"
-          printf "%s\n" "OUTPUT ONLY UNIFIED DIFF. NO PROSE. NO MARKDOWN. NO FENCES." >> "$PROMPT_FILE"
-          for d in $SPEC_DIRS; do
-            dir="$SPEC_ROOT/$d"
-            [ -d "$dir" ] || continue
-            while IFS= read -r f; do
-              printf "\n\n### %s\n" "$f" >> "$PROMPT_FILE"
-              cat "$f" >> "$PROMPT_FILE"
-            done < <(find "$dir" -type f \( -name "*.md" -o -name "*.txt" -o -name "*.yml" -o -name "*.yaml" -o -name "*.json" \) | sort)
-          done
+          printf "%s\n" "# Codex generation prompt" >> "$PROMPT_FILE"
+          printf "%s\n" "" >> "$PROMPT_FILE"
+          printf "%s\n" "## Mode: ${MODE}" >> "$PROMPT_FILE"
+          printf "%s\n" "" >> "$PROMPT_FILE"
 
-      - name: "Build allowlist (protect)"
-        shell: "bash"
-        run: |
-          set -euo pipefail
-          : > "$ALLOWLIST_FILE"
-          printf "%s\n" \
-            "src/**" \
-            "tests/**" \
-            "tools/**" \
-            "public/**" \
-            "storage/**" \
-            ".htaccess" \
-            "env-lite.php" \
-            "health-lite.php" \
-            > "$ALLOWLIST_FILE"
+          tmp_list="$(mktemp)"
+          for d in $SPEC_DIRS; do
+            if [ -d "${SPEC_ROOT}/${d}" ]; then
+              find "${SPEC_ROOT}/${d}" -type f \
+                \( -name "*.md" -o -name "*.txt" -o -name "*.yaml" -o -name "*.yml" -o -name "*.json" \) \
+                >> "$tmp_list"
+            fi
+          done
+          if [ -s "$tmp_list" ]; then
+            LC_ALL=C sort "$tmp_list" -o "$tmp_list"
+            while IFS= read -r f; do
+              printf "%s\n" "" >> "$PROMPT_FILE"
+              printf "%s\n" "### $(basename "$f")" >> "$PROMPT_FILE"
+              printf "%s\n" "" >> "$PROMPT_FILE"
+              # 改行コードを正規化
+              sed -e 's/\r$//' "$f" >> "$PROMPT_FILE"
+              printf "%s\n" "" >> "$PROMPT_FILE"
+            done < "$tmp_list"
+          fi
+          rm -f "$tmp_list"
 
       - name: "Create tools/run_codex.js (no heredoc)"
         shell: "bash"
         run: |
           set -euo pipefail
-          mkdir -p tools
+          mkdir -p tools ai
           rm -f tools/run_codex.js
-          {
-            printf "%s\n" "'use strict';"
-            printf "%s\n" "const fs = require('fs');"
-            printf "%s\n" "const path = require('path');"
-            printf "%s\n" "const https = require('https');"
-            printf "%s\n" "const PROMPT_FILE = process.env.PROMPT_FILE || 'ai/prompt.md';"
-            printf "%s\n" "const PATCH_FILE  = process.env.PATCH_FILE  || 'ai/patch.diff';"
-            printf "%s\n" "const MODEL = (process.env.OPENAI_MODEL && process.env.OPENAI_MODEL.length>0) ? process.env.OPENAI_MODEL : (process.env.MODEL_DEFAULT||'gpt-4o-mini');"
-            printf "%s\n" "const KEY = process.env.OPENAI_API_KEY;"
-            printf "%s\n" "if (!KEY) { console.error('OPENAI_API_KEY missing'); process.exit(2); }"
-            printf "%s\n" "const prompt = fs.readFileSync(PROMPT_FILE, 'utf8');"
-            printf "%s\n" "const body = JSON.stringify({"
-            printf "%s\n" "  model: MODEL,"
-            printf "%s\n" "  input: [{ role: 'user', content: prompt + '\\n\\nReturn only a unified diff patch (UTF-8), root at repository.' }]"
-            printf "%s\n" "});"
-            printf "%s\n" "const req = https.request({"
-            printf "%s\n" "  hostname: 'api.openai.com',"
-            printf "%s\n" "  path: '/v1/responses',"
-            printf "%s\n" "  method: 'POST',"
-            printf "%s\n" "  headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + KEY }"
-            printf "%s\n" "}, res => {"
-            printf "%s\n" "  let data='';"
-            printf "%s\n" "  res.on('data', c => data += c);"
-            printf "%s\n" "  res.on('end', () => {"
-            printf "%s\n" "    if (res.statusCode && res.statusCode >= 300) { console.error('OpenAI error', res.statusCode, data); process.exit(3); }"
-            printf "%s\n" "    try {"
-            printf "%s\n" "      const j = JSON.parse(data);"
-            printf "%s\n" "      const out = (j.output_text || j.output || '').trim();"
-            printf "%s\n" "      if (!out || out.indexOf('+++') === -1 || out.indexOf('---') === -1) { console.error('model did not return a unified diff'); process.exit(4); }"
-            printf "%s\n" "      fs.mkdirSync(path.dirname(PATCH_FILE), { recursive: true });"
-            printf "%s\n" "      fs.writeFileSync(PATCH_FILE, out, 'utf8');"
-            printf "%s\n" "      console.log('patch written');"
-            printf "%s\n" "    } catch (e) { console.error('parse error', e.message); process.exit(5); }"
-            printf "%s\n" "  });"
-            printf "%s\n" "});"
-            printf "%s\n" "req.on('error', err => { console.error('request error', err.message); process.exit(6); });"
-            printf "%s\n" "req.write(body);"
-            printf "%s\n" "req.end();"
-          } >> tools/run_codex.js
+          printf "%s\n" "'use strict';" >> tools/run_codex.js
+          printf "%s\n" "const fs = require('fs');" >> tools/run_codex.js
+          printf "%s\n" "const path = require('path');" >> tools/run_codex.js
+          printf "%s\n" "const https = require('https');" >> tools/run_codex.js
+          printf "%s\n" "const PROMPT_FILE = process.env.PROMPT_FILE || 'ai/prompt.md';" >> tools/run_codex.js
+          printf "%s\n" "const PATCH_FILE  = process.env.PATCH_FILE  || 'ai/patch.diff';" >> tools/run_codex.js
+          printf "%s\n" "const MODEL = (process.env.OPENAI_MODEL && process.env.OPENAI_MODEL.length>0) ? process.env.OPENAI_MODEL : (process.env.MODEL_DEFAULT||'gpt-4o-mini');" >> tools/run_codex.js
+          printf "%s\n" "const KEY = process.env.OPENAI_API_KEY;" >> tools/run_codex.js
+          printf "%s\n" "function extractText(j){" >> tools/run_codex.js
+          printf "%s\n" "  if (!j) return '';" >> tools/run_codex.js
+          printf "%s\n" "  if (typeof j.output_text === 'string') return j.output_text;" >> tools/run_codex.js
+          printf "%s\n" "  if (Array.isArray(j.output_text)) return j.output_text.join('');" >> tools/run_codex.js
+          printf "%s\n" "  if (typeof j.output === 'string') return j.output;" >> tools/run_codex.js
+          printf "%s\n" "  if (Array.isArray(j.output)) return j.output.map(x => (typeof x==='string'?x:(x?.text||x?.content||''))).join('');" >> tools/run_codex.js
+          printf "%s\n" "  if (j.choices && j.choices.length){" >> tools/run_codex.js
+          printf "%s\n" "    const c0=j.choices[0];" >> tools/run_codex.js
+          printf "%s\n" "    if (c0?.message?.content){ if (Array.isArray(c0.message.content)) return c0.message.content.map(c=>c.text||c.string||'').join(''); return c0.message.content; }" >> tools/run_codex.js
+          printf "%s\n" "    if (typeof c0?.text==='string') return c0.text;" >> tools/run_codex.js
+          printf "%s\n" "  }" >> tools/run_codex.js
+          printf "%s\n" "  if (typeof j.data==='string') return j.data;" >> tools/run_codex.js
+          printf "%s\n" "  return '';" >> tools/run_codex.js
+          printf "%s\n" "}" >> tools/run_codex.js
+          printf "%s\n" "if (!KEY) { console.error('OPENAI_API_KEY missing'); process.exit(2); }" >> tools/run_codex.js
+          printf "%s\n" "const prompt = fs.readFileSync(PROMPT_FILE, 'utf8');" >> tools/run_codex.js
+          printf "%s\n" "const body = JSON.stringify({ model: MODEL, input: [{ role: 'user', content: prompt + '\\n\\nReturn only a unified diff patch (UTF-8), root at repository.' }] });" >> tools/run_codex.js
+          printf "%s\n" "const req = https.request({ hostname: 'api.openai.com', path: '/v1/responses', method: 'POST', headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer '+KEY } }, (res)=>{" >> tools/run_codex.js
+          printf "%s\n" "  let data=''; res.on('data',c=>data+=c); res.on('end',()=>{" >> tools/run_codex.js
+          printf "%s\n" "    if (res.statusCode>=300){ console.error('OpenAI error',res.statusCode); try{fs.writeFileSync('ai/response.error.json',data);}catch(e){} process.exit(3); }" >> tools/run_codex.js
+          printf "%s\n" "    try{" >> tools/run_codex.js
+          printf "%s\n" "      const j=JSON.parse(data);" >> tools/run_codex.js
+          printf "%s\n" "      const out=String(extractText(j)||'').trim();" >> tools/run_codex.js
+          printf "%s\n" "      if (!out || out.indexOf('--- ')===-1 || out.indexOf('+++ ')===-1){ console.error('model did not return a unified diff'); try{fs.writeFileSync('ai/response.debug.json',data);}catch(e){} process.exit(4); }" >> tools/run_codex.js
+          printf "%s\n" "      fs.mkdirSync(path.dirname(PATCH_FILE),{recursive:true}); fs.writeFileSync(PATCH_FILE,out,'utf8'); console.log('patch written');" >> tools/run_codex.js
+          printf "%s\n" "    }catch(e){ console.error('parse error',e.message); try{fs.writeFileSync('ai/response.parse.json',data);}catch(_){} process.exit(5); }" >> tools/run_codex.js
+          printf "%s\n" "  });" >> tools/run_codex.js
+          printf "%s\n" "});" >> tools/run_codex.js
+          printf "%s\n" "req.on('error',err=>{ console.error('request error',err.message); process.exit(6); });" >> tools/run_codex.js
+          printf "%s\n" "req.write(body); req.end();" >> tools/run_codex.js
 
       - name: "Run Codex (node, no chmod)"
         shell: "bash"
         env:
           OPENAI_API_KEY: "${{ secrets.OPENAI_API_KEY }}"
-          OPENAI_MODEL: "${{ env.OPENAI_MODEL }}"
-          PROMPT_FILE:  "${{ env.PROMPT_FILE }}"
-          PATCH_FILE:   "${{ env.PATCH_FILE }}"
         run: |
           set -euo pipefail
           node -v
           node tools/run_codex.js
 
-      - name: "Write verify script (no heredoc)"
+      - name: "Normalize & verify patch (no heredoc)"
         shell: "bash"
         run: |
           set -euo pipefail
-          mkdir -p tools
-          : > tools/verify_patch.py
-          printf "%s\n" "import os, sys, re, pathlib" >> tools/verify_patch.py
-          printf "%s\n" "p = pathlib.Path(os.environ.get('PATCH_FILE','ai/patch.diff'))" >> tools/verify_patch.py
-          printf "%s\n" "if not p.exists():" >> tools/verify_patch.py
-          printf "%s\n" "    sys.stderr.write('patch not found\\n'); sys.exit(1)" >> tools/verify_patch.py
-          printf "%s\n" "txt = p.read_text(encoding='utf-8')" >> tools/verify_patch.py
-          printf "%s\n" "txt = re.sub(r'^\\s*```.*?\\n', '', txt, flags=re.M)" >> tools/verify_patch.py
-          printf "%s\n" "if 'diff --git ' not in txt and '--- ' not in txt:" >> tools/verify_patch.py
-          printf "%s\n" "    sys.stderr.write('not a unified diff\\n'); sys.exit(2)" >> tools/verify_patch.py
-          printf "%s\n" "p.write_text(txt, encoding='utf-8')" >> tools/verify_patch.py
-          printf "%s\n" "print('patch verified')" >> tools/verify_patch.py
-
-      - name: "Normalize & verify patch"
-        shell: "bash"
-        env:
-          PATCH_FILE: "${{ env.PATCH_FILE }}"
-        run: |
-          set -euo pipefail
-          python3 tools/verify_patch.py
-
-      - name: "Apply patch (no commit yet)"
-        shell: "bash"
-        env:
-          PATCH_FILE: "${{ env.PATCH_FILE }}"
-          MODE: "${{ env.MODE }}"
-        run: |
-          set -euo pipefail
-          git apply --whitespace=nowarn "$PATCH_FILE" || { echo "::error::failed to apply patch"; exit 1; }
-
-      - name: "Commit & PR"
-        shell: "bash"
-        env:
-          MODE: "${{ env.MODE }}"
-        run: |
-          set -euo pipefail
-          if git status --porcelain | grep . >/dev/null 2>&1; then
-            git config user.name  "ci-bot"
-            git config user.email "ci-bot@example.invalid"
-            git add -A
-            git commit -m "chore(ai): apply Codex changes ($MODE)"
-          else
-            echo "No changes"; exit 0
+          if [ ! -f "${PATCH_FILE}" ]; then
+            echo "::error::patch not found"
+            exit 1
           fi
+          # 改行コードの正規化
+          perl -pi -e 's/\r$//' "${PATCH_FILE}"
+          if ! grep -q "^--- " "${PATCH_FILE}" || ! grep -q "^+++ " "${PATCH_FILE}"; then
+            echo "::error::not a unified diff"
+            exit 1
+          fi
+          echo "patch verified"
 
-      - name: "Create Pull Request"
-        uses: peter-evans/create-pull-request@v6
+      - name: "Upload response debug (if any)"
+        if: ${{ failure() }}
+        uses: "actions/upload-artifact@v4"
         with:
-          title: "AI: apply Codex changes (${{ env.MODE }})"
-          branch: "ai/codex/batch-${{ github.run_id }}"
-          commit-message: "chore(ai): apply Codex changes"
-          body: "Generated by reusable workflow (no heredoc)."
-          labels: "ai,autogen"
+          name: "ai-response-debug"
+          path: "ai/*.json"
+          if-no-files-found: "ignore"
