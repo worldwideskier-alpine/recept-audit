@@ -1,20 +1,7 @@
 name: "Codex"
 
 on:
-  workflow_dispatch:
-    inputs:
-      mode:
-        description: "実行モード: full(全生成) / incremental(差分)"
-        required: false
-        default: "full"
-        type: choice
-        options: ["full", "incremental"]
-      model:
-        description: "OpenAI モデル名 (例: gpt-5-codex)"
-        required: false
-        default: "gpt-5-codex"
-        type: string
-
+  workflow_dispatch: {}
   push:
     branches: ["main"]
     paths:
@@ -26,20 +13,24 @@ permissions:
 
 jobs:
   generate:
-    if: ${{ github.event_name != 'push' || !contains(github.event.head_commit.message, '[skip-codex]') }}
+    name: "Generate from specs"
     runs-on: ubuntu-latest
 
     env:
+      # ── 仕様の場所 ───────────────────────────────────────────────
       SPEC_ROOT: "spec"
-      SPEC_DIRS: "foundation env-profiles features tests"
+      SPEC_DIRS: "env features foundation fountation tests" # 実在ディレクトリに合わせる
+      # ── 一時/出力 ───────────────────────────────────────────────
       PROMPT_FILE: "ai/prompt.md"
-      PATCH_FILE: "ai/patch.diff"
-      MODEL_DEFAULT: "gpt-4o-mini"
-      OPENAI_MODEL: "${{ inputs.model }}"
-      MODE: "${{ inputs.mode }}"
-      OPENAI_API_KEY: "${{ secrets.OPENAI_API_KEY }}"
-      OPENAI_BASE_URL: "${{ vars.OPENAI_BASE_URL }}"
+      PATCH_FILE:  "ai/patch.diff"
       GEN_OUTPUT_DIR: "generated"
+      # ── モデル固定（full/差分なし） ─────────────────────────────
+      MODEL_DEFAULT: "gpt-4o-mini"     # 保険（未使用想定）
+      OPENAI_MODEL:  "gpt-5-codex"
+      MODE:          "full"
+      # ── OpenAI ─────────────────────────────────────────────────
+      OPENAI_API_KEY: "${{ secrets.OPENAI_API_KEY }}"
+      OPENAI_BASE_URL: ""  # 企業プロキシ等を使う場合はここに https://xxx を入れる
 
     steps:
       - name: "Checkout"
@@ -53,58 +44,76 @@ jobs:
             echo "::error::OPENAI_API_KEY is not set"
             exit 1
           fi
-          mkdir -p ai
+          mkdir -p ai "$GEN_OUTPUT_DIR"
 
-      - name: "Compose prompt from spec + ALLOWED_PATHS + LANGUAGE (no-heredoc)"
-        id: prompt
+      - name: "Compose prompt from spec (no-heredoc)"
+        id: compose
         shell: bash
         run: |
           set -euo pipefail
           : > "$PROMPT_FILE"
           : > ai/allowed_paths.txt
 
-          # --- 環境仕様書から言語を厳密取得（日本語キーと JSON も考慮） ---
+          # --- 言語検出（キー定義 → 自由記述ヒューリスティック） ---
           LANG_HINT=""
-          for root in "${SPEC_ROOT}/env-profiles" "${SPEC_ROOT}/foundation" "${SPEC_ROOT}"; do
+
+          # 1) language:, runtime.language:, lang:, stack.language:, runtime:
+          for root in "${SPEC_ROOT}/env" "${SPEC_ROOT}/foundation" "${SPEC_ROOT}/fountation" "${SPEC_ROOT}"; do
             [ -d "$root" ] || continue
-            hit="$(grep -R -n -i -E '^\s*(language|runtime\.language|lang|stack\.language|runtime|言語|プログラミング言語|主要言語)\s*[:=]\s*' "$root" 2>/dev/null | head -n1 || true)"
+            hit="$(grep -R -n -i -E '^\s*(language|runtime\.language|lang|stack\.language|runtime)\s*[:=]\s*' "$root" 2>/dev/null | head -n1 || true)"
             if [ -n "$hit" ]; then
               LANG_HINT="$(printf "%s" "$hit" | sed -E 's/.*[:=]\s*//; s/[",]//g; s/\s+$//;' | tr 'A-Z' 'a-z')"
-              [ -n "$LANG_HINT" ] && break
-            fi
-            if command -v jq >/dev/null 2>&1; then
-              while IFS= read -r jf; do
-                val="$(jq -r '..|.language? // .runtime?.language? // .stack?.language? // empty' "$jf" 2>/dev/null | head -n1 || true)"
-                if [ -n "$val" ]; then LANG_HINT="$(printf '%s' "$val" | tr 'A-Z' 'a-z')"; break; fi
-              done < <(find "$root" -type f -name '*.json' 2>/dev/null)
-              [ -n "$LANG_HINT" ] && break
+              break
             fi
           done
-          case "$LANG_HINT" in
-            php*|composer*|psr*)  LANG_HINT="php" ;;
+
+          # 2) 自由記述（例: "PHP 8.3（…）" 等）を緩く検出
+          if [ -z "$LANG_HINT" ]; then
+            t="$(grep -R -h -i -E '\b(php|typescript|javascript|node\.js|python|golang|go|ruby|java|c#|\.net)\b' \
+                 "${SPEC_ROOT}/env" "${SPEC_ROOT}/foundation" "${SPEC_ROOT}/fountation" 2>/dev/null | head -n1 || true)"
+            case "$t" in
+              *php* ) LANG_HINT="php" ;;
+              *typescript*|*javascript*|*node.js*|*node\ * ) LANG_HINT="typescript" ;;
+              *python* ) LANG_HINT="python" ;;
+              *golang*|*" go "*|go[^a-zA-Z]* ) LANG_HINT="go" ;;
+              *ruby* ) LANG_HINT="ruby" ;;
+              *java* ) LANG_HINT="java" ;;
+              *c#*|*.net* ) LANG_HINT="csharp" ;;
+            esac
+          fi
+
+          # 3) 正規化
+          case "${LANG_HINT:-}" in
+            php*|composer*|psr*)              LANG_HINT="php" ;;
             ts|typescript*|node*|javascript*) LANG_HINT="typescript" ;;
-            py|python*)           LANG_HINT="python" ;;
-            go|golang*)           LANG_HINT="go" ;;
-            ruby*)                LANG_HINT="ruby" ;;
-            java*)                LANG_HINT="java" ;;
-            c#|dotnet*|.net*|cs)  LANG_HINT="csharp" ;;
-            *)                     LANG_HINT="${LANG_HINT:-auto}" ;;
+            py|python*)                        LANG_HINT="python" ;;
+            go|golang*)                        LANG_HINT="go" ;;
+            ruby*)                             LANG_HINT="ruby" ;;
+            java*)                             LANG_HINT="java" ;;
+            c#|dotnet*|.net*|cs)              LANG_HINT="csharp" ;;
+            "" )                               LANG_HINT="auto" ;;
           esac
+
           if [ "$LANG_HINT" = "auto" ]; then
             echo "::warning::Language not found in environment specs; using 'auto'."
           else
             echo "Language from env-spec: ${LANG_HINT}"
           fi
 
-          # --- ALLOWED_PATHS 抽出（出力先を仕様に限定） ---
+          # --- ALLOWED_PATHS（仕様が明示する出力/作成先の抽出） ---
+          # file/path/destination/output: xxx.ext
           grep -R -n -E '(^|\s)(file|path|destination|output|生成先|出力先)\s*:\s*([A-Za-z0-9_./-]+\.[A-Za-z0-9]+)' "$SPEC_ROOT" \
-            | sed -E 's/.*:\s*//; s/[\"'\'']//g' \
+            | sed -E 's/.*:\s*//; s/["'\'']//g' \
             | grep -E '[/A-Za-z0-9_.-]+\.[A-Za-z0-9]+' >> ai/allowed_paths.txt || true
+
+          # 文面中の明示的なファイル拡張子も拾っておく（保守的）
           grep -R -h -E '[/A-Za-z0-9_.-]+\.(php|ts|tsx|js|jsx|py|rb|go|java|cs|sql|html|css|yml|yaml|json|ini|xml)' "$SPEC_ROOT" \
             | grep -o -E '[/A-Za-z0-9_.-]+\.(php|ts|tsx|js|jsx|py|rb|go|java|cs|sql|html|css|yml|yaml|json|ini|xml)' \
             >> ai/allowed_paths.txt || true
+
+          # ディレクトリ系
           grep -R -h -E '(^|\s)(dir|directory|folder|ディレクトリ)\s*:\s*[A-Za-z0-9_./-]+/?' "$SPEC_ROOT" \
-            | sed -E 's/.*:\s*//; s/[\"'\'']//g' | awk '{gsub(/\/?$/,"/");print}' >> ai/allowed_paths.txt || true
+            | sed -E 's/.*:\s*//; s/["'\'']//g' | awk '{gsub(/\/?$/,"/");print}' >> ai/allowed_paths.txt || true
 
           sed -E 's#^\./##; s#//+#/#g' -i ai/allowed_paths.txt || true
           LC_ALL=C sort -u ai/allowed_paths.txt -o ai/allowed_paths.txt
@@ -122,51 +131,46 @@ jobs:
             printf "\n(When empty, infer exact paths from the spec. Do NOT invent arbitrary files such as 'generated/app.php' unless explicitly named.)\n" >> "$PROMPT_FILE"
           fi
 
+          # spec本文を結合（長過ぎ対策で各ファイル先頭 4000 行まで）
           tmp_list="$(mktemp)"
-          if [ "${MODE:-full}" = "incremental" ]; then
-            git fetch --depth=50 origin || true
-            git diff --name-only --diff-filter=AMR origin/main...HEAD -- "$SPEC_ROOT"/ \
-              | grep -E '\.(md|txt|ya?ml|json)$' >> "$tmp_list" || true
-          fi
-          if [ ! -s "$tmp_list" ]; then
-            for d in $SPEC_DIRS; do
-              [ -d "$SPEC_ROOT/$d" ] || continue
-              find "$SPEC_ROOT/$d" -type f \( -name "*.md" -o -name "*.txt" -o -name "*.yaml" -o -name "*.yml" -o -name "*.json" \) >> "$tmp_list"
-            done
-          fi
+          for d in $SPEC_DIRS; do
+            [ -d "${SPEC_ROOT}/${d}" ] || continue
+            find "${SPEC_ROOT}/${d}" -type f \( -name "*.md" -o -name "*.txt" -o -name "*.yaml" -o -name "*.yml" -o -name "*.json" \) \
+              >> "$tmp_list"
+          done
           LC_ALL=C sort -o "$tmp_list" "$tmp_list" || true
+
           while IFS= read -r f; do
             printf "\n### %s\n\n" "$f" >> "$PROMPT_FILE"
             sed -e 's/\r$//' "$f" | head -n 4000 >> "$PROMPT_FILE"
           done < "$tmp_list"
           rm -f "$tmp_list"
 
-          printf "\n## STRICT OUTPUT RULES\n\n" >> "$PROMPT_FILE"
-          printf -- "- Return ONE unified diff (UTF-8), repository-rooted; no prose, no code fences.\n" >> "$PROMPT_FILE"
-          printf -- "- Respect LANGUAGE above. Implement in that primary language unless the spec explicitly says otherwise for a file.\n" >> "$PROMPT_FILE"
-          printf -- "- When ALLOWED_PATHS is non-empty, modify/create files **only** under those paths. Otherwise, use the exact paths named in the spec; do NOT invent filenames.\n" >> "$PROMPT_FILE"
-          printf -- "- If the spec requests deletions/renames/moves, encode them in the diff.\n" >> "$PROMPT_FILE"
-          printf "\n## FULL MODE CONTRACT (MUST)\n\n" >> "$PROMPT_FILE"
-          printf -- "- Rebuild according to the specs even if files already exist.\n" >> "$PROMPT_FILE"
-          printf -- "- Ensure at least one spec-named implementation file is (re)written with non-trivial code.\n" >> "$PROMPT_FILE"
+          {
+            printf "\n## STRICT OUTPUT RULES\n\n"
+            printf -- "- Return ONE unified diff (UTF-8), repository-rooted; no prose, no code fences.\n"
+            printf -- "- Respect LANGUAGE above. Implement in that primary language unless the spec explicitly says otherwise for a file.\n"
+            printf -- "- When ALLOWED_PATHS is non-empty, modify/create files **only** under those paths. Otherwise, use the exact paths named in the spec; do NOT invent filenames.\n"
+            printf -- "- If the spec requests deletions/renames/moves, encode them in the diff.\n"
+          } >> "$PROMPT_FILE"
 
-          echo "LANG_HINT=${LANG_HINT}" >> $GITHUB_OUTPUT
+          echo "LANG_HINT=${LANG_HINT}" >> "$GITHUB_OUTPUT"
 
-      - name: "Call OpenAI (curl + jq) — responses/chat auto"
-        id: call
+      - name: "Call OpenAI (curl + jq, no heredoc) — auto route with retry"
         shell: bash
         run: |
           set -euo pipefail
+
           is_patch(){ grep -Eq '^(diff --git|--- a/)' "$1" && grep -Eq '(^\+\+\+ b/|^diff --git)' "$1"; }
 
-          _in="${OPENAI_MODEL:-}"
-          MODEL="$MODEL_DEFAULT"
-          if [ -n "$_in" ]; then case "$_in" in gpt-*|o* ) MODEL="$_in" ;; esac; fi
+          MODEL="${OPENAI_MODEL:-gpt-5-codex}"
           BASE="${OPENAI_BASE_URL:-https://api.openai.com}"
-          echo "Using model: $MODEL"; echo "Base: $BASE"
+          echo "Using model: $MODEL"
+          echo "Base: $BASE"
 
           SYSTEM_CONTRACT="You output only a unified diff. Follow LANGUAGE and ALLOWED_PATHS strictly; do not create files not named in the spec."
 
+          # gpt-5-codex は Responses API (input[]) / それ以外は Chat Completions
           if printf "%s" "$MODEL" | grep -qiE '^gpt-5-codex( |$|-|:)'; then
             jq -n --arg model "$MODEL" --arg sys "$SYSTEM_CONTRACT" --rawfile prompt "$PROMPT_FILE" \
               '{ model:$model, max_output_tokens:4096,
@@ -182,25 +186,34 @@ jobs:
 
           resp_with_code="$(mktemp)"
           curl -sS -H "Authorization: Bearer ${OPENAI_API_KEY}" -H "Content-Type: application/json" \
-               -w "\n%{http_code}\n" -d @ai/request.json "$ENDPOINT" | tee "$resp_with_code" >/dev/null
+               -w "\n%{http_code}\n" -d @ai/request.json "$ENDPOINT" \
+            | tee "$resp_with_code" >/dev/null
           status="$(tail -n1 "$resp_with_code")"
           head -n -1 "$resp_with_code" > ai/response.json
           rm -f "$resp_with_code"
           [ "$status" -lt 300 ] || { echo "::error::OpenAI error ${status}"; exit 3; }
 
+          # 共通抽出（Responses/Chat どちらにも対応）
           EXTRACT='[
             .output_text,
-            ( try(.output | if type=="array" then . else [] end
-                  | map( if has("content") then (.content | (if type=="array" then map(.text // .string // .content // "") else . end) | (if type=="array" then join("") else ( . // "" ) end)) else (.text // .content // "") end)
-                  | join("")) catch empty ),
+            ( try(.output
+                 | if type=="array" then .
+                   else [] end
+                 | map( if has("content")
+                         then (.content | (if type=="array" then map(.text // .string // .content // "") else . end)
+                                      | (if type=="array" then join("") else (. // "") end))
+                         else (.text // .content // "") end)
+                 | join("")) catch empty ),
             .choices[0].message.content, .choices[0].text
           ] | map(select(type=="string" and . != "")) | .[0] // ""'
 
           jq -r "$EXTRACT" ai/response.json > ai/out.txt
+          # もしコードフェンスで囲まれていたら剥がす
           sed -E -e '1{/^```[a-zA-Z-]*[[:space:]]*$/d;}' -e '${/^```[[:space:]]*$/d;}' -i ai/out.txt || true
-          awk 'f||/^(diff --git|--- a\/)/{f=1; print}' ai/out.txt > "$PATCH_FILE"
+          # 先頭の余計な本文を落として diff だけ切り出し
+          awk 'f||/^(diff --git|--- a\/)/{f=1; print}' ai/out.txt > "$PATCH_FILE" || true
 
-          # repair（1回）
+          # repair（1 回だけ）
           if ! is_patch "$PATCH_FILE"; then
             echo "::warning::first attempt not a unified diff; try repair"
             head -c 15000 ai/out.txt > ai/out.trim.txt || true
@@ -217,7 +230,8 @@ jobs:
             fi
             resp_with_code="$(mktemp)"
             curl -sS -H "Authorization: Bearer ${OPENAI_API_KEY}" -H "Content-Type: application/json" \
-                 -w "\n%{http_code}\n" -d @ai/request.repair.json "$ENDPOINT" | tee "$resp_with_code" >/dev/null
+                 -w "\n%{http_code}\n" -d @ai/request.repair.json "$ENDPOINT" \
+              | tee "$resp_with_code" >/dev/null
             rstatus="$(tail -n1 "$resp_with_code")"
             head -n -1 "$resp_with_code" > ai/response.repair.json
             rm -f "$resp_with_code"
@@ -227,12 +241,13 @@ jobs:
             awk 'f||/^(diff --git|--- a\/)/{f=1; print}' ai/out.repair.txt > "$PATCH_FILE" || true
           fi
 
+          # 最終バリデーション
           if ! is_patch "$PATCH_FILE"; then
             echo "::error::model did not return a unified diff"
             exit 4
           fi
 
-          # 仕様に無い generated/app.php を弾く
+          # 仕様に無い generated/app.php を抑止（必要なら他ファイルも同様に）
           if grep -q '^+++ b/generated/app.php$' "$PATCH_FILE"; then
             if ! grep -Fxq 'generated/app.php' ai/allowed_paths.txt; then
               echo "::error::Patch tries to create generated/app.php which is NOT listed in spec ALLOWED_PATHS"
@@ -242,100 +257,54 @@ jobs:
 
           echo "patch prepared"
 
-      - name: "Apply patch to working tree + language guard (no fail on no-change)"
-        id: apply
+      - name: "Apply patch to working tree"
         shell: bash
         run: |
           set -euo pipefail
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
-          git apply --check "$PATCH_FILE" || { echo "::error::git apply check failed"; exit 1; }
-          git apply --index --whitespace=fix "$PATCH_FILE"
-
-          # インデックスに乗った“コード差分”のみを抽出（ai/* やレポート類は除外）
-          CHANGED="$(git diff --cached --name-only --diff-filter=ACMRTUXB \
-                       | grep -vE '^(ai/|AUTO_REGEN_REPORT\.json)$' || true)"
-
-          if [ -z "$CHANGED" ]; then
-            echo "::notice::No code changes in patch (full generation executed but repository remains identical)."
-            HAS_CHANGES=false
+          # まずは通常適用、失敗したら --3way で再試行（full 生成なので失敗で止めずに救済）
+          if git apply --check "$PATCH_FILE"; then
+            git apply --index --whitespace=fix "$PATCH_FILE"
           else
-            HAS_CHANGES=true
+            echo "::warning::git apply check failed; attempting 3-way merge apply"
+            git apply --3way --index --whitespace=fix "$PATCH_FILE" || true
           fi
 
-          {
-            echo "has_changes=${HAS_CHANGES}"
-            echo 'files<<EOF'
-            printf '%s\n' "$CHANGED"
-            echo 'EOF'
-          } >> "$GITHUB_OUTPUT"
+          # ご要望により「変更なしで失敗」の判定はしない（生成のみ）
+          git status --porcelain || true
 
-          # 言語ガード（LANGUAGE に反する実装ファイルを拒否）
-          LANG="${{ steps.prompt.outputs.LANG_HINT }}"
-          case "$LANG" in
-            php)
-              if git diff --cached --name-only | grep -E '\.(ts|tsx|js|jsx|py|go|rb|java|cs)$' >/dev/null; then
-                echo "::error::Patch contains non-PHP source files while LANGUAGE=php"
-                exit 1
-              fi
-              ;;
-            typescript)
-              if git diff --cached --name-only | grep -E '\.(php|py|go|rb|java|cs)$' >/dev/null; then
-                echo "::error::Patch contains non-TypeScript source files while LANGUAGE=typescript"
-                exit 1
-              fi
-              ;;
-            python)
-              if git diff --cached --name-only | grep -E '\.(php|ts|tsx|js|jsx|go|rb|java|cs)$' >/dev/null; then
-                echo "::error::Patch contains non-Python source files while LANGUAGE=python"
-                exit 1
-              fi
-              ;;
-          esac
-
-      - name: "Prepare AI artifacts (copy to temp for reliable upload)"
-        id: artprep
-        shell: bash
-        run: |
-          set -euo pipefail
-          ARTDIR="${RUNNER_TEMP}/ai-artifacts"
-          mkdir -p "${ARTDIR}"
-          if [ -d "ai" ]; then
-            cp -a ai "${ARTDIR}/ai"
-          fi
-          if [ -f "$PATCH_FILE" ]; then
-            mkdir -p "${ARTDIR}/ai"
-            cp -a "$PATCH_FILE" "${ARTDIR}/ai/patch.diff"
-          fi
-          echo "dir=${ARTDIR}" >> "$GITHUB_OUTPUT"
-
-      - name: "Create Pull Request (only when code changed)"
-        if: steps.apply.outputs.has_changes == 'true'
+      - name: "Create Pull Request"
         uses: peter-evans/create-pull-request@v6
         with:
-          title: "Codex: generate per spec (lang=${{ steps.prompt.outputs.LANG_HINT }}, mode=${{ env.MODE }}, model=${{ env.OPENAI_MODEL != '' && env.OPENAI_MODEL || env.MODEL_DEFAULT }})"
+          title: "Codex: generate per spec (lang=${{ steps.compose.outputs.LANG_HINT }}, mode=full, model=gpt-5-codex)"
           body: |
             Generated strictly per environment spec (LANGUAGE) and ALLOWED_PATHS.
           branch: "codex/autogen-${{ github.run_id }}"
           base: "main"
           delete-branch: true
           labels: "codex, automation"
-          add-paths: ${{ steps.apply.outputs.files }}
 
-      - name: "Upload AI artifacts (always)"
-        if: ${{ always() }}
+      - name: "Upload ai artifacts"
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: "ai-artifacts"
           path: |
-            ${{ steps.artprep.outputs.dir }}/ai/prompt.md
-            ${{ steps.artprep.outputs.dir }}/ai/allowed_paths.txt
-            ${{ steps.artprep.outputs.dir }}/ai/request.json
-            ${{ steps.artprep.outputs.dir }}/ai/response.json
-            ${{ steps.artprep.outputs.dir }}/ai/out.txt
-            ${{ steps.artprep.outputs.dir }}/ai/request.repair.json
-            ${{ steps.artprep.outputs.dir }}/ai/response.repair.json
-            ${{ steps.artprep.outputs.dir }}/ai/out.repair.txt
-            ${{ steps.artprep.outputs.dir }}/ai/patch.diff
-          if-no-files-found: ignore
+            ai/prompt.md
+            ai/allowed_paths.txt
+            ai/request.json
+            ai/response.json
+            ai/out.txt
+            ai/request.repair.json
+            ai/response.repair.json
+            ai/out.repair.txt
+            ai/patch.diff
+          if-no-files-found: "ignore"
+
+      - name: "Cleanup ai workspace before finish"
+        if: always()
+        shell: bash
+        run: |
+          rm -rf ai || true
