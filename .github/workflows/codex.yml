@@ -1,11 +1,16 @@
 name: "Codex"
 
 on:
-  workflow_dispatch: {}
-  push:
-    branches: ["main"]
-    paths:
-      - "spec/**"
+  workflow_dispatch:
+    inputs:
+      openai_model:
+        description: "OpenAI model (default: gpt-5-codex)"
+        required: false
+        default: "gpt-5-codex"
+      mode:
+        description: "full / incremental (default: full)"
+        required: false
+        default: "full"
 
 permissions:
   contents: write
@@ -14,40 +19,57 @@ permissions:
 jobs:
   generate:
     name: "Generate from specs"
-    runs-on: ubuntu-latest
+    runs-on: "ubuntu-24.04"
 
     env:
       SPEC_ROOT: "spec"
       SPEC_DIRS: "env features foundation fountation tests"
       PROMPT_FILE: "ai/prompt.md"
-      PATCH_FILE:  "ai/patch.diff"
+      PATCH_FILE: "ai/patch.diff"
+      GEN_OUTPUT_DIR: "generated"
       MODEL_DEFAULT: "gpt-4o-mini"
-      OPENAI_MODEL:  "gpt-5-codex"
+      OPENAI_MODEL: "${{ github.event.inputs.openai_model }}"
+      MODE: "${{ github.event.inputs.mode }}"
       OPENAI_API_KEY: "${{ secrets.OPENAI_API_KEY }}"
-      OPENAI_BASE_URL: ""
+      OPENAI_BASE_URL: "${{ secrets.OPENAI_BASE_URL }}"
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - name: "Checkout"
+        uses: "actions/checkout@v4"
+        with:
+          fetch-depth: "1"
+          set-safe-directory: true
 
-      - name: Preflight
+      - name: "Preflight"
         shell: bash
         run: |
           set -euo pipefail
-          [ -n "${OPENAI_API_KEY:-}" ] || { echo "::error::OPENAI_API_KEY is not set"; exit 1; }
-          rm -rf ai
-          mkdir -p ai generated
+          if [ -z "${OPENAI_API_KEY:-}" ]; then
+            echo "::error::OPENAI_API_KEY is not set"
+            exit 1
+          fi
+          mkdir -p ai "$GEN_OUTPUT_DIR"
+          if [ -z "${OPENAI_MODEL:-}" ]; then
+            OPENAI_MODEL="gpt-5-codex"
+            printf '%s\n' "OPENAI_MODEL=${OPENAI_MODEL}" >> "$GITHUB_ENV"
+          fi
+          if [ -z "${MODE:-}" ]; then
+            MODE="full"
+            printf '%s\n' "MODE=${MODE}" >> "$GITHUB_ENV"
+          fi
 
-      - name: Compose prompt from specs (detect language, allowed paths)
-        id: compose
+      - name: "Compose prompt from specs (detect language, allowed paths)"
+        id: "compose"
         shell: bash
         run: |
           set -euo pipefail
+
           : > "$PROMPT_FILE"
           : > ai/allowed_paths.txt
 
-          # --- language detection (keys -> free text heuristic) ---
+          # --- Language detection ---
           LANG_HINT=""
+
           for root in "${SPEC_ROOT}/env" "${SPEC_ROOT}/foundation" "${SPEC_ROOT}/fountation" "${SPEC_ROOT}"; do
             [ -d "$root" ] || continue
             hit="$(grep -R -n -i -E '^\s*(language|runtime\.language|lang|stack\.language|runtime)\s*[:=]\s*' "$root" 2>/dev/null | head -n1 || true)"
@@ -56,206 +78,117 @@ jobs:
               break
             fi
           done
+
           if [ -z "$LANG_HINT" ]; then
-            t="$(grep -R -h -i -E '\b(php|typescript|javascript|node\.js|node |python|golang|go|ruby|java|kotlin|c#|\.net|csharp)\b' \
+            t="$(grep -R -h -i -E '\b(php|typescript|javascript|node\.js|python|golang|go|ruby|java|c#|\.net)\b' \
                  "${SPEC_ROOT}/env" "${SPEC_ROOT}/foundation" "${SPEC_ROOT}/fountation" 2>/dev/null | head -n1 || true)"
             case "$t" in
               *php* ) LANG_HINT="php" ;;
-              *typescript*|*javascript*|*node.js*|*node\ * ) LANG_HINT="typescript" ;;
+              *typescript*|*javascript*|*node.js*|*'node '* ) LANG_HINT="typescript" ;;
               *python* ) LANG_HINT="python" ;;
               *golang*|*" go "*|go[^a-zA-Z]* ) LANG_HINT="go" ;;
               *ruby* ) LANG_HINT="ruby" ;;
               *java* ) LANG_HINT="java" ;;
-              *kotlin* ) LANG_HINT="kotlin" ;;
-              *c#*|*.net*|*csharp* ) LANG_HINT="csharp" ;;
+              *c#*|*.net* ) LANG_HINT="csharp" ;;
             esac
           fi
-          case "${LANG_HINT:-}" in
-            php*|composer*|psr*) LANG_HINT="php" ;;
-            ts|typescript*|node*|javascript*) LANG_HINT="typescript" ;;
-            py|python*) LANG_HINT="python" ;;
-            go|golang*) LANG_HINT="go" ;;
-            rb|ruby*) LANG_HINT="ruby" ;;
-            java*) LANG_HINT="java" ;;
-            kotlin*) LANG_HINT="kotlin" ;;
-            c#|dotnet*|.net*|cs|csharp) LANG_HINT="csharp" ;;
-            "" ) LANG_HINT="auto" ;;
-          esac
-          echo "lang=${LANG_HINT}" >> "$GITHUB_OUTPUT"
-          [ "$LANG_HINT" = "auto" ] && echo "::warning::Language not found in env specs; using 'auto'."
 
-          # --- ALLOWED_PATHS (from explicit file/dir mentions) ---
+          case "${LANG_HINT:-}" in
+            php*|composer*|psr*)              LANG_HINT="php" ;;
+            ts|typescript*|node*|javascript*) LANG_HINT="typescript" ;;
+            py|python*)                        LANG_HINT="python" ;;
+            go|golang*)                        LANG_HINT="go" ;;
+            ruby*)                             LANG_HINT="ruby" ;;
+            java*)                             LANG_HINT="java" ;;
+            c#|dotnet*|.net*|cs)              LANG_HINT="csharp" ;;
+            "" )                               LANG_HINT="auto" ;;
+          esac
+
+          if [ "$LANG_HINT" = "auto" ]; then
+            echo "::warning::Language not found in environment specs; using 'auto'."
+          else
+            echo "Language from env-spec: ${LANG_HINT}"
+          fi
+
+          # --- ALLOWED_PATHS ---
           grep -R -n -E '(^|\s)(file|path|destination|output|生成先|出力先)\s*:\s*([A-Za-z0-9_./-]+\.[A-Za-z0-9]+)' "$SPEC_ROOT" \
-            | sed -E 's/.*:\s*//; s/["'\'']//g' \
+            | sed -E 's/.*:\s*//; s/["'\''"]//g' \
             | grep -E '[/A-Za-z0-9_.-]+\.[A-Za-z0-9]+' >> ai/allowed_paths.txt || true
 
-          grep -R -h -E '[/A-Za-z0-9_.-]+\.(php|ts|tsx|js|jsx|py|rb|go|java|kt|cs|sql|html|css|yml|yaml|json|ini|xml)' "$SPEC_ROOT" \
-            | grep -o -E '[/A-Za-z0-9_.-]+\.(php|ts|tsx|js|jsx|py|rb|go|java|kt|cs|sql|html|css|yml|yaml|json|ini|xml)' >> ai/allowed_paths.txt || true
+          grep -R -h -E '[/A-Za-z0-9_.-]+\.(php|ts|tsx|js|jsx|py|rb|go|java|cs|sql|html|css|yml|yaml|json|ini|xml)' "$SPEC_ROOT" \
+            | grep -o -E '[/A-Za-z0-9_.-]+\.(php|ts|tsx|js|jsx|py|rb|go|java|cs|sql|html|css|yml|yaml|json|ini|xml)' \
+            >> ai/allowed_paths.txt || true
 
           grep -R -h -E '(^|\s)(dir|directory|folder|ディレクトリ)\s*:\s*[A-Za-z0-9_./-]+/?' "$SPEC_ROOT" \
-            | sed -E 's/.*:\s*//; s/["'\'']//g' | awk '{gsub(/\/?$/,"/");print}' >> ai/allowed_paths.txt || true
+            | sed -E 's/.*:\s*//; s/["'\''"]//g' | awk '{gsub(/\/?$/,"/");print}' >> ai/allowed_paths.txt || true
 
           sed -E 's#^\./##; s#//+#/#g' -i ai/allowed_paths.txt || true
           LC_ALL=C sort -u ai/allowed_paths.txt -o ai/allowed_paths.txt
 
-          # --- default allowlist when spec is silent (language-specific) ---
+          # --- Minimal scaffold when ALLOWED_PATHS is empty (no heredoc) ---
           if [ ! -s ai/allowed_paths.txt ]; then
             case "$LANG_HINT" in
               php)
-                printf '%s\n' \
-                  'composer.json' \
-                  'public/' \
-                  'public/.htaccess' \
-                  'public/index.php' \
-                  'src/' \
-                  'src/**/*.php' \
-                  'bin/' \
-                  'tests/' >> ai/allowed_paths.txt
+                printf "%s\n" \
+                  "composer.json" \
+                  "public/.htaccess" \
+                  "public/index.php" \
+                  "src/Bootstrap.php" \
+                  "src/Router.php" \
+                  "src/Controller/HomeController.php" \
+                  "tests/RouterTest.php" \
+                  "phpunit.xml" \
+                  >> ai/allowed_paths.txt
                 ;;
               typescript)
-                printf '%s\n' \
-                  'package.json' \
-                  'tsconfig.json' \
-                  'src/' \
-                  'src/**/*.ts' \
-                  'bin/' \
-                  'tests/' >> ai/allowed_paths.txt
+                printf "%s\n" \
+                  "package.json" \
+                  "tsconfig.json" \
+                  "src/server.ts" \
+                  "src/routes.ts" \
+                  "src/index.ts" \
+                  "tests/app.spec.ts" \
+                  >> ai/allowed_paths.txt
                 ;;
               python)
-                printf '%s\n' \
-                  'pyproject.toml' \
-                  'requirements.txt' \
-                  'src/' \
-                  'src/**/*.py' \
-                  'app.py' \
-                  'tests/' >> ai/allowed_paths.txt
-                ;;
-              go)
-                printf '%s\n' \
-                  'go.mod' \
-                  'cmd/' \
-                  'cmd/**/main.go' \
-                  'internal/' \
-                  'pkg/' >> ai/allowed_paths.txt
-                ;;
-              ruby)
-                printf '%s\n' \
-                  'Gemfile' \
-                  'bin/' \
-                  'lib/' \
-                  'lib/**/*.rb' >> ai/allowed_paths.txt
-                ;;
-              java|kotlin)
-                printf '%s\n' \
-                  'pom.xml' \
-                  'build.gradle' \
-                  'settings.gradle' \
-                  'src/' \
-                  'src/main/**' \
-                  'src/test/**' >> ai/allowed_paths.txt
-                ;;
-              csharp)
-                printf '%s\n' \
-                  '*.sln' \
-                  '*.csproj' \
-                  'Program.cs' \
-                  'src/' \
-                  'src/**/*.cs' >> ai/allowed_paths.txt
-                ;;
-              *)
-                printf '%s\n' 'generated/' >> ai/allowed_paths.txt
+                printf "%s\n" \
+                  "pyproject.toml" \
+                  "src/app/__init__.py" \
+                  "src/app/main.py" \
+                  "tests/test_main.py" \
+                  >> ai/allowed_paths.txt
                 ;;
             esac
           fi
+          LC_ALL=C sort -u ai/allowed_paths.txt -o ai/allowed_paths.txt
 
-          # --- language-specific minimum deliverables & scaffold text (no heredoc) ---
-          REQUIRED_GREP=""
-          SCAFFOLD_FILE="ai/scaffold.txt"
-          : > "$SCAFFOLD_FILE"
-          case "$LANG_HINT" in
-            php)
-              REQUIRED_GREP='(\+\+\+ b/composer\.json)|(\+\+\+ b/public/\.htaccess)|(\+\+\+ b/public/index\.php)|(\+\+\+ b/src/.*\.php)'
-              printf '%s\n' \
-                'Output a UNIFIED DIFF that creates a minimal PHP 8.3 project (framework-free):' \
-                '- composer.json (php>=8.3, ext-curl; PSR-4 autoload App\\ => src/)' \
-                '- public/.htaccess (mod_rewrite front controller)' \
-                '- public/index.php (front controller)' \
-                '- src/ (at least one class)' \
-                'Only the diff. No prose.' >> "$SCAFFOLD_FILE"
-              ;;
-            typescript)
-              REQUIRED_GREP='(\+\+\+ b/package\.json)|(\+\+\+ b/tsconfig\.json)|(\+\+\+ b/src/.*\.ts)'
-              printf '%s\n' \
-                'Output a UNIFIED DIFF for a minimal TypeScript Node project:' \
-                '- package.json (type: module, scripts: build/start, deps)' \
-                '- tsconfig.json (ES2020)' \
-                '- src/index.ts (entry)' \
-                'Only the diff. No prose.' >> "$SCAFFOLD_FILE"
-              ;;
-            python)
-              REQUIRED_GREP='(\+\+\+ b/pyproject\.toml)|(\+\+\+ b/requirements\.txt)|(\+\+\+ b/src/.*\.py)|(\+\+\+ b/app\.py)'
-              printf '%s\n' \
-                'Output a UNIFIED DIFF for a minimal Python project:' \
-                '- pyproject.toml or requirements.txt' \
-                '- src/ or app.py with a runnable entry' \
-                'Only the diff. No prose.' >> "$SCAFFOLD_FILE"
-              ;;
-            go)
-              REQUIRED_GREP='(\+\+\+ b/go\.mod)|(\+\+\+ b/cmd/.*/main\.go)'
-              printf '%s\n' \
-                'Output a UNIFIED DIFF for a minimal Go project:' \
-                '- go.mod' \
-                '- cmd/app/main.go' \
-                'Only the diff. No prose.' >> "$SCAFFOLD_FILE"
-              ;;
-            ruby)
-              REQUIRED_GREP='(\+\+\+ b/Gemfile)|(\+\+\+ b/lib/.*\.rb)'
-              printf '%s\n' \
-                'Output a UNIFIED DIFF for a minimal Ruby project:' \
-                '- Gemfile' \
-                '- lib/**.rb with an entry in bin/' \
-                'Only the diff. No prose.' >> "$SCAFFOLD_FILE"
-              ;;
-            java|kotlin)
-              REQUIRED_GREP='(\+\+\+ b/pom\.xml)|(\+\+\+ b/build\.gradle)|(\+\+\+ b/src/main/.*\.(java|kt))'
-              printf '%s\n' \
-                'Output a UNIFIED DIFF for a minimal JVM project:' \
-                '- Maven or Gradle build file' \
-                '- src/main/** with at least one class' \
-                'Only the diff. No prose.' >> "$SCAFFOLD_FILE"
-              ;;
-            csharp)
-              REQUIRED_GREP='(\+\+\+ b/.*\.csproj)|(\+\+\+ b/Program\.cs)|(\+\+\+ b/src/.*\.cs)'
-              printf '%s\n' \
-                'Output a UNIFIED DIFF for a minimal .NET project:' \
-                '- *.csproj' \
-                '- Program.cs (top-level statements ok)' \
-                'Only the diff. No prose.' >> "$SCAFFOLD_FILE"
-              ;;
-            *)
-              REQUIRED_GREP='(\+\+\+ b/src/)'
-              printf '%s\n' \
-                'Output a UNIFIED DIFF that adds a minimal project with src/ and an entry file.' \
-                'Only the diff. No prose.' >> "$SCAFFOLD_FILE"
-              ;;
-          esac
-          printf 'required_grep<<EOF\n%s\nEOF\n' "$REQUIRED_GREP" >> "$GITHUB_OUTPUT"
-          echo "scaffold_file=$SCAFFOLD_FILE" >> "$GITHUB_OUTPUT"
+          # --- Prompt body ---
+          printf "%s\n" "# Codex generation prompt" >> "$PROMPT_FILE"
+          printf "\n## LANGUAGE (MUST)\n\n" >> "$PROMPT_FILE"
+          printf "language: %s\n" "$LANG_HINT" >> "$PROMPT_FILE"
 
-          # --- prompt body ---
-          {
-            printf "# Codex generation prompt\n\n"
-            printf "## LANGUAGE (MUST)\n\nlanguage: %s\n" "$LANG_HINT"
-            printf "\n## ALLOWED_PATHS (only modify/create under these)\n\n"
-            awk '{print "- " $0}' ai/allowed_paths.txt
-            printf "\n## SPEC (excerpt; first 4000 lines per file)\n"
-          } >> "$PROMPT_FILE"
+          if [ -s ai/allowed_paths.txt ]; then
+            printf "\n## ALLOWED_PATHS (only modify/create under these)\n\n" >> "$PROMPT_FILE"
+            while IFS= read -r line; do
+              printf -- "- %s\n" "$line" >> "$PROMPT_FILE"
+            done < ai/allowed_paths.txt
+          else
+            printf "\n## ALLOWED_PATHS\n\n- (empty)\n" >> "$PROMPT_FILE"
+            printf "\n(When empty, infer exact paths from the spec. Do NOT invent arbitrary files unless explicitly named.)\n" >> "$PROMPT_FILE"
+          fi
 
           tmp_list="$(mktemp)"
-          for d in $SPEC_DIRS; do
-            [ -d "${SPEC_ROOT}/${d}" ] || continue
-            find "${SPEC_ROOT}/${d}" -type f \( -name "*.md" -o -name "*.txt" -o -name "*.yaml" -o -name "*.yml" -o -name "*.json" \) >> "$tmp_list"
-          done
+          if [ "${MODE:-full}" = "incremental" ]; then
+            git fetch --depth=50 origin || true
+            git diff --name-only --diff-filter=AMR origin/main...HEAD -- "$SPEC_ROOT"/ \
+              | grep -E '\.(md|txt|ya?ml|json)$' >> "$tmp_list" || true
+          fi
+          if [ ! -s "$tmp_list" ]; then
+            for d in $SPEC_DIRS; do
+              [ -d "$SPEC_ROOT/$d" ] || continue
+              find "$SPEC_ROOT/$d" -type f \( -name "*.md" -o -name "*.txt" -o -name "*.yaml" -o -name "*.yml" -o -name "*.json" \) >> "$tmp_list"
+            done
+          fi
           LC_ALL=C sort -o "$tmp_list" "$tmp_list" || true
           while IFS= read -r f; do
             printf "\n### %s\n\n" "$f" >> "$PROMPT_FILE"
@@ -266,136 +199,189 @@ jobs:
           {
             printf "\n## STRICT OUTPUT RULES\n\n"
             printf -- "- Return ONE unified diff (UTF-8), repository-rooted; no prose, no code fences.\n"
-            printf -- "- Respect LANGUAGE and ALLOWED_PATHS. Do NOT invent files the spec didn't name.\n"
+            printf -- "- Respect LANGUAGE above. Implement in that primary language unless the spec explicitly says otherwise for a file.\n"
+            printf -- "- Modify/create files **only** under ALLOWED_PATHS. If ALLOWED_PATHS exists only as the language default scaffold, you MUST create that scaffold at minimum.\n"
+            printf -- "- New files must be emitted with proper git-style diff headers (--- /dev/null, +++ b/<path>, new file mode 100644).\n"
+            printf -- "- If the spec requests deletions/renames/moves, encode them in the diff.\n"
+            printf -- "- PHP specifics: Web is Apache + mod_rewrite with AllowOverride FileInfo+. Use cURL for HTTP client (disallow file_get_contents for HTTP). Framework is not assumed; PSR conformance optional.\n"
           } >> "$PROMPT_FILE"
 
-      - name: Call OpenAI (primary)
-        id: call1
+          echo "LANG_HINT=${LANG_HINT}" >> "$GITHUB_OUTPUT"
+
+      - name: "Call OpenAI (primary)"
         shell: bash
         run: |
           set -euo pipefail
-          MODEL="${OPENAI_MODEL:-$MODEL_DEFAULT}"
+
+          is_patch(){ grep -Eq '^(diff --git|--- a/)' "$1" && grep -Eq '(^\+\+\+ b/|^diff --git)' "$1"; }
+
+          MODEL="${OPENAI_MODEL:-gpt-5-codex}"
           BASE="${OPENAI_BASE_URL:-https://api.openai.com}"
-          SYSTEM="You output only a unified diff. Follow LANGUAGE and ALLOWED_PATHS strictly."
+          echo "Using model: $MODEL"
+          echo "Base: $BASE"
+
+          SYSTEM_CONTRACT="You output only a unified diff. Follow LANGUAGE and ALLOWED_PATHS strictly; do not create files not named in the spec unless they are in the language default scaffold."
+
           if printf "%s" "$MODEL" | grep -qiE '^gpt-5-codex( |$|-|:)'; then
-            jq -n --arg model "$MODEL" --arg sys "$SYSTEM" --rawfile prompt "$PROMPT_FILE" \
-              '{model:$model,max_output_tokens:4096,
-                input:[{role:"system",content:[{type:"input_text",text:$sys}]},
-                       {role:"user",content:[{type:"input_text",text:$prompt}]}]}' > ai/request.json
-            EP="${BASE%/}/v1/responses"
+            jq -n --arg model "$MODEL" --arg sys "$SYSTEM_CONTRACT" --rawfile prompt "$PROMPT_FILE" \
+              '{ model:$model, max_output_tokens:4096,
+                 input:[ {role:"system",content:[{type:"input_text",text:$sys}]},
+                         {role:"user",  content:[{type:"input_text",text:$prompt}]} ] }' > ai/request.json
+            ENDPOINT="${BASE%/}/v1/responses"
           else
-            jq -n --arg model "$MODEL" --arg sys "$SYSTEM" --rawfile prompt "$PROMPT_FILE" \
-              '{model:$model,temperature:0,max_tokens:4096,
-                messages:[{role:"system",content:$sys},{role:"user",content:$prompt}]}' > ai/request.json
-            EP="${BASE%/}/v1/chat/completions"
+            jq -n --arg model "$MODEL" --arg sys "$SYSTEM_CONTRACT" --rawfile prompt "$PROMPT_FILE" \
+              '{ model:$model, temperature:0, max_tokens:4096,
+                 messages:[ {role:"system",content:$sys}, {role:"user",content:$prompt} ] }' > ai/request.json
+            ENDPOINT="${BASE%/}/v1/chat/completions"
           fi
+
+          resp_with_code="$(mktemp)"
           curl -sS -H "Authorization: Bearer ${OPENAI_API_KEY}" -H "Content-Type: application/json" \
-               -d @ai/request.json "$EP" > ai/response.json
-          jq -r '
-            [.output_text,
-             (try(.output|if type=="array" then map(.content|if type=="array" then map(.text // .string // .content // "")|join("") else (. // "") end)|join("") else "" end) catch ""),
-             .choices[0].message.content,.choices[0].text]
-            | map(select(type=="string" and .!="")) | .[0]//""' ai/response.json > ai/out.txt
+               -w "\n%{http_code}\n" -d @ai/request.json "$ENDPOINT" \
+               | tee "$resp_with_code" >/dev/null
+          status="$(tail -n1 "$resp_with_code")"
+          head -n -1 "$resp_with_code" > ai/response.json
+          rm -f "$resp_with_code"
+          [ "$status" -lt 300 ] || { echo "::error::OpenAI error ${status}"; exit 3; }
+
+          EXTRACT='[
+            .output_text,
+            ( try(.output
+                 | (if type=="array" then . else [] end)
+                 | map( if has("content")
+                          then (.content
+                                | (if type=="array" then map(.text // .string // .content // "") else . end)
+                                | (if type=="array" then join("") else (. // "") end))
+                          else (.text // .content // "") end)
+                 | join("")) catch empty ),
+            .choices[0].message.content, .choices[0].text
+          ] | map(select(type=="string" and . != "")) | .[0] // ""'
+
+          jq -r "$EXTRACT" ai/response.json > ai/out.txt
           sed -E -e '1{/^```[a-zA-Z-]*[[:space:]]*$/d;}' -e '${/^```[[:space:]]*$/d;}' -i ai/out.txt || true
           awk 'f||/^(diff --git|--- a\/)/{f=1; print}' ai/out.txt > "$PATCH_FILE" || true
 
-      - name: Validate patch & scaffold if needed
-        id: validate
-        shell: bash
-        run: |
-          set -euo pipefail
-          REQ='${{ steps.compose.outputs.required_grep }}'
-          if ! grep -Eq '^(diff --git|--- a/)' "$PATCH_FILE"; then
-            echo "::warning::primary result is not a diff; forcing scaffold"
-            > "$PATCH_FILE"
-          fi
-          need=0
-          if ! [ -s "$PATCH_FILE" ]; then need=1; fi
-          if [ "$need" -eq 0 ] && ! grep -Eq "$REQ" "$PATCH_FILE"; then
-            echo "::warning::diff lacks minimum deliverables; forcing scaffold"
-            need=1
-          fi
-          if [ "$need" -eq 1 ]; then
-            MODEL="${OPENAI_MODEL:-$MODEL_DEFAULT}"
-            BASE="${OPENAI_BASE_URL:-https://api.openai.com}"
-            SCAF='${{ steps.compose.outputs.scaffold_file }}'
+          if ! is_patch "$PATCH_FILE"; then
+            echo "::warning::first attempt not a unified diff; try repair"
+            head -c 15000 ai/out.txt > ai/out.trim.txt || true
+            REPAIR_SYS="If the text contains a diff, extract ONLY the diff. Otherwise synthesize a diff that modifies/creates files strictly inside ALLOWED_PATHS; follow LANGUAGE. If ALLOWED_PATHS only contains a default language scaffold, CREATE that scaffold."
             if printf "%s" "$MODEL" | grep -qiE '^gpt-5-codex( |$|-|:)'; then
-              jq -n --arg model "$MODEL" --rawfile prompt "$SCAF" \
-                '{model:$model,max_output_tokens:4096,input:[{role:"user",content:[{type:"input_text",text:$prompt}]}]}' \
-                > ai/request.repair.json
-              EP="${BASE%/}/v1/responses"
+              jq -n --arg model "$MODEL" --arg sys "$REPAIR_SYS" --rawfile prev ai/out.trim.txt \
+                '{ model:$model, max_output_tokens:4096,
+                   input:[ {role:"system",content:[{type:"input_text",text:$sys}]},
+                           {role:"user",content:[{type:"input_text",text:$prev}]} ] }' > ai/request.repair.json
             else
-              jq -n --arg model "$MODEL" --rawfile prompt "$SCAF" \
-                '{model:$model,temperature:0,max_tokens:4096,messages:[{role:"user",content:$prompt}]}' \
-                > ai/request.repair.json
-              EP="${BASE%/}/v1/chat/completions"
+              jq -n --arg model "$MODEL" --arg sys "$REPAIR_SYS" --rawfile prev ai/out.trim.txt \
+                '{ model:$model, temperature:0, max_tokens:2048,
+                   messages:[ {role:"system",content:$sys}, {role:"user",content:$prev} ] }' > ai/request.repair.json
             fi
+            resp_with_code="$(mktemp)"
             curl -sS -H "Authorization: Bearer ${OPENAI_API_KEY}" -H "Content-Type: application/json" \
-                 -d @ai/request.repair.json "$EP" > ai/response.repair.json
-            jq -r '
-              [.output_text,
-               (try(.output|if type=="array" then map(.content|if type=="array" then map(.text // .string // .content // "")|join("") else (. // "") end)|join("") else "" end) catch ""),
-               .choices[0].message.content,.choices[0].text]
-              | map(select(type=="string" and .!="")) | .[0]//""' ai/response.repair.json > ai/out.repair.txt
+                 -w "\n%{http_code}\n" -d @ai/request.repair.json "$ENDPOINT" \
+                 | tee "$resp_with_code" >/dev/null
+            rstatus="$(tail -n1 "$resp_with_code")"
+            head -n -1 "$resp_with_code" > ai/response.repair.json
+            rm -f "$resp_with_code"
+            [ "$rstatus" -lt 300 ] || { echo "::error::repair call error ${rstatus}"; exit 3; }
+            jq -r "$EXTRACT" ai/response.repair.json > ai/out.repair.txt
             sed -E -e '1{/^```[a-zA-Z-]*[[:space:]]*$/d;}' -e '${/^```[[:space:]]*$/d;}' -i ai/out.repair.txt || true
             awk 'f||/^(diff --git|--- a\/)/{f=1; print}' ai/out.repair.txt > "$PATCH_FILE" || true
           fi
-          if ! grep -Eq '^(diff --git|--- a/)' "$PATCH_FILE"; then
+
+          if ! ( grep -Eq '^(diff --git|--- a/)' "$PATCH_FILE" && grep -Eq '(^\+\+\+ b/|^diff --git)' "$PATCH_FILE" ); then
             echo "::error::model did not return a unified diff"
             exit 4
           fi
-          if ! grep -Eq "$REQ" "$PATCH_FILE"; then
-            echo "::error::diff does not include language-specific minimum deliverables"
-            exit 4
-          fi
+          echo "patch prepared"
 
-      - name: Apply patch
+      - name: "Validate patch & scaffold if needed"
         shell: bash
         run: |
           set -euo pipefail
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
+
           if git apply --check "$PATCH_FILE"; then
             git apply --index --whitespace=fix "$PATCH_FILE"
           else
             echo "::warning::git apply check failed; attempting 3-way merge apply"
             git apply --3way --index --whitespace=fix "$PATCH_FILE" || true
           fi
-          git restore --staged --worktree -- STATE.json 2>/dev/null || true
-          rm -f STATE.json || true
 
-      - name: Upload AI artifacts (before PR)
-        uses: actions/upload-artifact@v4
-        with:
-          name: ai-artifacts
-          path: ai/**
-          if-no-files-found: warn
+          if ! git diff --name-only --cached | grep -qvE '^(ai/|STATE\.json$)'; then
+            echo "::warning::no repo changes; retry with forced scaffold"
+            MODEL="${OPENAI_MODEL:-gpt-5-codex}"
+            BASE="${OPENAI_BASE_URL:-https://api.openai.com}"
+            ENDPOINT="${BASE%/}/v1/responses"
+            if ! printf "%s" "$MODEL" | grep -qiE '^gpt-5-codex( |$|-|:)'; then
+              ENDPOINT="${BASE%/}/v1/chat/completions"
+            fi
+            REPAIR_SYS="Create the default LANGUAGE scaffold listed in ALLOWED_PATHS and return ONLY a unified git diff."
+            if printf "%s" "$MODEL" | grep -qiE '^gpt-5-codex( |$|-|:)'; then
+              jq -n --arg model "$MODEL" --arg sys "$REPAIR_SYS" --rawfile prompt "$PROMPT_FILE" \
+                '{ model:$model, max_output_tokens:4096,
+                   input:[ {role:"system",content:[{type:"input_text",text:$sys}]},
+                           {role:"user",  content:[{type:"input_text",text:$prompt}]} ] }' > ai/request.forced.json
+            else
+              jq -n --arg model "$MODEL" --arg sys "$REPAIR_SYS" --rawfile prompt "$PROMPT_FILE" \
+                '{ model:$model, temperature:0, max_tokens:2048,
+                   messages:[ {role:"system",content:$sys}, {role:"user",content:$prompt} ] }' > ai/request.forced.json
+            fi
+            resp_with_code="$(mktemp)"
+            curl -sS -H "Authorization: Bearer ${OPENAI_API_KEY}" -H "Content-Type: application/json" \
+                 -w "\n%{http_code}\n" -d @ai/request.forced.json "$ENDPOINT" \
+                 | tee "$resp_with_code" >/dev/null
+            rstatus="$(tail -n1 "$resp_with_code")"
+            head -n -1 "$resp_with_code" > ai/response.forced.json
+            rm -f "$resp_with_code"
+            [ "$rstatus" -lt 300 ] || { echo "::error::forced scaffold call error ${rstatus}"; exit 3; }
+            EXTRACT='[.output_text, .choices[0].message.content, .choices[0].text] | map(select(type=="string" and . != "")) | .[0] // ""'
+            jq -r "$EXTRACT" ai/response.forced.json > ai/out.forced.txt
+            sed -E -e '1{/^```[a-zA-Z-]*[[:space:]]*$/d;}' -e '${/^```[[:space:]]*$/d;}' -i ai/out.forced.txt || true
+            awk 'f||/^(diff --git|--- a\/)/{f=1; print}' ai/out.forced.txt > "$PATCH_FILE" || true
+            if grep -Eq '^(diff --git|--- a/)' "$PATCH_FILE"; then
+              git apply --index --whitespace=fix "$PATCH_FILE" || true
+            fi
+          fi
 
-      - name: Remove ai/ to keep PR clean
-        shell: bash
-        run: rm -rf ai
-
-      - name: List staged files for PR
-        id: staged
+      - name: "Apply patch"
         shell: bash
         run: |
           set -euo pipefail
-          git diff --name-only --cached | sed '/^ai\//d;/^STATE\.json$/d' | tee pr-files.txt
-          if [ ! -s pr-files.txt ]; then
-            echo "::error::No staged files for PR"
-            exit 6
-          fi
-          printf "files<<EOF\n%s\nEOF\n" "$(cat pr-files.txt)" >> "$GITHUB_OUTPUT"
+          git status --porcelain || true
 
-      - name: Create Pull Request (staged files only)
-        uses: peter-evans/create-pull-request@v6
+      - name: "Upload AI artifacts (before PR)"
+        uses: "actions/upload-artifact@v4"
         with:
-          title: "Codex: generate per spec (lang=${{ steps.compose.outputs.lang }})"
-          body: |
-            Generated strictly from environment specs and ALLOWED_PATHS.
-            Only staged files are included in this PR.
+          name: "ai-artifacts"
+          if-no-files-found: "ignore"
+          path: |
+            ai/prompt.md
+            ai/allowed_paths.txt
+            ai/request.json
+            ai/response.json
+            ai/out.txt
+            ai/request.repair.json
+            ai/response.repair.json
+            ai/out.repair.txt
+            ai/request.forced.json
+            ai/response.forced.json
+            ai/out.forced.txt
+            ai/patch.diff
+
+      - name: "Remove ai/ to keep PR clean"
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf ai || true
+
+      - name: "Create pull request"
+        uses: "peter-evans/create-pull-request@v6"
+        with:
+          title: "Codex: generate per spec"
+          body: "Generated from specs with language detection and default scaffold when paths are not specified."
           branch: "codex/autogen-${{ github.run_id }}"
           base: "main"
           delete-branch: true
           labels: "codex, automation"
-          add-paths: ${{ steps.staged.outputs.files }}
+          token: "${{ secrets.GITHUB_TOKEN }}"
