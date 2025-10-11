@@ -1,0 +1,112 @@
+diff --git a/README.md b/README.md
+new file mode 100644
+index 0000000..6d41f6a
+--- /dev/null
++++ b/README.md
+@@ -0,0 +1,21 @@
++# Default PHP Scaffold
++
++This is a minimal PHP project scaffold featuring:
++
++- Composer for dependency management.
++- PSR-4 autoloading for the `App\` namespace.
++- A simple `App` class with a friendly greeter.
++- A public entry point at `public/index.php`.
++
++## Requirements
++
++- PHP 8.1 or higher
++- Composer
++
++## Installation
++
++```bash
++composer install
++php -S localhost:8000 -t public
++```
++
++Then visit [http://localhost:8000](http://localhost:8000) in your browser.
+
+diff --git a/composer.json b/composer.json
+new file mode 100644
+index 0000000..8142737
+--- /dev/null
++++ b/composer.json
+@@ -0,0 +1,22 @@
++{
++    "name": "app/default-php-scaffold",
++    "description": "Default PHP project scaffold",
++    "type": "project",
++    "license": "MIT",
++    "require": {
++        "php": "^8.1"
++    },
++    "autoload": {
++        "psr-4": {
++            "App\\": "src/"
++        }
++    },
++    "autoload-dev": {
++        "psr-4": {
++            "App\\Tests\\": "tests/"
++        }
++    },
++    "scripts": {
++        "start": "php -S localhost:8000 -t public"
++    }
++}
+
+diff --git a/public/index.php b/public/index.php
+new file mode 100644
+index 0000000..3709e76
+--- /dev/null
++++ b/public/index.php
+@@ -0,0 +1,17 @@
++<?php
++
++declare(strict_types=1);
++
++require __DIR__ . '/../vendor/autoload.php';
++
++use App\App;
++
++$app = new App();
++$name = $_GET['name'] ?? null;
++
++header('Content-Type: text/plain; charset=utf-8');
++
++try {
++    echo $app->greet($name);
++} catch (Throwable $exception) {
++    http_response_code(500);
++    echo 'An unexpected error occurred.';
++}
+
+diff --git a/src/App.php b/src/App.php
+new file mode 100644
+index 0000000..c2ff9f2
+--- /dev/null
++++ b/src/App.php
+@@ -0,0 +1,22 @@
++<?php
++
++declare(strict_types=1);
++
++namespace App;
++
++final class App
++{
++    public function greet(?string $name = null): string
++    {
++        $subject = $this->normalizeName($name);
++
++        return sprintf('Hello, %s!', $subject);
++    }
++
++    private function normalizeName(?string $name): string
++    {
++        $normalized = trim((string) $name);
++
++        return $normalized !== '' ? $normalized : 'World';
++    }
++}

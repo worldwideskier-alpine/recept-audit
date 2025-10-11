@@ -1,0 +1,72 @@
+{
+  "id": "resp_0d3d3f9c39650fc30068eada5b16648199bfc4c582e3e20781",
+  "object": "response",
+  "created_at": 1760221787,
+  "status": "completed",
+  "background": false,
+  "billing": {
+    "payer": "developer"
+  },
+  "error": null,
+  "incomplete_details": null,
+  "instructions": null,
+  "max_output_tokens": 4096,
+  "max_tool_calls": null,
+  "model": "gpt-5-codex",
+  "output": [
+    {
+      "id": "rs_0d3d3f9c39650fc30068eada5bc2248199b2c371b1ebf48f68",
+      "type": "reasoning",
+      "summary": []
+    },
+    {
+      "id": "msg_0d3d3f9c39650fc30068eada68c4248199996bd69f81a02a55",
+      "type": "message",
+      "status": "completed",
+      "content": [
+        {
+          "type": "output_text",
+          "annotations": [],
+          "logprobs": [],
+          "text": "diff --git a/README.md b/README.md\nnew file mode 100644\nindex 0000000..6d41f6a\n--- /dev/null\n+++ b/README.md\n@@ -0,0 +1,21 @@\n+# Default PHP Scaffold\n+\n+This is a minimal PHP project scaffold featuring:\n+\n+- Composer for dependency management.\n+- PSR-4 autoloading for the `App\\` namespace.\n+- A simple `App` class with a friendly greeter.\n+- A public entry point at `public/index.php`.\n+\n+## Requirements\n+\n+- PHP 8.1 or higher\n+- Composer\n+\n+## Installation\n+\n+```bash\n+composer install\n+php -S localhost:8000 -t public\n+```\n+\n+Then visit [http://localhost:8000](http://localhost:8000) in your browser.\n\ndiff --git a/composer.json b/composer.json\nnew file mode 100644\nindex 0000000..8142737\n--- /dev/null\n+++ b/composer.json\n@@ -0,0 +1,22 @@\n+{\n+    \"name\": \"app/default-php-scaffold\",\n+    \"description\": \"Default PHP project scaffold\",\n+    \"type\": \"project\",\n+    \"license\": \"MIT\",\n+    \"require\": {\n+        \"php\": \"^8.1\"\n+    },\n+    \"autoload\": {\n+        \"psr-4\": {\n+            \"App\\\\\": \"src/\"\n+        }\n+    },\n+    \"autoload-dev\": {\n+        \"psr-4\": {\n+            \"App\\\\Tests\\\\\": \"tests/\"\n+        }\n+    },\n+    \"scripts\": {\n+        \"start\": \"php -S localhost:8000 -t public\"\n+    }\n+}\n\ndiff --git a/public/index.php b/public/index.php\nnew file mode 100644\nindex 0000000..3709e76\n--- /dev/null\n+++ b/public/index.php\n@@ -0,0 +1,17 @@\n+<?php\n+\n+declare(strict_types=1);\n+\n+require __DIR__ . '/../vendor/autoload.php';\n+\n+use App\\App;\n+\n+$app = new App();\n+$name = $_GET['name'] ?? null;\n+\n+header('Content-Type: text/plain; charset=utf-8');\n+\n+try {\n+    echo $app->greet($name);\n+} catch (Throwable $exception) {\n+    http_response_code(500);\n+    echo 'An unexpected error occurred.';\n+}\n\ndiff --git a/src/App.php b/src/App.php\nnew file mode 100644\nindex 0000000..c2ff9f2\n--- /dev/null\n+++ b/src/App.php\n@@ -0,0 +1,22 @@\n+<?php\n+\n+declare(strict_types=1);\n+\n+namespace App;\n+\n+final class App\n+{\n+    public function greet(?string $name = null): string\n+    {\n+        $subject = $this->normalizeName($name);\n+\n+        return sprintf('Hello, %s!', $subject);\n+    }\n+\n+    private function normalizeName(?string $name): string\n+    {\n+        $normalized = trim((string) $name);\n+\n+        return $normalized !== '' ? $normalized : 'World';\n+    }\n+}"
+        }
+      ],
+      "role": "assistant"
+    }
+  ],
+  "parallel_tool_calls": true,
+  "previous_response_id": null,
+  "prompt_cache_key": null,
+  "reasoning": {
+    "effort": "medium",
+    "summary": null
+  },
+  "safety_identifier": null,
+  "service_tier": "default",
+  "store": true,
+  "temperature": 1.0,
+  "text": {
+    "format": {
+      "type": "text"
+    },
+    "verbosity": "medium"
+  },
+  "tool_choice": "auto",
+  "tools": [],
+  "top_logprobs": 0,
+  "top_p": 1.0,
+  "truncation": "disabled",
+  "usage": {
+    "input_tokens": 43,
+    "input_tokens_details": {
+      "cached_tokens": 0
+    },
+    "output_tokens": 1690,
+    "output_tokens_details": {
+      "reasoning_tokens": 960
+    },
+    "total_tokens": 1733
+  },
+  "user": null,
+  "metadata": {}
+}

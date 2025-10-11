@@ -1,0 +1,24 @@
+{
+  "model": "gpt-5-codex",
+  "max_output_tokens": 4096,
+  "input": [
+    {
+      "role": "system",
+      "content": [
+        {
+          "type": "input_text",
+          "text": "If text contains a diff, extract ONLY that diff. Otherwise, synthesize a single unified diff that creates the default PHP scaffold exactly under ALLOWED_PATHS."
+        }
+      ]
+    },
+    {
+      "role": "user",
+      "content": [
+        {
+          "type": "input_text",
+          "text": "\n"
+        }
+      ]
+    }
+  ]
+}
