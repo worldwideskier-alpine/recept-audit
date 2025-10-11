@@ -1,0 +1,14 @@
+diff --git a/generated/app.php b/generated/app.php
+new file mode 100644
+index 0000000..7f77d1f
+--- /dev/null
++++ b/generated/app.php
+@@ -0,0 +1,8 @@
++<?php
++declare(strict_types=1);
++
++/**
++ * TODO: Implement front controller per spec/features requirements.
++ */
++
++exit(0);
