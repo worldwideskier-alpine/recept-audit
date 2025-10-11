@@ -1,0 +1,7 @@
+diff --git a/AUTO_REGEN_REPORT.json b/AUTO_REGEN_REPORT.json
+new file mode 100644
+index 0000000..93e5b05
+--- /dev/null
++++ b/AUTO_REGEN_REPORT.json
+@@ -0,0 +1 @@
++{}
