@@ -1,0 +1,72 @@
+{
+  "id": "resp_074848c3f0d8fdd20068e9f3d8604c8199af93c635a3f59e71",
+  "object": "response",
+  "created_at": 1760162776,
+  "status": "completed",
+  "background": false,
+  "billing": {
+    "payer": "developer"
+  },
+  "error": null,
+  "incomplete_details": null,
+  "instructions": null,
+  "max_output_tokens": 4096,
+  "max_tool_calls": null,
+  "model": "gpt-5-codex",
+  "output": [
+    {
+      "id": "rs_074848c3f0d8fdd20068e9f3d90910819991d055d42ee29cea",
+      "type": "reasoning",
+      "summary": []
+    },
+    {
+      "id": "msg_074848c3f0d8fdd20068e9f3e2f318819995ed242133cad8c2",
+      "type": "message",
+      "status": "completed",
+      "content": [
+        {
+          "type": "output_text",
+          "annotations": [],
+          "logprobs": [],
+          "text": "diff --git a/generated/app.php b/generated/app.php\nnew file mode 100644\nindex 0000000..7f77d1f\n--- /dev/null\n+++ b/generated/app.php\n@@ -0,0 +1,8 @@\n+<?php\n+declare(strict_types=1);\n+\n+/**\n+ * TODO: Implement front controller per spec/features requirements.\n+ */\n+\n+exit(0);"
+        }
+      ],
+      "role": "assistant"
+    }
+  ],
+  "parallel_tool_calls": true,
+  "previous_response_id": null,
+  "prompt_cache_key": null,
+  "reasoning": {
+    "effort": "medium",
+    "summary": null
+  },
+  "safety_identifier": null,
+  "service_tier": "default",
+  "store": true,
+  "temperature": 1.0,
+  "text": {
+    "format": {
+      "type": "text"
+    },
+    "verbosity": "medium"
+  },
+  "tool_choice": "auto",
+  "tools": [],
+  "top_logprobs": 0,
+  "top_p": 1.0,
+  "truncation": "disabled",
+  "usage": {
+    "input_tokens": 7407,
+    "input_tokens_details": {
+      "cached_tokens": 7296
+    },
+    "output_tokens": 734,
+    "output_tokens_details": {
+      "reasoning_tokens": 640
+    },
+    "total_tokens": 8141
+  },
+  "user": null,
+  "metadata": {}
+}
