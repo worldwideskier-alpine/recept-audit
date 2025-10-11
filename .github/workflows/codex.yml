@@ -46,7 +46,7 @@ jobs:
           : > "$PROMPT_FILE"
           : > ai/allowed_paths.txt
 
-          # ── 言語検出（キー優先 → 自由記述ヒューリスティック） ─────────────
+          # --- language detection (keys -> free text heuristic) ---
           LANG_HINT=""
           for root in "${SPEC_ROOT}/env" "${SPEC_ROOT}/foundation" "${SPEC_ROOT}/fountation" "${SPEC_ROOT}"; do
             [ -d "$root" ] || continue
@@ -57,7 +57,7 @@ jobs:
             fi
           done
           if [ -z "$LANG_HINT" ]; then
-            t="$(grep -R -h -i -E '\b(php|typescript|javascript|node\.js|python|golang|go|ruby|java|kotlin|c#|\.net|csharp)\b' \
+            t="$(grep -R -h -i -E '\b(php|typescript|javascript|node\.js|node |python|golang|go|ruby|java|kotlin|c#|\.net|csharp)\b' \
                  "${SPEC_ROOT}/env" "${SPEC_ROOT}/foundation" "${SPEC_ROOT}/fountation" 2>/dev/null | head -n1 || true)"
             case "$t" in
               *php* ) LANG_HINT="php" ;;
@@ -70,7 +70,6 @@ jobs:
               *c#*|*.net*|*csharp* ) LANG_HINT="csharp" ;;
             esac
           fi
-          # 正規化（代表的ラベルを丸める）
           case "${LANG_HINT:-}" in
             php*|composer*|psr*) LANG_HINT="php" ;;
             ts|typescript*|node*|javascript*) LANG_HINT="typescript" ;;
@@ -85,180 +84,165 @@ jobs:
           echo "lang=${LANG_HINT}" >> "$GITHUB_OUTPUT"
           [ "$LANG_HINT" = "auto" ] && echo "::warning::Language not found in env specs; using 'auto'."
 
-          # ── ALLOWED_PATHS 抽出（仕様に書かれた出力先/ファイルを優先） ──────
+          # --- ALLOWED_PATHS (from explicit file/dir mentions) ---
           grep -R -n -E '(^|\s)(file|path|destination|output|生成先|出力先)\s*:\s*([A-Za-z0-9_./-]+\.[A-Za-z0-9]+)' "$SPEC_ROOT" \
             | sed -E 's/.*:\s*//; s/["'\'']//g' \
             | grep -E '[/A-Za-z0-9_.-]+\.[A-Za-z0-9]+' >> ai/allowed_paths.txt || true
 
-          # 文面中の明示的な拡張子も取得（保守的に）
           grep -R -h -E '[/A-Za-z0-9_.-]+\.(php|ts|tsx|js|jsx|py|rb|go|java|kt|cs|sql|html|css|yml|yaml|json|ini|xml)' "$SPEC_ROOT" \
             | grep -o -E '[/A-Za-z0-9_.-]+\.(php|ts|tsx|js|jsx|py|rb|go|java|kt|cs|sql|html|css|yml|yaml|json|ini|xml)' >> ai/allowed_paths.txt || true
 
-          # ディレクトリ指定（dir: / directory: / フォルダ）
           grep -R -h -E '(^|\s)(dir|directory|folder|ディレクトリ)\s*:\s*[A-Za-z0-9_./-]+/?' "$SPEC_ROOT" \
             | sed -E 's/.*:\s*//; s/["'\'']//g' | awk '{gsub(/\/?$/,"/");print}' >> ai/allowed_paths.txt || true
 
           sed -E 's#^\./##; s#//+#/#g' -i ai/allowed_paths.txt || true
           LC_ALL=C sort -u ai/allowed_paths.txt -o ai/allowed_paths.txt
 
-          # ── 言語別デフォルト許可（仕様に明記が無い場合の安全網） ────────
+          # --- default allowlist when spec is silent (language-specific) ---
           if [ ! -s ai/allowed_paths.txt ]; then
             case "$LANG_HINT" in
               php)
-                cat >> ai/allowed_paths.txt <<'EOF'
-composer.json
-public/
-public/.htaccess
-public/index.php
-src/
-src/**/*.php
-bin/
-tests/
-EOF
+                printf '%s\n' \
+                  'composer.json' \
+                  'public/' \
+                  'public/.htaccess' \
+                  'public/index.php' \
+                  'src/' \
+                  'src/**/*.php' \
+                  'bin/' \
+                  'tests/' >> ai/allowed_paths.txt
                 ;;
               typescript)
-                cat >> ai/allowed_paths.txt <<'EOF'
-package.json
-tsconfig.json
-src/
-src/**/*.ts
-bin/
-tests/
-EOF
+                printf '%s\n' \
+                  'package.json' \
+                  'tsconfig.json' \
+                  'src/' \
+                  'src/**/*.ts' \
+                  'bin/' \
+                  'tests/' >> ai/allowed_paths.txt
                 ;;
               python)
-                cat >> ai/allowed_paths.txt <<'EOF'
-pyproject.toml
-requirements.txt
-src/
-src/**/*.py
-app.py
-tests/
-EOF
+                printf '%s\n' \
+                  'pyproject.toml' \
+                  'requirements.txt' \
+                  'src/' \
+                  'src/**/*.py' \
+                  'app.py' \
+                  'tests/' >> ai/allowed_paths.txt
                 ;;
               go)
-                cat >> ai/allowed_paths.txt <<'EOF'
-go.mod
-cmd/
-cmd/**/main.go
-internal/
-pkg/
-EOF
+                printf '%s\n' \
+                  'go.mod' \
+                  'cmd/' \
+                  'cmd/**/main.go' \
+                  'internal/' \
+                  'pkg/' >> ai/allowed_paths.txt
                 ;;
               ruby)
-                cat >> ai/allowed_paths.txt <<'EOF'
-Gemfile
-bin/
-lib/
-lib/**/*.rb
-EOF
+                printf '%s\n' \
+                  'Gemfile' \
+                  'bin/' \
+                  'lib/' \
+                  'lib/**/*.rb' >> ai/allowed_paths.txt
                 ;;
               java|kotlin)
-                cat >> ai/allowed_paths.txt <<'EOF'
-pom.xml
-build.gradle
-settings.gradle
-src/
-src/main/**
-src/test/**
-EOF
+                printf '%s\n' \
+                  'pom.xml' \
+                  'build.gradle' \
+                  'settings.gradle' \
+                  'src/' \
+                  'src/main/**' \
+                  'src/test/**' >> ai/allowed_paths.txt
                 ;;
               csharp)
-                cat >> ai/allowed_paths.txt <<'EOF'
-*.sln
-*.csproj
-Program.cs
-src/
-src/**/*.cs
-EOF
+                printf '%s\n' \
+                  '*.sln' \
+                  '*.csproj' \
+                  'Program.cs' \
+                  'src/' \
+                  'src/**/*.cs' >> ai/allowed_paths.txt
                 ;;
               *)
-                echo "generated/" >> ai/allowed_paths.txt
+                printf '%s\n' 'generated/' >> ai/allowed_paths.txt
                 ;;
             esac
           fi
 
-          # ── 言語別：最低生成物の正規表現 & スキャフォールド指示 ────────────
+          # --- language-specific minimum deliverables & scaffold text (no heredoc) ---
           REQUIRED_GREP=""
-          SCAFFOLD_FILE="ai/scaffold.md"
+          SCAFFOLD_FILE="ai/scaffold.txt"
+          : > "$SCAFFOLD_FILE"
           case "$LANG_HINT" in
             php)
               REQUIRED_GREP='(\+\+\+ b/composer\.json)|(\+\+\+ b/public/\.htaccess)|(\+\+\+ b/public/index\.php)|(\+\+\+ b/src/.*\.php)'
-              cat > "$SCAFFOLD_FILE" <<'EOF'
-Output a UNIFIED DIFF that creates a minimal PHP 8.3 project (framework-free):
-- composer.json (php>=8.3, ext-curl; PSR-4 autoload App\\ => src/)
-- public/.htaccess (mod_rewrite front controller)
-- public/index.php (front controller)
-- src/ (at least one class)
-Only the diff. No prose.
-EOF
+              printf '%s\n' \
+                'Output a UNIFIED DIFF that creates a minimal PHP 8.3 project (framework-free):' \
+                '- composer.json (php>=8.3, ext-curl; PSR-4 autoload App\\ => src/)' \
+                '- public/.htaccess (mod_rewrite front controller)' \
+                '- public/index.php (front controller)' \
+                '- src/ (at least one class)' \
+                'Only the diff. No prose.' >> "$SCAFFOLD_FILE"
               ;;
             typescript)
               REQUIRED_GREP='(\+\+\+ b/package\.json)|(\+\+\+ b/tsconfig\.json)|(\+\+\+ b/src/.*\.ts)'
-              cat > "$SCAFFOLD_FILE" <<'EOF'
-Output a UNIFIED DIFF for a minimal TypeScript Node project:
-- package.json (type: module, scripts: build/start, deps)
-- tsconfig.json (ES2020)
-- src/index.ts (entry)
-Only the diff. No prose.
-EOF
+              printf '%s\n' \
+                'Output a UNIFIED DIFF for a minimal TypeScript Node project:' \
+                '- package.json (type: module, scripts: build/start, deps)' \
+                '- tsconfig.json (ES2020)' \
+                '- src/index.ts (entry)' \
+                'Only the diff. No prose.' >> "$SCAFFOLD_FILE"
               ;;
             python)
               REQUIRED_GREP='(\+\+\+ b/pyproject\.toml)|(\+\+\+ b/requirements\.txt)|(\+\+\+ b/src/.*\.py)|(\+\+\+ b/app\.py)'
-              cat > "$SCAFFOLD_FILE" <<'EOF'
-Output a UNIFIED DIFF for a minimal Python project:
-- pyproject.toml or requirements.txt
-- src/ or app.py with a runnable entry
-Only the diff. No prose.
-EOF
+              printf '%s\n' \
+                'Output a UNIFIED DIFF for a minimal Python project:' \
+                '- pyproject.toml or requirements.txt' \
+                '- src/ or app.py with a runnable entry' \
+                'Only the diff. No prose.' >> "$SCAFFOLD_FILE"
               ;;
             go)
               REQUIRED_GREP='(\+\+\+ b/go\.mod)|(\+\+\+ b/cmd/.*/main\.go)'
-              cat > "$SCAFFOLD_FILE" <<'EOF'
-Output a UNIFIED DIFF for a minimal Go project:
-- go.mod
-- cmd/app/main.go
-Only the diff. No prose.
-EOF
+              printf '%s\n' \
+                'Output a UNIFIED DIFF for a minimal Go project:' \
+                '- go.mod' \
+                '- cmd/app/main.go' \
+                'Only the diff. No prose.' >> "$SCAFFOLD_FILE"
               ;;
             ruby)
               REQUIRED_GREP='(\+\+\+ b/Gemfile)|(\+\+\+ b/lib/.*\.rb)'
-              cat > "$SCAFFOLD_FILE" <<'EOF'
-Output a UNIFIED DIFF for a minimal Ruby project:
-- Gemfile
-- lib/**.rb with an entry in bin/
-Only the diff. No prose.
-EOF
+              printf '%s\n' \
+                'Output a UNIFIED DIFF for a minimal Ruby project:' \
+                '- Gemfile' \
+                '- lib/**.rb with an entry in bin/' \
+                'Only the diff. No prose.' >> "$SCAFFOLD_FILE"
               ;;
             java|kotlin)
               REQUIRED_GREP='(\+\+\+ b/pom\.xml)|(\+\+\+ b/build\.gradle)|(\+\+\+ b/src/main/.*\.(java|kt))'
-              cat > "$SCAFFOLD_FILE" <<'EOF'
-Output a UNIFIED DIFF for a minimal JVM project:
-- Maven or Gradle build file
-- src/main/** with at least one class
-Only the diff. No prose.
-EOF
+              printf '%s\n' \
+                'Output a UNIFIED DIFF for a minimal JVM project:' \
+                '- Maven or Gradle build file' \
+                '- src/main/** with at least one class' \
+                'Only the diff. No prose.' >> "$SCAFFOLD_FILE"
               ;;
             csharp)
               REQUIRED_GREP='(\+\+\+ b/.*\.csproj)|(\+\+\+ b/Program\.cs)|(\+\+\+ b/src/.*\.cs)'
-              cat > "$SCAFFOLD_FILE" <<'EOF'
-Output a UNIFIED DIFF for a minimal .NET project:
-- *.csproj
-- Program.cs (top-level statements ok)
-Only the diff. No prose.
-EOF
+              printf '%s\n' \
+                'Output a UNIFIED DIFF for a minimal .NET project:' \
+                '- *.csproj' \
+                '- Program.cs (top-level statements ok)' \
+                'Only the diff. No prose.' >> "$SCAFFOLD_FILE"
               ;;
             *)
               REQUIRED_GREP='(\+\+\+ b/src/)'
-              echo "Output a UNIFIED DIFF that adds a minimal project with src/ and an entry file." > "$SCAFFOLD_FILE"
+              printf '%s\n' \
+                'Output a UNIFIED DIFF that adds a minimal project with src/ and an entry file.' \
+                'Only the diff. No prose.' >> "$SCAFFOLD_FILE"
               ;;
           esac
-          echo "required_grep<<EOF" >> "$GITHUB_OUTPUT"
-          echo "$REQUIRED_GREP" >> "$GITHUB_OUTPUT"
-          echo "EOF" >> "$GITHUB_OUTPUT"
+          printf 'required_grep<<EOF\n%s\nEOF\n' "$REQUIRED_GREP" >> "$GITHUB_OUTPUT"
           echo "scaffold_file=$SCAFFOLD_FILE" >> "$GITHUB_OUTPUT"
 
-          # ── プロンプト本文：言語・環境・許可パス・仕様本文を束ねる ───────────
+          # --- prompt body ---
           {
             printf "# Codex generation prompt\n\n"
             printf "## LANGUAGE (MUST)\n\nlanguage: %s\n" "$LANG_HINT"
@@ -356,7 +340,6 @@ EOF
             sed -E -e '1{/^```[a-zA-Z-]*[[:space:]]*$/d;}' -e '${/^```[[:space:]]*$/d;}' -i ai/out.repair.txt || true
             awk 'f||/^(diff --git|--- a\/)/{f=1; print}' ai/out.repair.txt > "$PATCH_FILE" || true
           fi
-          # 最終妥当性
           if ! grep -Eq '^(diff --git|--- a/)' "$PATCH_FILE"; then
             echo "::error::model did not return a unified diff"
             exit 4
@@ -372,14 +355,12 @@ EOF
           set -euo pipefail
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          # 通常適用。失敗時は 3-way で救済（full 生成なので止めない）
           if git apply --check "$PATCH_FILE"; then
             git apply --index --whitespace=fix "$PATCH_FILE"
           else
             echo "::warning::git apply check failed; attempting 3-way merge apply"
             git apply --3way --index --whitespace=fix "$PATCH_FILE" || true
           fi
-          # PR に不要なゴミの除外
           git restore --staged --worktree -- STATE.json 2>/dev/null || true
           rm -f STATE.json || true
 
