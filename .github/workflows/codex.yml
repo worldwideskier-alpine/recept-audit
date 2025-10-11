@@ -3,6 +3,7 @@ name: "Codex"
 on:
   workflow_dispatch:
     inputs:
+      # モードは常に full で運用する前提でも、将来の柔軟性のため入力は残します（既定は full）
       mode:
         description: "実行モード: full(全生成) / incremental(差分)"
         required: false
@@ -12,7 +13,7 @@ on:
       model:
         description: "OpenAI モデル名 (例: gpt-5-codex / gpt-5 / gpt-4.1 / gpt-4o-mini)"
         required: false
-        default: ""
+        default: "gpt-5-codex"
         type: string
 
   push:
@@ -131,7 +132,7 @@ jobs:
 
           is_patch() { grep -Eq '^(diff --git|--- a/)' "$1" && grep -Eq '(^\+\+\+ b/|^diff --git)' "$1"; }
 
-          # パッチ合成ヘルパ（作業ツリーに先書きしない）
+          # パッチ合成（作業ツリーへは書かず、diff だけを出力）
           synth_patch_from_text () {
             local target_rel="$1"; shift
             local tmp="ai/_scaffold.$$"
@@ -166,10 +167,9 @@ jobs:
           echo "Using model: $MODEL"
           echo "Base URL  : $BASE"
 
-          # ★ ダブルクォートに統一（$'…' を使用しない）
           SYSTEM_CONTRACT="You are a patch generator. Always output a unified diff (UTF-8) rooted at repository with at least one file changed. Default output directory is ${GEN_OUTPUT_DIR}/. Do not return a no-op. If spec is ambiguous, generate a minimal scaffold under that directory with TODO comments. No prose, no code fences."
 
-          # リクエスト（Responses では temperature を送らない）
+          # gpt-5-codex は /v1/responses（temperature を送らない）
           if printf "%s" "$MODEL" | grep -qiE '^gpt-5-codex( |$|-|:)'; then
             jq -n --arg model "$MODEL" --arg sys "$SYSTEM_CONTRACT" --rawfile prompt "$PROMPT_FILE" \
               '{
@@ -205,7 +205,7 @@ jobs:
             status=200
           fi
 
-          # 抽出（Responses / Chat 兼用）
+          # 抽出（Responses/Chat 兼用）
           EXTRACT_FILTER='[
             .output_text,
             ( try (
@@ -232,12 +232,11 @@ jobs:
             awk 'f||/^(diff --git|--- a\/)/{f=1; print}' ai/out.txt > "$PATCH_FILE"
           fi
 
-          # 不正なら repair → だめなら合成
+          # 不正なら repair → それでも不正なら合成
           if ! grep -Eq '^(diff --git|--- a/)' "$PATCH_FILE"; then
             echo "::warning::first attempt not a unified diff; retry with repair prompt"
             head -c 15000 ai/out.txt > ai/out.trim.txt || true
 
-            # ★ こちらもダブルクォートに統一
             REPAIR_SYS="You are a patch generator. If the given text already contains a unified diff, extract ONLY the diff. Otherwise, SYNTHESIZE a new diff that creates at least one file under ${GEN_OUTPUT_DIR}/ (e.g. README.generated.md with a short implementation plan and TODOs). No prose around the diff."
 
             if printf "%s" "$MODEL" | grep -qiE '^gpt-5-codex( |$|-|:)'; then
@@ -271,7 +270,6 @@ jobs:
             fi
           fi
 
-          # まだパッチでなければ合成
           if ! grep -Eq '^(diff --git|--- a/)' "$PATCH_FILE"; then
             echo "::warning::Synthesizing local minimal scaffold (final)"
             synth_patch_from_text "${GEN_OUTPUT_DIR}/README.generated.md"
@@ -286,23 +284,25 @@ jobs:
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
-          # まず適用可能かチェック
+          # index も更新しておくと変更検出が確実
           if git apply --check "$PATCH_FILE"; then
-            git apply --whitespace=fix "$PATCH_FILE"
+            git apply --index --whitespace=fix "$PATCH_FILE"
           elif git apply -R --check "$PATCH_FILE"; then
             echo "::notice::Patch already applied (reverse check passed)."
           else
             echo "::warning::Patch failed dry-run; attempt 3-way merge apply"
-            git apply --3way --whitespace=fix "$PATCH_FILE" || {
+            git apply --3way --index --whitespace=fix "$PATCH_FILE" || {
               echo "::error::git apply failed"; exit 1;
             }
           fi
 
-          # 差分が無ければ“バンプ”差分を合成
-          if git diff --quiet; then
+          # 未追跡も含めて変更有無を判定
+          if [ -z "$(git status --porcelain)" ]; then
             echo "::warning::No changes after applying patch; synthesizing bump diff"
             ts="$(date -u +%Y%m%dT%H%M%SZ)"
-            bump_rel="${GEN_OUTPUT_DIR}/.codex-run-${ts}.txt"
+            bump_rel=".codex/bumps/run-${ts}.txt"
+
+            mkdir -p .codex/bumps
             : > ai/_bump.diff
             {
               printf "%s\n" "--- /dev/null"
@@ -310,10 +310,19 @@ jobs:
               printf "%s\n" "@@ -0,0 +1 @@"
               printf "%s\n" "+codex run ${ts}"
             } >> ai/_bump.diff
-            git apply --whitespace=fix ai/_bump.diff
+
+            if ! git apply --index --whitespace=fix ai/_bump.diff; then
+              echo "::notice::bump diff apply failed; forcing add"
+              echo "codex run ${ts}" > "${bump_rel}"
+              git add -f "${bump_rel}"
+            fi
           fi
 
-          if git diff --quiet; then
+          if [ -z "$(git status --porcelain)" ]; then
+            echo "::group::diagnostics"
+            git status --ignored --porcelain=all || true
+            git check-ignore -vn ".codex/bumps" || true
+            echo "::endgroup::"
             echo "::error::No changes after applying patch and bump."
             exit 1
           fi
