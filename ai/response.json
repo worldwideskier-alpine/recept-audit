@@ -1,0 +1,72 @@
+{
+  "id": "resp_0b457c04304ae3580068e9f7b7b4348194a1992c666492c9ae",
+  "object": "response",
+  "created_at": 1760163767,
+  "status": "completed",
+  "background": false,
+  "billing": {
+    "payer": "developer"
+  },
+  "error": null,
+  "incomplete_details": null,
+  "instructions": null,
+  "max_output_tokens": 4096,
+  "max_tool_calls": null,
+  "model": "gpt-5-codex",
+  "output": [
+    {
+      "id": "rs_0b457c04304ae3580068e9f7b8a63081948c19be35755d656c",
+      "type": "reasoning",
+      "summary": []
+    },
+    {
+      "id": "msg_0b457c04304ae3580068e9f7d02f1481948b2a2ed1347ab859",
+      "type": "message",
+      "status": "completed",
+      "content": [
+        {
+          "type": "output_text",
+          "annotations": [],
+          "logprobs": [],
+          "text": "diff --git a/AUTO_REGEN_REPORT.json b/AUTO_REGEN_REPORT.json\nnew file mode 100644\nindex 0000000..93e5b05\n--- /dev/null\n+++ b/AUTO_REGEN_REPORT.json\n@@ -0,0 +1 @@\n+{}"
+        }
+      ],
+      "role": "assistant"
+    }
+  ],
+  "parallel_tool_calls": true,
+  "previous_response_id": null,
+  "prompt_cache_key": null,
+  "reasoning": {
+    "effort": "medium",
+    "summary": null
+  },
+  "safety_identifier": null,
+  "service_tier": "default",
+  "store": true,
+  "temperature": 1.0,
+  "text": {
+    "format": {
+      "type": "text"
+    },
+    "verbosity": "medium"
+  },
+  "tool_choice": "auto",
+  "tools": [],
+  "top_logprobs": 0,
+  "top_p": 1.0,
+  "truncation": "disabled",
+  "usage": {
+    "input_tokens": 7775,
+    "input_tokens_details": {
+      "cached_tokens": 0
+    },
+    "output_tokens": 1476,
+    "output_tokens_details": {
+      "reasoning_tokens": 1408
+    },
+    "total_tokens": 9251
+  },
+  "user": null,
+  "metadata": {}
+}
