@@ -21,12 +21,12 @@ jobs:
       PROMPT_FILE: "ai/prompt.md"
       PATCH_FILE: "ai/patch.diff"
       FILES_JSON: "ai/files.json"
-      OPENAI_MODEL: "gpt-5-codex"                   # 代替モデルは使わない
+      OPENAI_MODEL: "gpt-5-codex"                      # 代替モデルには切り替えない
       OPENAI_API_KEY: "${{ secrets.OPENAI_API_KEY }}"
-      OPENAI_BASE_URL: "${{ secrets.OPENAI_BASE_URL }}"  # 未指定なら https://api.openai.com
+      OPENAI_BASE_URL: "${{ secrets.OPENAI_BASE_URL }}" # 未設定なら https://api.openai.com
       BRANCH_PREFIX: "codex/autogen"
       MAX_OUT_TOKENS: "12288"
-      TEMPERATURE: "0"                               # 非対応なら自動で送らない
+      TEMPERATURE: "0"                                  # 非対応なら送らない
       CURL_TIMEOUT: "300"
       CURL_RETRIES: "5"
       CURL_RETRY_DELAY: "5"
@@ -48,7 +48,7 @@ jobs:
           mkdir -p ai
           command -v jq >/dev/null || (sudo apt-get update -y && sudo apt-get install -y jq)
 
-      # モデル固定のまま、どの API を使うか／temperature 可否を事前判定
+      # モデル固定のまま /v1/responses or /v1/chat/completions を事前プローブ
       - name: "Probe endpoint & features for this model"
         id: probe
         run: |
@@ -56,8 +56,8 @@ jobs:
           BASE="${OPENAI_BASE_URL:-https://api.openai.com}"; BASE="${BASE%/}"
           MODEL="${OPENAI_MODEL}"
 
-          # 最小疎通（Responses / Chat）
-          PROBE_TOKENS_RESP=32   # responses は min 16
+          # 最小疎通（各APIの最小仕様に合わせる）
+          PROBE_TOKENS_RESP=32   # responses の min は 16
           PROBE_TOKENS_CHAT=16
 
           r_tmp="$(mktemp)"
@@ -83,7 +83,7 @@ jobs:
           if [ "$c_code" -lt 300 ] && [ "$r_code" -ge 300 ]; then api="chat"; fi
           if [ "$c_code" -lt 300 ] && [ "$r_code" -lt 300 ]; then api="responses"; fi
 
-          # temperature 可否
+          # temperature 可否プローブ
           t_tmp="$(mktemp)"
           if [ "$api" = "responses" ]; then
             t_req='{"model":"'"$MODEL"'","input":[{"role":"user","content":[{"type":"input_text","text":"ping"}]}],"max_output_tokens":'"$PROBE_TOKENS_RESP"',"temperature":0}'
@@ -121,7 +121,7 @@ jobs:
           : > "ai/allowed_paths.txt"
           : > "$PROMPT_FILE"
 
-          # 言語ヒント（spec→repo フォールバック）
+          # 言語ヒント
           LANG_HINT=""
           for root in "${SPEC_ROOT}/env" "${SPEC_ROOT}/foundation" "${SPEC_ROOT}/features" "${SPEC_ROOT}"; do
             [ -d "$root" ] || continue
@@ -152,6 +152,7 @@ jobs:
             else LANG_HINT="typescript"
             fi
           fi
+          echo "lang_hint=$LANG_HINT" >> "$GITHUB_OUTPUT"
           echo "Language from specs/repo: ${LANG_HINT}"
 
           # ALLOWED_PATHS 抽出
@@ -165,7 +166,7 @@ jobs:
           grep -R -h -E "(^|\s)(dir|directory|folder|ディレクトリ)\s*:\s*[A-Za-z0-9_./-]+/?" "$SPEC_ROOT" \
             | sed -E "s/.*:\s*//; s/[\"']//g" | awk '{gsub(/\/?$/,"/");print}' >> "ai/allowed_paths.txt" || true
 
-          # コードパスの種付け（コード拡張子が無い場合）
+          # コードルートの種付け（何も無い時）
           if ! grep -Eq '\.(php|ts|tsx|js|jsx|py|rb|go|java|cs|sql)$' ai/allowed_paths.txt; then
             case "$LANG_HINT" in
               typescript) printf "%s\n" "src/" "app/" "lib/" "server/" "package.json" "tsconfig.json" >> ai/allowed_paths.txt ;;
@@ -190,22 +191,15 @@ jobs:
             else
               printf -- "- /\n"
             fi
+            printf "\n## Example header (force unified diff)\n\ndiff --git a/app.php b/app.php\n"
+            printf "\n## STRICT OUTPUT RULES\n\n"
+            printf -- "- Output ONE Git unified diff (UTF-8). No prose, no code fences.\n"
+            printf -- "- MUST start with: diff --git a/<path> b/<path>\n"
+            printf -- "- Implement the SPECIFICATION as runnable APPLICATION CODE and TESTS.\n"
+            printf -- "- Prefer creating/updating SOURCE CODE under the ALLOWED_PATHS code roots.\n"
+            printf -- "- Do NOT create compliance/policy/README/meta documents.\n"
+            printf -- "- Include real code (no placeholders). If initial attempt fails, still SYNTHESIZE a complete diff that fulfills the specs.\n"
           } >> "$PROMPT_FILE"
-
-          lines=(
-            ""
-            "## Example header (force unified diff)"
-            "diff --git a/app.php b/app.php"
-            ""
-            "## STRICT OUTPUT RULES"
-            "- Output ONE Git unified diff (UTF-8). No prose, no code fences."
-            "- MUST start with: diff --git a/<path> b/<path>"
-            "- Implement the SPECIFICATION as runnable APPLICATION CODE and TESTS."
-            "- Prefer creating/updating SOURCE CODE under the ALLOWED_PATHS code roots."
-            "- Do NOT create compliance/policy/README/meta documents."
-            "- Include real code (no placeholders). If initial attempt fails, still SYNTHESIZE a complete diff that fulfills the specs."
-          )
-          for l in "${lines[@]}"; do printf "%s\n" "$l" >> "$PROMPT_FILE"; done
 
           # 仕様書を連結
           tmp_list="$(mktemp)"
@@ -223,7 +217,7 @@ jobs:
       - name: "Show language & allowed paths (for humans)"
         run: |
           echo "### Language hint" >> "$GITHUB_STEP_SUMMARY"
-          echo "${LANG_HINT:-unknown}" >> "$GITHUB_STEP_SUMMARY"
+          echo "${{ steps.compose.outputs.lang_hint }}" >> "$GITHUB_STEP_SUMMARY"
           echo "### Allowed paths" >> "$GITHUB_STEP_SUMMARY"
           if [ -s ai/allowed_paths.txt ]; then
             sed 's/^/- /' ai/allowed_paths.txt >> "$GITHUB_STEP_SUMMARY"
@@ -239,8 +233,8 @@ jobs:
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
           MODEL="${OPENAI_MODEL}"
-          BASE="${{ steps.probe.outputs.base || env.OPENAI_BASE_URL }}"
-          BASE="${BASE:-https://api.openai.com}"; BASE="${BASE%/}"
+          BASE="${{ steps.probe.outputs.base }}"
+          BASE="${BASE:-${OPENAI_BASE_URL:-https://api.openai.com}}"; BASE="${BASE%/}"
           API_KIND="${{ steps.probe.outputs.api }}"
           ALLOW_TEMPERATURE="${{ steps.probe.outputs.allow_temp }}"
           [ -z "$API_KIND" ] && API_KIND="responses"
@@ -255,7 +249,7 @@ jobs:
           BRANCH_NAME="${BRANCH_PREFIX}-${GITHUB_RUN_ID}"
           git checkout -b "${BRANCH_NAME}"
 
-          # jq 抽出ファイル（heredoc 不使用）
+          # jq 抽出ファイル（heredoc なし）
           {
             printf 'def texts:\n'
             printf '  (try(.output_text) // empty),\n'
@@ -391,7 +385,7 @@ jobs:
             fi
           fi
 
-          # files-JSON フォールバック
+          # ---------- files-JSON フォールバック（抽出→フェンス除去→JSON正規化） ----------
           if ! git diff --cached --name-only | grep -q "."; then
             echo "::warning::No staged changes after diff path; switching to files-JSON fallback"
             system3=$'Output ONLY a compact JSON with exact key `files`: [{ "path": "relative/path", "content": "UTF-8 file content" }, ...]. No prose, no markdown, no trailing text.\nImplement the SPEC as WORKING CODE (and minimal build/config/test files) under ALLOWED_PATHS.\nDo NOT include compliance/policy/README/meta documents.'
@@ -401,8 +395,27 @@ jobs:
               else gen_req "$system3" "$PROMPT_FILE" "ai/request.files.json"; fi
             done
 
-            jq 'try(.files) // empty' "ai/response.files.json" > "$FILES_JSON"
-            if [ ! -s "$FILES_JSON" ] || ! jq -e 'type=="array" and length>0 and all(.[]; has("path") and has("content"))' "$FILES_JSON" >/dev/null; then
+            # ① API 応答から本文テキストを抽出
+            jq -r -f "ai/extract.jq" "ai/response.files.json" > "ai/out.files.txt"
+            # ② コードフェンス除去
+            sed -E -e '1{/^```[a-zA-Z-]*[[:space:]]*$/d;}' -e '${/^```[[:space:]]*$/d;}' -i "ai/out.files.txt" || true
+            # ③ JSON 妥当性
+            if ! jq -e . "ai/out.files.txt" >/dev/null 2>&1; then
+              echo "::error::Model did not return parseable JSON"; exit 7
+            fi
+            # ④ 形の正規化 → files 配列
+            jq -c '
+              def normalize:
+                if type=="array" then .                                   # [{path,content}...]
+                elif type=="object" and has("files") then .files           # {files:[...]}
+                elif type=="object" and (has("path") and has("content")) then [ {path:.path, content:.content} ]  # 単体
+                elif type=="object" then [ to_entries[] | {path:.key, content:.value} ]                            # 連想配列
+                else [] end;
+              normalize
+            ' "ai/out.files.txt" > "$FILES_JSON"
+
+            # ⑤ バリデーション
+            if [ ! -s "$FILES_JSON" ] || ! jq -e 'type=="array" and length>0 and all(.[]; (has("path") and has("content")) and (.path|type=="string") and (.content|type=="string"))' "$FILES_JSON" >/dev/null; then
               echo "::error::Model did not return valid files JSON"; exit 7
             fi
 
@@ -414,7 +427,6 @@ jobs:
 
               # ai/ 配下は触らない
               if printf "%s" "$p" | grep -q '^ai/'; then echo "::warning::skip ai/: $p"; continue; fi
-
               # 文書・ポリシー系は拒否
               if printf "%s" "$p" | grep -qiE '(COMPLIANCE|SECURITY|CODE_OF_CONDUCT|CONTRIBUTING|README)\.(md|txt|json)$'; then
                 echo "::warning::skip non-code doc: $p"; continue
@@ -433,12 +445,13 @@ jobs:
               git add "$p"
             done
           fi
+          # ------------------------------------------------------------------
 
           # 何もステージされていない → 失敗
           if ! git diff --cached --name-only | grep -q "."; then
             echo "::error::No changes staged after all paths"; exit 6
           fi
-          # コード拡張子が無ければ失敗
+          # コード拡張子が無ければ失敗（非コードPRを防止）
           if ! git diff --cached --name-only | grep -E '\.(php|ts|tsx|js|jsx|py|rb|go|java|cs|sql)$' >/dev/null; then
             echo "::error::No code files staged (only non-code docs). Aborting."; exit 6
           fi
@@ -467,4 +480,5 @@ jobs:
             ai/patch.diff
             ai/request.files.json
             ai/response.files.json
+            ai/out.files.txt
             ai/files.json
