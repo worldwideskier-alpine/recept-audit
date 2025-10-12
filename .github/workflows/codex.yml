@@ -21,12 +21,12 @@ jobs:
       PROMPT_FILE: "ai/prompt.md"
       PATCH_FILE: "ai/patch.diff"
       FILES_JSON: "ai/files.json"
-      OPENAI_MODEL: "gpt-5-codex"                      # 代替モデルへは切替えない
+      OPENAI_MODEL: "gpt-5-codex"
       OPENAI_API_KEY: "${{ secrets.OPENAI_API_KEY }}"
-      OPENAI_BASE_URL: "${{ secrets.OPENAI_BASE_URL }}" # 未設定なら https://api.openai.com
+      OPENAI_BASE_URL: "${{ secrets.OPENAI_BASE_URL }}"
       BRANCH_PREFIX: "codex/autogen"
       MAX_OUT_TOKENS: "12288"
-      TEMPERATURE: "0"                                  # 非対応なら送らない
+      TEMPERATURE: "0"
       CURL_TIMEOUT: "300"
       CURL_RETRIES: "5"
       CURL_RETRY_DELAY: "5"
@@ -48,28 +48,23 @@ jobs:
           mkdir -p ai
           command -v jq >/dev/null || (sudo apt-get update -y && sudo apt-get install -y jq)
 
-      - name: "Probe endpoint & features for this model"
+      - name: "Probe endpoint & features"
         id: probe
         run: |
           set -euo pipefail
           BASE="${OPENAI_BASE_URL:-https://api.openai.com}"; BASE="${BASE%/}"
           MODEL="${OPENAI_MODEL}"
-          PROBE_TOKENS_RESP=32
-          PROBE_TOKENS_CHAT=16
-
           r_tmp="$(mktemp)"
-          r_req='{"model":"'"$MODEL"'","input":[{"role":"user","content":[{"type":"input_text","text":"ping"}]}],"max_output_tokens":'"$PROBE_TOKENS_RESP"'}'
-          curl -sS -w "\n%{http_code}\n" \
-               -H "Authorization: Bearer ${OPENAI_API_KEY}" -H "Content-Type: application/json" \
+          r_req='{"model":"'"$MODEL"'","input":[{"role":"user","content":[{"type":"input_text","text":"ping"}]}],"max_output_tokens":32}'
+          curl -sS -w "\n%{http_code}\n" -H "Authorization: Bearer ${OPENAI_API_KEY}" -H "Content-Type: application/json" \
                -d "$r_req" "$BASE/v1/responses" | tee "$r_tmp" >/dev/null
           r_code="$(tail -n1 "$r_tmp")"
           head -n -1 "$r_tmp" > ai/probe.responses.json || true
           rm -f "$r_tmp"
 
           c_tmp="$(mktemp)"
-          c_req='{"model":"'"$MODEL"'","max_tokens":'"$PROBE_TOKENS_CHAT"',"messages":[{"role":"system","content":"Reply with OK."},{"role":"user","content":"ping"}]}'
-          curl -sS -w "\n%{http_code}\n" \
-               -H "Authorization: Bearer ${OPENAI_API_KEY}" -H "Content-Type: application/json" \
+          c_req='{"model":"'"$MODEL"'","max_tokens":16,"messages":[{"role":"system","content":"Reply with OK."},{"role":"user","content":"ping"}]}'
+          curl -sS -w "\n%{http_code}\n" -H "Authorization: Bearer ${OPENAI_API_KEY}" -H "Content-Type: application/json" \
                -d "$c_req" "$BASE/v1/chat/completions" | tee "$c_tmp" >/dev/null
           c_code="$(tail -n1 "$c_tmp")"
           head -n -1 "$c_tmp" > ai/probe.chat.json || true
@@ -82,14 +77,13 @@ jobs:
 
           t_tmp="$(mktemp)"
           if [ "$api" = "responses" ]; then
-            t_req='{"model":"'"$MODEL"'","input":[{"role":"user","content":[{"type":"input_text","text":"ping"}]}],"max_output_tokens":'"$PROBE_TOKENS_RESP"',"temperature":0}'
+            t_req='{"model":"'"$MODEL"'","input":[{"role":"user","content":[{"type":"input_text","text":"ping"}]}],"max_output_tokens":32,"temperature":0}'
             t_url="$BASE/v1/responses"
           else
-            t_req='{"model":"'"$MODEL"'","max_tokens":'"$PROBE_TOKENS_CHAT"',"temperature":0,"messages":[{"role":"user","content":"ping"}]}'
+            t_req='{"model":"'"$MODEL"'","max_tokens":16,"temperature":0,"messages":[{"role":"user","content":"ping"}]}'
             t_url="$BASE/v1/chat/completions"
           fi
-          curl -sS -w "\n%{http_code}\n" \
-               -H "Authorization: Bearer ${OPENAI_API_KEY}" -H "Content-Type: application/json" \
+          curl -sS -w "\n%{http_code}\n" -H "Authorization: Bearer ${OPENAI_API_KEY}" -H "Content-Type: application/json" \
                -d "$t_req" "$t_url" | tee "$t_tmp" >/dev/null
           t_code="$(tail -n1 "$t_tmp")"
           head -n -1 "$t_tmp" > ai/probe.temperature.json || true
@@ -98,17 +92,13 @@ jobs:
           allow_temp=1
           if [ "$t_code" -ge 300 ] && command -v jq >/dev/null 2>&1; then
             msg="$(jq -r '.error?.message // empty' ai/probe.temperature.json)"
-            case "$msg" in
-              *"Unsupported parameter"*temperature* ) allow_temp=0 ;;
-            esac
+            case "$msg" in *"Unsupported parameter"*temperature* ) allow_temp=0 ;; esac
             [ -n "$msg" ] && echo "::notice::temperature probe: $msg"
           fi
 
           echo "base=$BASE"             >> "$GITHUB_OUTPUT"
           echo "api=$api"               >> "$GITHUB_OUTPUT"
           echo "allow_temp=$allow_temp" >> "$GITHUB_OUTPUT"
-          echo "model=$MODEL"           >> "$GITHUB_OUTPUT"
-          echo "API decided: $api  (temperature allowed: $allow_temp)"
 
       - name: "Compose prompt (FULL from specs)"
         id: compose
@@ -122,8 +112,7 @@ jobs:
             [ -d "$root" ] || continue
             hit="$(grep -R -n -i -E "^\s*(language|runtime\.language|lang|stack\.language|runtime)\s*[:=]\s*" "$root" 2>/dev/null | head -n1 || true)"
             if [ -n "$hit" ]; then
-              LANG_HINT="$(printf "%s" "$hit" | sed -E "s/.*[:=]\s*//; s/[\",]//g; s/\s+$//;" | tr "A-Z" "a-z")"
-              break
+              LANG_HINT="$(printf "%s" "$hit" | sed -E "s/.*[:=]\s*//; s/[\",]//g; s/\s+$//;" | tr "A-Z" "a-z")"; break
             fi
           done
           case "${LANG_HINT:-}" in
@@ -136,19 +125,15 @@ jobs:
             c#|dotnet*|.net*|cs) LANG_HINT="csharp" ;;
             "" )                 LANG_HINT="auto" ;;
           esac
-          if [ "${LANG_HINT:-}" = "auto" ] || [ -z "${LANG_HINT:-}" ]; then
+          if [ "$LANG_HINT" = "auto" ]; then
             if   find . -type f \( -name "*.ts" -o -name "*.tsx" -o -name "*.js" -o -name "*.jsx" \) -print -quit | grep -q .; then LANG_HINT="typescript"
-            elif find . -type f -name "*.py"     -print -quit | grep -q .; then LANG_HINT="python"
-            elif [ -f composer.json ] || find . -type f -name "*.php" -print -quit | grep -q .; then LANG_HINT="php"
-            elif [ -f go.mod ]        || find . -type f -name "*.go"  -print -quit | grep -q .; then LANG_HINT="go"
-            elif find . -type f \( -name "*.cs" -o -name "*.csproj" -o -name "*.sln" \) -print -quit | grep -q .; then LANG_HINT="csharp"
-            elif find . -type f \( -name "*.java" -o -name "pom.xml" -o -name "build.gradle*" \) -print -quit | grep -q .; then LANG_HINT="java"
-            elif find . -type f -name "*.rb" -print -quit | grep -q .; then LANG_HINT="ruby"
+            elif find . -type f -name "*.py"  -print -quit | grep -q .; then LANG_HINT="python"
+            elif find . -type f -name "*.php" -print -quit | grep -q . || [ -f composer.json ]; then LANG_HINT="php"
+            elif [ -f go.mod ]; then LANG_HINT="go"
             else LANG_HINT="typescript"
             fi
           fi
           echo "lang_hint=$LANG_HINT" >> "$GITHUB_OUTPUT"
-          echo "Language from specs/repo: ${LANG_HINT}"
 
           grep -R -n -E "(^|\s)(file|path|destination|output|生成先|出力先)\s*:\s*([A-Za-z0-9_./-]+\.[A-Za-z0-9]+)" "$SPEC_ROOT" \
             | sed -E "s/.*:\s*//; s/[\"']//g" \
@@ -160,13 +145,10 @@ jobs:
 
           if ! grep -Eq '\.(php|ts|tsx|js|jsx|py|rb|go|java|cs|sql)$' ai/allowed_paths.txt; then
             case "$LANG_HINT" in
-              typescript) printf "%s\n" "src/" "app/" "lib/" "server/" "package.json" "tsconfig.json" >> ai/allowed_paths.txt ;;
-              python)     printf "%s\n" "src/" "app/" "lib/" "pyproject.toml" "requirements.txt" >> ai/allowed_paths.txt ;;
+              typescript) printf "%s\n" "src/" "app/" "lib/" "package.json" "tsconfig.json" >> ai/allowed_paths.txt ;;
+              python)     printf "%s\n" "src/" "app/" "pyproject.toml" "requirements.txt" >> ai/allowed_paths.txt ;;
               php)        printf "%s\n" "src/" "app/" "public/" "composer.json" >> ai/allowed_paths.txt ;;
               go)         printf "%s\n" "cmd/" "internal/" "pkg/" "go.mod" >> ai/allowed_paths.txt ;;
-              java)       printf "%s\n" "src/main/" "src/test/" "pom.xml" "build.gradle" >> ai/allowed_paths.txt ;;
-              csharp)     printf "%s\n" "src/" "app/" >> ai/allowed_paths.txt ;;
-              ruby)       printf "%s\n" "app/" "lib/" "Gemfile" >> ai/allowed_paths.txt ;;
             esac
           fi
           sed -E "s#^\./##; s#//+#/#g" -i "ai/allowed_paths.txt" || true
@@ -176,17 +158,12 @@ jobs:
             printf "# Codex generation prompt\n\n"
             printf "## LANGUAGE (MUST)\n\nlanguage: %s\n" "$LANG_HINT"
             printf "\n## ALLOWED_PATHS (only modify/create under these; NEVER touch ai/)\n\n"
-            if [ -s "ai/allowed_paths.txt" ]; then
-              while IFS= read -r line; do printf -- "- %s\n" "$line"; done < "ai/allowed_paths.txt"
-            else
-              printf -- "- /\n"
-            fi
+            while IFS= read -r line; do printf -- "- %s\n" "$line"; done < "ai/allowed_paths.txt"
             printf "\n## Example header (force unified diff)\n\ndiff --git a/app.php b/app.php\n"
             printf "\n## STRICT OUTPUT RULES\n\n"
             printf -- "- Output ONE Git unified diff (UTF-8). No prose, no code fences.\n"
             printf -- "- MUST start with: diff --git a/<path> b/<path>\n"
-            printf -- "- Implement the SPECIFICATION as runnable APPLICATION CODE and TESTS.\n"
-            printf -- "- Prefer creating/updating SOURCE CODE under the ALLOWED_PATHS code roots.\n"
+            printf -- "- Implement the SPEC as runnable APPLICATION CODE and TESTS under ALLOWED_PATHS.\n"
             printf -- "- Do NOT create compliance/policy/README/meta documents.\n"
             printf -- "- Include real code (no placeholders). If initial attempt fails, still SYNTHESIZE a complete diff that fulfills the specs.\n"
           } >> "$PROMPT_FILE"
@@ -203,19 +180,7 @@ jobs:
           done < "$tmp_list"
           rm -f "$tmp_list"
 
-      - name: "Show language & allowed paths (for humans)"
-        run: |
-          echo "### Language hint" >> "$GITHUB_STEP_SUMMARY"
-          echo "${{ steps.compose.outputs.lang_hint }}" >> "$GITHUB_STEP_SUMMARY"
-          echo "### Allowed paths" >> "$GITHUB_STEP_SUMMARY"
-          if [ -s ai/allowed_paths.txt ]; then
-            sed 's/^/- /' ai/allowed_paths.txt >> "$GITHUB_STEP_SUMMARY"
-          else
-            echo "- (empty)" >> "$GITHUB_STEP_SUMMARY"
-          fi
-
       - name: "Generate unified diff, commit to new branch, push"
-        id: gen
         run: |
           set -euo pipefail
           git config user.name  "github-actions[bot]"
@@ -228,12 +193,7 @@ jobs:
           ALLOW_TEMPERATURE="${{ steps.probe.outputs.allow_temp }}"
           [ -z "$API_KIND" ] && API_KIND="responses"
           [ -z "$ALLOW_TEMPERATURE" ] && ALLOW_TEMPERATURE=0
-
-          if [ "$API_KIND" = "chat" ]; then
-            ENDPOINT="${BASE}/v1/chat/completions"
-          else
-            ENDPOINT="${BASE}/v1/responses"
-          fi
+          if [ "$API_KIND" = "chat" ]; then ENDPOINT="${BASE}/v1/chat/completions"; else ENDPOINT="${BASE}/v1/responses"; fi
 
           BRANCH_NAME="${BRANCH_PREFIX}-${GITHUB_RUN_ID}"
           git checkout -b "${BRANCH_NAME}"
@@ -278,25 +238,14 @@ jobs:
                    -w "\n%{http_code}\n" -d @"$req" "$ENDPOINT" | tee "$tmp" >/dev/null
               local status; status="$(tail -n1 "$tmp")"
               head -n -1 "$tmp" > "$out"; rm -f "$tmp"
-
               if [ "$status" -lt 300 ]; then return 0; fi
-
               local msg=""; if command -v jq >/dev/null 2>&1; then msg="$(jq -r '.error?.message // empty' "$out")"; fi
               [ -n "$msg" ] && echo "::notice::API error $status: $msg"
-
               case "$status" in
-                408|429|500|502|503|504)
-                  echo "::warning::transient ${status}; shrinking tokens and retrying"
-                  MAX_OUT_TOKENS=$(( MAX_OUT_TOKENS / 2 )); [ "$MAX_OUT_TOKENS" -lt 4096 ] && MAX_OUT_TOKENS=4096
-                  attempt=$((attempt+1)); return 1 ;;
+                408|429|500|502|503|504) echo "::warning::transient ${status}; shrinking tokens and retrying"; MAX_OUT_TOKENS=$(( MAX_OUT_TOKENS / 2 )); [ "$MAX_OUT_TOKENS" -lt 4096 ] && MAX_OUT_TOKENS=4096; attempt=$((attempt+1)); return 1 ;;
                 400)
                   case "$msg" in
-                    *"Unsupported parameter"*temperature* )
-                      if [ "$ALLOW_TEMPERATURE" -ne 0 ]; then
-                        echo "::warning::disabling temperature for this model"
-                        ALLOW_TEMPERATURE=0
-                        return 1
-                      fi ;;
+                    *"Unsupported parameter"*temperature* ) if [ "$ALLOW_TEMPERATURE" -ne 0 ]; then echo "::warning::disabling temperature for this model"; ALLOW_TEMPERATURE=0; return 1; fi ;;
                     *"only supported in v1/responses"* ) API_KIND="responses"; ENDPOINT="${BASE}/v1/responses"; return 1 ;;
                     *"only supported in v1/chat/completions"* ) API_KIND="chat"; ENDPOINT="${BASE}/v1/chat/completions"; return 1 ;;
                   esac
@@ -307,13 +256,13 @@ jobs:
             echo "::error::repeated transient failures"; return 2
           }
 
+          # 1) diff 生成
           system1=$'Output ONLY a Git unified diff.\nMUST start with: diff --git a/<path> b/<path>\nNo prose or fences.'
           gen_req "$system1" "$PROMPT_FILE" "ai/request.json"
           for _ in 1 2 3; do
             if call_api_with_retry "ai/request.json" "ai/response.json"; then break
             else gen_req "$system1" "$PROMPT_FILE" "ai/request.json"; fi
           done
-
           jq -r -f "ai/extract.jq" "ai/response.json" > "ai/out.txt"
           sed -E -e '1{/^```[a-zA-Z-]*[[:space:]]*$/d;}' -e '${/^```[[:space:]]*$/d;}' -i "ai/out.txt" || true
           awk 'f||/^(diff --git|--- a\/|\*\*\* |Index: )/{f=1; print}' "ai/out.txt" > "$PATCH_FILE" || true
@@ -323,7 +272,6 @@ jobs:
              && grep -Eq "(\+\+\+ b\/|^diff --git|^--- b\/)" "$PATCH_FILE"; then
             is_unified=1
           fi
-
           if [ "$is_unified" -ne 1 ]; then
             echo "::warning::first attempt not a unified diff; repairing"
             system2=$'Output ONLY a Git unified diff.\nMUST start with: diff --git a/<path> b/<path>\nNo prose or fences.'
@@ -342,40 +290,30 @@ jobs:
               fi
             done
           fi
-
           if [ "$is_unified" -eq 1 ]; then
-            if git apply --check "$PATCH_FILE"; then
-              git apply --index --whitespace=fix "$PATCH_FILE"
-            else
-              echo "::warning::git apply check failed; attempting 3-way merge"
-              git apply --3way --index --whitespace=fix "$PATCH_FILE" || true
-            fi
+            if git apply --check "$PATCH_FILE"; then git apply --index --whitespace=fix "$PATCH_FILE"
+            else echo "::warning::git apply check failed; attempting 3-way merge"; git apply --3way --index --whitespace=fix "$PATCH_FILE" || true; fi
           fi
 
-          # ---------- files-JSON フォールバック ----------
+          # 2) files-JSON フォールバック
           if ! git diff --cached --name-only | grep -q "."; then
             echo "::warning::No staged changes after diff path; switching to files-JSON fallback"
-
-            system3=$'Output ONLY a compact JSON with exact key `files`: [{ "path": "relative/path", "content": "UTF-8 file content" }, ...]. No prose, no markdown, no trailing text.\nImplement the SPEC as WORKING CODE (and minimal build/config/test files) under ALLOWED_PATHS.\nDo NOT include compliance/policy/README/meta documents.'
+            system3=$'Output ONLY a compact JSON with exact key `files`: [{ "path": "relative/path", "content": "UTF-8 file content" }, ...]. No prose, no markdown, no trailing text.\nImplement the SPEC as WORKING CODE under ALLOWED_PATHS.'
             gen_req "$system3" "$PROMPT_FILE" "ai/request.files.json"
             for _ in 1 2 3; do
               if call_api_with_retry "ai/request.files.json" "ai/response.files.json"; then break
               else gen_req "$system3" "$PROMPT_FILE" "ai/request.files.json"; fi
             done
 
-            # 応答本文を抽出→フェンス除去
             jq -r -f "ai/extract.jq" "ai/response.files.json" > "ai/out.files.txt"
             sed -E -e '1{/^```[a-zA-Z-]*[[:space:]]*$/d;}' -e '${/^```[[:space:]]*$/d;}' -i "ai/out.files.txt" || true
 
-            # ① 最初のパース
-            parse_ok=1
-            jq -e . "ai/out.files.txt" >/dev/null 2>&1 || parse_ok=0
-
-            # ② 失敗時は JSON 修復を 2 回まで
+            # parseable? ダメなら修復
+            parse_ok=1; jq -e . "ai/out.files.txt" >/dev/null 2>&1 || parse_ok=0
             if [ $parse_ok -ne 1 ]; then
               echo "::warning::files JSON not parseable; attempting repair"
               cp "ai/out.files.txt" "ai/out.files.prev.txt"
-              system4=$'You will receive a model output that SHOULD be JSON but is not strictly parseable.\nReturn ONLY strict JSON with the exact top-level key `files` (array of {path, content} strings). No prose, no markdown, no extra keys.'
+              system4=$'You will receive an almost-JSON model output. Return ONLY strict JSON with the exact top-level key `files` (array of {path, content} strings). No prose.'
               for i in 1 2; do
                 gen_req "$system4" "ai/out.files.prev.txt" "ai/request.files.repair.json"
                 if call_api_with_retry "ai/request.files.repair.json" "ai/response.files.repair.json"; then
@@ -385,41 +323,45 @@ jobs:
                 fi
               done
             fi
+            [ $parse_ok -ne 1 ] && { echo "::error::Model did not return parseable JSON"; exit 7; }
 
-            if [ $parse_ok -ne 1 ]; then
-              echo "::error::Model did not return parseable JSON"; exit 7
-            fi
+            # 正規化 jq を作成（再帰探索＋content を文字列化）
+            {
+              printf 'def to_text(x):\n'
+              printf '  if x==null then ""\n'
+              printf '  elif (x|type)=="string" then x\n'
+              printf '  elif (x|type)=="array" then (x|map(tostring)|join("\\n"))\n'
+              printf '  elif (x|type)=="object" and (x|has("code")) then to_text(x.code)\n'
+              printf '  elif (x|type)=="object" and (x|has("text")) then to_text(x.text)\n'
+              printf '  else tostring end;\n'
+              printf 'def pick_files:\n'
+              printf '  if (type=="object") and has("files") and (.files|type)=="array" then (.files)\n'
+              printf '  elif (type=="array") then .\n'
+              printf '  elif (type=="object") and (has("path") and has("content")) then [ {path:.path, content:.content} ]\n'
+              printf '  elif (type=="object") then ( [ .[] ] | map(pick_files) | add? ) // []\n'
+              printf '  else [] end;\n'
+              printf 'pick_files\n'
+              printf '| map({ path: ( ( .path // .file // .name // .filename // "" ) | tostring ),\n'
+              printf '        content: to_text( ( .content // .code // .text // "" ) ) })\n'
+            } > "ai/normalize.jq"
 
-            # ③ 形の差を files 配列に正規化
-            jq -c '
-              def normalize:
-                if type=="array" then .
-                elif type=="object" and has("files") then .files
-                elif type=="object" and (has("path") and has("content")) then [ {path:.path, content:.content} ]
-                elif type=="object" then [ to_entries[] | {path:.key, content:.value} ]
-                else [] end;
-              normalize
-            ' "ai/out.files.txt" > "$FILES_JSON"
+            jq -c -f "ai/normalize.jq" "ai/out.files.txt" > "$FILES_JSON"
 
-            # ④ 検証
-            if [ ! -s "$FILES_JSON" ] || ! jq -e 'type=="array" and length>0 and all(.[]; (has("path") and has("content")) and (.path|type=="string") and (.content|type=="string"))' "$FILES_JSON" >/dev/null; then
+            # 検証：配列・各要素に path/content があること（型は文字列化済み）
+            if [ ! -s "$FILES_JSON" ] || ! jq -e 'type=="array" and length>0 and all(.[]; has("path") and has("content"))' "$FILES_JSON" >/dev/null; then
               echo "::error::Model did not return valid files JSON"; exit 7
             fi
 
-            # ⑤ 書き込み（ai/や非コード文書を除外、許可パスのみ）
+            # 書き込み（ai/ と非コード系を除外、許可パスのみ）
             allow_all=0
             if [ -s "ai/allowed_paths.txt" ]; then mapfile -t ALLOWED < "ai/allowed_paths.txt"; else allow_all=1; fi
             jq -r '.[] | @base64' "$FILES_JSON" | while read -r row; do
               _jq(){ echo "$row" | base64 -d | jq -r "$1"; }
               p="$(_jq '.path')"; c="$(_jq '.content')"
-
-              # ai/ は常にスキップ
               if printf "%s" "$p" | grep -q '^ai/'; then echo "::warning::skip ai/: $p"; continue; fi
-              # 非コード文書は拒否
               if printf "%s" "$p" | grep -qiE '(COMPLIANCE|SECURITY|CODE_OF_CONDUCT|CONTRIBUTING|README)\.(md|txt|json)$'; then
                 echo "::warning::skip non-code doc: $p"; continue
               fi
-
               ok="$allow_all"
               if [ "$allow_all" -ne 1 ]; then
                 for pat in "${ALLOWED[@]}"; do
@@ -427,26 +369,20 @@ jobs:
                 done
               fi
               [ "$ok" -ne 1 ] && { echo "::warning::skip (not allowed): $p"; continue; }
-
-              mkdir -p "$(dirname "$p")"
-              printf "%s" "$c" > "$p"
-              git add "$p"
+              mkdir -p "$(dirname "$p")"; printf "%s" "$c" > "$p"; git add "$p"
             done
           fi
-          # ---------- /files-JSON フォールバック ----------
 
-          # 何もステージされていない → 失敗
+          # 最終確認
           if ! git diff --cached --name-only | grep -q "."; then
             echo "::error::No changes staged after all paths"; exit 6
           fi
-          # コード拡張子が無ければ失敗（非コードのみ）
           if ! git diff --cached --name-only | grep -E '\.(php|ts|tsx|js|jsx|py|rb|go|java|cs|sql)$' >/dev/null; then
             echo "::error::No code files staged (only non-code docs). Aborting."; exit 6
           fi
 
           git commit -m "codex(full): generated from specs via ${MODEL}"
           git push origin "HEAD:${BRANCH_NAME}"
-          echo "branch=${BRANCH_NAME}" >> "$GITHUB_OUTPUT"
 
       - name: "Upload AI artifacts"
         uses: "actions/upload-artifact@v4"
@@ -472,4 +408,5 @@ jobs:
             ai/out.files.prev.txt
             ai/request.files.repair.json
             ai/response.files.repair.json
+            ai/normalize.jq
             ai/files.json
