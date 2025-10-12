@@ -21,12 +21,12 @@ jobs:
       PROMPT_FILE: "ai/prompt.md"
       PATCH_FILE: "ai/patch.diff"
       FILES_JSON: "ai/files.json"
-      OPENAI_MODEL: "gpt-5-codex"                 # 代替モデルへの切替はしない
+      OPENAI_MODEL: "gpt-5-codex"                # 代替モデルには切り替えない
       OPENAI_API_KEY: "${{ secrets.OPENAI_API_KEY }}"
-      OPENAI_BASE_URL: "${{ secrets.OPENAI_BASE_URL }}"
+      OPENAI_BASE_URL: "${{ secrets.OPENAI_BASE_URL }}"   # 未設定なら https://api.openai.com を使用
       BRANCH_PREFIX: "codex/autogen"
       MAX_OUT_TOKENS: "12288"
-      TEMPERATURE: "0"                            # モデルが非対応なら後段で自動的に「送らない」
+      TEMPERATURE: "0"                            # モデルが非対応なら送らない（自動判定）
       CURL_TIMEOUT: "300"
       CURL_RETRIES: "5"
       CURL_RETRY_DELAY: "5"
@@ -46,10 +46,10 @@ jobs:
             echo "::error::OPENAI_API_KEY is not set"; exit 1
           fi
           mkdir -p ai
-          command -v jq >/dev/null || (sudo apt-get update && sudo apt-get install -y jq)
+          command -v jq >/dev/null || (sudo apt-get update -y && sudo apt-get install -y jq)
 
       # ─────────────────────────────────────────────────────────────
-      # モデルは固定のまま：どの API を使うか／temperature が送れるかだけ事前に判定
+      # モデルは固定のまま：どの API を使うか／temperature が送れるかを事前に判定
       # ─────────────────────────────────────────────────────────────
       - name: "Probe endpoint & features for this model"
         id: probe
@@ -58,12 +58,13 @@ jobs:
           BASE="${OPENAI_BASE_URL:-https://api.openai.com}"; BASE="${BASE%/}"
           MODEL="${OPENAI_MODEL}"
 
-          mkdir -p ai
-          echo "Base: $BASE  Model: $MODEL"
+          # 最小疎通（Responses / Chat）※ Responses の min は >=16 を守る
+          PROBE_TOKENS_RESP=32
+          PROBE_TOKENS_CHAT=16
 
-          # まず Responses で最小疎通（temperature なし）
+          # Responses
           r_tmp="$(mktemp)"
-          r_req='{"model":"'"$MODEL"'","input":[{"role":"user","content":[{"type":"input_text","text":"ping"}]}],"max_output_tokens":8}'
+          r_req='{"model":"'"$MODEL"'","input":[{"role":"user","content":[{"type":"input_text","text":"ping"}]}],"max_output_tokens":'"$PROBE_TOKENS_RESP"'}'
           curl -sS -w "\n%{http_code}\n" \
                -H "Authorization: Bearer ${OPENAI_API_KEY}" -H "Content-Type: application/json" \
                -d "$r_req" "$BASE/v1/responses" | tee "$r_tmp" >/dev/null
@@ -71,9 +72,9 @@ jobs:
           head -n -1 "$r_tmp" > ai/probe.responses.json || true
           rm -f "$r_tmp"
 
-          # Chat でも最小疎通
+          # Chat
           c_tmp="$(mktemp)"
-          c_req='{"model":"'"$MODEL"'","max_tokens":8,"messages":[{"role":"system","content":"Reply with OK."},{"role":"user","content":"ping"}]}'
+          c_req='{"model":"'"$MODEL"'","max_tokens":'"$PROBE_TOKENS_CHAT"',"messages":[{"role":"system","content":"Reply with OK."},{"role":"user","content":"ping"}]}'
           curl -sS -w "\n%{http_code}\n" \
                -H "Authorization: Bearer ${OPENAI_API_KEY}" -H "Content-Type: application/json" \
                -d "$c_req" "$BASE/v1/chat/completions" | tee "$c_tmp" >/dev/null
@@ -81,19 +82,19 @@ jobs:
           head -n -1 "$c_tmp" > ai/probe.chat.json || true
           rm -f "$c_tmp"
 
-          # どちらのエンドポイントを使うか決定（成功した方）。両方失敗なら Responses を既定にして続行。
+          # 使う API を決定（成功した方。両方成功なら Responses を優先）
           api="responses"
           if [ "$r_code" -lt 300 ] && [ "$c_code" -ge 300 ]; then api="responses"; fi
           if [ "$c_code" -lt 300 ] && [ "$r_code" -ge 300 ]; then api="chat"; fi
           if [ "$c_code" -lt 300 ] && [ "$r_code" -lt 300 ]; then api="responses"; fi
 
-          # temperature の対応可否を判定（選ばれた API で、temperature を付けて試す）
+          # temperature の対応可否チェック（選んだ API で temperature:0 を付けて試す）
           t_tmp="$(mktemp)"
           if [ "$api" = "responses" ]; then
-            t_req='{"model":"'"$MODEL"'","input":[{"role":"user","content":[{"type":"input_text","text":"ping"}]}],"max_output_tokens":8,"temperature":0}'
+            t_req='{"model":"'"$MODEL"'","input":[{"role":"user","content":[{"type":"input_text","text":"ping"}]}],"max_output_tokens":'"$PROBE_TOKENS_RESP"',"temperature":0}'
             t_url="$BASE/v1/responses"
           else
-            t_req='{"model":"'"$MODEL"'","max_tokens":8,"temperature":0,"messages":[{"role":"user","content":"ping"}]}'
+            t_req='{"model":"'"$MODEL"'","max_tokens":'"$PROBE_TOKENS_CHAT"',"temperature":0,"messages":[{"role":"user","content":"ping"}]}'
             t_url="$BASE/v1/chat/completions"
           fi
           curl -sS -w "\n%{http_code}\n" \
@@ -112,10 +113,10 @@ jobs:
             [ -n "$msg" ] && echo "::notice::temperature probe: $msg"
           fi
 
-          echo "base=$BASE"            >> "$GITHUB_OUTPUT"
-          echo "api=$api"              >> "$GITHUB_OUTPUT"
-          echo "allow_temp=$allow_temp">> "$GITHUB_OUTPUT"
-          echo "model=$MODEL"          >> "$GITHUB_OUTPUT"
+          echo "base=$BASE"             >> "$GITHUB_OUTPUT"
+          echo "api=$api"               >> "$GITHUB_OUTPUT"
+          echo "allow_temp=$allow_temp" >> "$GITHUB_OUTPUT"
+          echo "model=$MODEL"           >> "$GITHUB_OUTPUT"
           echo "API decided: $api  (temperature allowed: $allow_temp)"
 
       - name: "Compose prompt (FULL from specs)"
@@ -125,7 +126,7 @@ jobs:
           : > "ai/allowed_paths.txt"
           : > "$PROMPT_FILE"
 
-          # 言語ヒント抽出
+          # 言語ヒント抽出（spec から）
           LANG_HINT=""
           for root in "${SPEC_ROOT}/env" "${SPEC_ROOT}/foundation" "${SPEC_ROOT}/features" "${SPEC_ROOT}"; do
             [ -d "$root" ] || continue
@@ -145,40 +146,71 @@ jobs:
             c#|dotnet*|.net*|cs) LANG_HINT="csharp" ;;
             "" )                 LANG_HINT="auto" ;;
           esac
-          echo "Language from specs: ${LANG_HINT}"
+
+          # 追加フォールバック：リポジトリの実ファイルから推定
+          if [ "${LANG_HINT:-}" = "auto" ] || [ -z "${LANG_HINT:-}" ]; then
+            if   [ -f package.json ] || ls -1 **/*.{ts,tsx,js,jsx}  >/dev/null 2>&1; then LANG_HINT="typescript"
+            elif [ -f pyproject.toml ] || [ -f requirements.txt ] || ls -1 **/*.py >/dev/null 2>&1; then LANG_HINT="python"
+            elif [ -f composer.json ]  || ls -1 **/*.php >/dev/null 2>&1; then LANG_HINT="php"
+            elif [ -f go.mod ]         || ls -1 **/*.go  >/dev/null 2>&1; then LANG_HINT="go"
+            elif ls -1 **/*.{cs,csproj,sln} >/dev/null 2>&1; then LANG_HINT="csharp"
+            elif ls -1 **/*.{java,gradle,pom.xml} >/dev/null 2>&1; then LANG_HINT="java"
+            elif ls -1 **/*.rb >/dev/null 2>&1; then LANG_HINT="ruby"
+          fi
+          [ -z "${LANG_HINT:-}" ] && LANG_HINT="typescript"
+          echo "LANG_HINT=$LANG_HINT" >> "$GITHUB_ENV"
+
+          echo "Language from specs/repo: ${LANG_HINT}"
 
           # ALLOWED_PATHS 抽出
           grep -R -n -E "(^|\s)(file|path|destination|output|生成先|出力先)\s*:\s*([A-Za-z0-9_./-]+\.[A-Za-z0-9]+)" "$SPEC_ROOT" \
             | sed -E "s/.*:\s*//; s/[\"']//g" \
             | grep -E "[/A-Za-z0-9_.-]+\.[A-Za-z0-9]+" >> "ai/allowed_paths.txt" || true
+
           grep -R -h -E "[/A-Za-z0-9_.-]+\.(php|ts|tsx|js|jsx|py|rb|go|java|cs|sql|html|css|yml|yaml|json|ini|xml)" "$SPEC_ROOT" \
             | grep -o -E "[/A-Za-z0-9_.-]+\.(php|ts|tsx|js|jsx|py|rb|go|java|cs|sql|html|css|yml|yaml|json|ini|xml)" >> "ai/allowed_paths.txt" || true
+
           grep -R -h -E "(^|\s)(dir|directory|folder|ディレクトリ)\s*:\s*[A-Za-z0-9_./-]+/?" "$SPEC_ROOT" \
             | sed -E "s/.*:\s*//; s/[\"']//g" | awk '{gsub(/\/?$/,"/");print}' >> "ai/allowed_paths.txt" || true
-          sed -E "s#^\./##; s#//+#/#g" -i "ai/allowed_paths.txt" || true
-          LC_ALL=C sort -u "ai/allowed_paths.txt" -o "ai/allowed_paths.txt"
 
-          # プロンプト
+          # コードパスの種付け（コード拡張子が見つからない場合）
+          has_code_glob=0
+          grep -Eq '\.(php|ts|tsx|js|jsx|py|rb|go|java|cs|sql)$' ai/allowed_paths.txt && has_code_glob=1
+          if [ $has_code_glob -eq 0 ]; then
+            case "$LANG_HINT" in
+              typescript) printf "%s\n" "src/" "app/" "lib/" "server/" "package.json" "tsconfig.json" >> ai/allowed_paths.txt ;;
+              python)     printf "%s\n" "src/" "app/" "lib/" "pyproject.toml" "requirements.txt" >> ai/allowed_paths.txt ;;
+              php)        printf "%s\n" "src/" "app/" "public/" "composer.json" >> ai/allowed_paths.txt ;;
+              go)         printf "%s\n" "cmd/" "internal/" "pkg/" "go.mod" >> ai/allowed_paths.txt ;;
+              java)       printf "%s\n" "src/main/" "src/test/" "pom.xml" "build.gradle" >> ai/allowed_paths.txt ;;
+              csharp)     printf "%s\n" "src/" "app/" >> ai/allowed_paths.txt ;;
+              ruby)       printf "%s\n" "app/" "lib/" "Gemfile" >> ai/allowed_paths.txt ;;
+            esac
+          fi
+
+          sed -E "s#^\./##; s#//+#/#g" -i "ai/allowed_paths.txt" || true
+          LC_ALL=C sort -u -o ai/allowed_paths.txt ai/allowed_paths.txt
+
+          # プロンプト本文
           {
             printf "# Codex generation prompt\n\n"
             printf "## LANGUAGE (MUST)\n\nlanguage: %s\n" "$LANG_HINT"
+
             printf "\n## ALLOWED_PATHS (only modify/create under these; NEVER touch ai/)\n\n"
             if [ -s "ai/allowed_paths.txt" ]; then
               while IFS= read -r line; do printf -- "- %s\n" "$line"; done < "ai/allowed_paths.txt"
             else
-              case "$LANG_HINT" in
-                php)        printf -- "- app.php\n- public/\n- src/\n- tests/\n- composer.json\n" ;;
-                typescript) printf -- "- src/\n- app/\n- package.json\n- tsconfig.json\n- vite.config.*\n" ;;
-                python)     printf -- "- src/\n- app/\n- requirements.txt\n- pyproject.toml\n" ;;
-                *)          printf -- "- /\n" ;;
-              esac
-              printf "\nDo NOT modify ai/ directory.\n"
+              printf -- "- /\n"
             fi
+
             printf "\n## Example header (force unified diff)\n\ndiff --git a/app.php b/app.php\n"
+
             printf "\n## STRICT OUTPUT RULES\n\n"
             printf -- "- Output ONE Git unified diff (UTF-8). No prose, no code fences.\n"
             printf -- "- MUST start with: diff --git a/<path> b/<path>\n"
-            printf -- "- Follow LANGUAGE; respect ALLOWED_PATHS strictly.\n"
+            printf -- "- Implement the SPECIFICATION as runnable APPLICATION CODE and TESTS.\n"
+            printf -- "- Prefer creating/updating SOURCE CODE under the ALLOWED_PATHS code roots.\n"
+            printf -- "- Do NOT create compliance/policy/README/meta documents.\n"
             printf -- "- Include real code (no placeholders). If initial attempt fails, still SYNTHESIZE a complete diff that fulfills the specs.\n"
           } >> "$PROMPT_FILE"
 
@@ -195,6 +227,19 @@ jobs:
           done < "$tmp_list"
           rm -f "$tmp_list"
 
+      # Summary に可視化（ダウンロード不要）
+      - name: "Show language & allowed paths (for humans)"
+        run: |
+          echo "### Language hint" >> "$GITHUB_STEP_SUMMARY"
+          echo "${LANG_HINT:-unknown}" >> "$GITHUB_STEP_SUMMARY"
+          echo "### Allowed paths" >> "$GITHUB_STEP_SUMMARY"
+          if [ -s ai/allowed_paths.txt ]; then
+            sed 's/^/- /' ai/allowed_paths.txt >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "- (empty)" >> "$GITHUB_STEP_SUMMARY"
+          fi
+          echo "::group::Allowed paths"; cat ai/allowed_paths.txt || true; echo "::endgroup::"
+
       - name: "Generate unified diff, commit to new branch, push"
         id: gen
         run: |
@@ -202,13 +247,13 @@ jobs:
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
-          MODEL="${OPENAI_MODEL}"                                          # モデル固定（代替しない）
+          MODEL="${OPENAI_MODEL}"
           BASE="${{ steps.probe.outputs.base || env.OPENAI_BASE_URL }}"
           BASE="${BASE:-https://api.openai.com}"; BASE="${BASE%/}"
           API_KIND="${{ steps.probe.outputs.api }}"
           ALLOW_TEMPERATURE="${{ steps.probe.outputs.allow_temp }}"
           [ -z "$API_KIND" ] && API_KIND="responses"
-          [ -z "$ALLOW_TEMPERATURE" ] && ALLOW_TEMPERATURE=0               # 安全側：送らない
+          [ -z "$ALLOW_TEMPERATURE" ] && ALLOW_TEMPERATURE=0
 
           if [ "$API_KIND" = "chat" ]; then
             ENDPOINT="${BASE}/v1/chat/completions"
@@ -229,7 +274,7 @@ jobs:
           [ texts ] | map(select(type=="string" and . != "")) | first // ""
           JQ
 
-          # リクエスト生成（API 種／temperature 可否で JSON 切替）
+          # リクエスト生成
           gen_req() {
             local system_text="$1"
             local user_file="$2"
@@ -264,7 +309,6 @@ jobs:
           }
 
           call_api_with_retry() {
-            # $1: request.json  $2: response.json
             local req="$1"; local out="$2"
             local attempt=1
             while [ $attempt -le 3 ]; do
@@ -288,7 +332,6 @@ jobs:
                   MAX_OUT_TOKENS=$(( MAX_OUT_TOKENS / 2 )); [ "$MAX_OUT_TOKENS" -lt 4096 ] && MAX_OUT_TOKENS=4096
                   attempt=$((attempt+1)); return 1 ;;
                 400)
-                  # モデル固定。エンドポイントは切り替えない。
                   case "$msg" in
                     *"Unsupported parameter"*temperature* )
                       if [ "$ALLOW_TEMPERATURE" -ne 0 ]; then
@@ -309,7 +352,7 @@ jobs:
             echo "::error::repeated transient failures"; return 2
           }
 
-          # 生成開始（diff 指示）
+          # 生成（diff 指示）
           system1=$'Output ONLY a Git unified diff.\nMUST start with: diff --git a/<path> b/<path>\nNo prose or fences.'
           gen_req "$system1" "$PROMPT_FILE" "ai/request.json"
           for _ in 1 2 3; do
@@ -360,7 +403,7 @@ jobs:
           # files-JSON フォールバック
           if ! git diff --cached --name-only | grep -q "."; then
             echo "::warning::No staged changes after diff path; switching to files-JSON fallback"
-            system3=$'Output ONLY a compact JSON with exact key `files`: [{ "path": "relative/path", "content": "UTF-8 file content" }, ...]. No prose, no markdown, no trailing text.'
+            system3=$'Output ONLY a compact JSON with exact key `files`: [{ "path": "relative/path", "content": "UTF-8 file content" }, ...]. No prose, no markdown, no trailing text.\nImplement the SPEC as WORKING CODE (and minimal build/config/test files) under ALLOWED_PATHS.\nDo NOT include compliance/policy/README/meta documents.'
             gen_req "$system3" "$PROMPT_FILE" "ai/request.files.json"
             for _ in 1 2 3; do
               if call_api_with_retry "ai/request.files.json" "ai/response.files.json"; then break
@@ -377,7 +420,15 @@ jobs:
             jq -r '.[] | @base64' "$FILES_JSON" | while read -r row; do
               _jq(){ echo "$row" | base64 -d | jq -r "$1"; }
               p="$(_jq '.path')"; c="$(_jq '.content')"
+
+              # ai/ 配下は触らない
               if printf "%s" "$p" | grep -q '^ai/'; then echo "::warning::skip ai/: $p"; continue; fi
+
+              # 文書・ポリシー系は拒否
+              if printf "%s" "$p" | grep -qiE '(COMPLIANCE|SECURITY|CODE_OF_CONDUCT|CONTRIBUTING|README)\.(md|txt|json)$'; then
+                echo "::warning::skip non-code doc: $p"; continue
+              fi
+
               ok="$allow_all"
               if [ "$allow_all" -ne 1 ]; then
                 for pat in "${ALLOWED[@]}"; do
@@ -385,12 +436,21 @@ jobs:
                 done
               fi
               [ "$ok" -ne 1 ] && { echo "::warning::skip (not allowed): $p"; continue; }
-              mkdir -p "$(dirname "$p")"; printf "%s" "$c" > "$p"; git add "$p"
+
+              mkdir -p "$(dirname "$p")"
+              printf "%s" "$c" > "$p"
+              git add "$p"
             done
           fi
 
+          # 何もステージされていない → 失敗
           if ! git diff --cached --name-only | grep -q "."; then
             echo "::error::No changes staged after all paths"; exit 6
+          fi
+
+          # コードファイルが1つも無ければ失敗（空振りPR防止）
+          if ! git diff --cached --name-only | grep -E '\.(php|ts|tsx|js|jsx|py|rb|go|java|cs|sql)$' >/dev/null; then
+            echo "::error::No code files staged (only non-code docs). Aborting."; exit 6
           fi
 
           git commit -m "codex(full): generated from specs via ${MODEL}"
