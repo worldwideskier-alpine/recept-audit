@@ -21,7 +21,7 @@ jobs:
       PROMPT_FILE: "ai/prompt.md"
       PATCH_FILE: "ai/patch.diff"
       FILES_JSON: "ai/files.json"
-      OPENAI_MODEL: "gpt-5-codex"                      # 代替モデルには切り替えない
+      OPENAI_MODEL: "gpt-5-codex"                      # 代替モデルへは切替えない
       OPENAI_API_KEY: "${{ secrets.OPENAI_API_KEY }}"
       OPENAI_BASE_URL: "${{ secrets.OPENAI_BASE_URL }}" # 未設定なら https://api.openai.com
       BRANCH_PREFIX: "codex/autogen"
@@ -238,41 +238,28 @@ jobs:
           BRANCH_NAME="${BRANCH_PREFIX}-${GITHUB_RUN_ID}"
           git checkout -b "${BRANCH_NAME}"
 
-          {
-            printf 'def texts:\n'
-            printf '  (try(.output_text) // empty),\n'
-            printf '  (try(.output[]?.content[]?.text) // empty),\n'
-            printf '  (try(.choices[0].message.content) // empty),\n'
-            printf '  (try(.choices[0].text) // empty);\n'
-            printf '[ texts ] | map(select(type=="string" and . != "")) | first // ""\n'
-          } > "ai/extract.jq"
+          { printf 'def texts:\n'; printf '  (try(.output_text) // empty),\n'; printf '  (try(.output[]?.content[]?.text) // empty),\n'; printf '  (try(.choices[0].message.content) // empty),\n'; printf '  (try(.choices[0].text) // empty);\n'; printf '[ texts ] | map(select(type=="string" and . != "")) | first // ""\n'; } > "ai/extract.jq"
 
           gen_req() {
-            local system_text="$1"
-            local user_file="$2"
-            local out_file="$3"
+            local system_text="$1"; local user_file="$2"; local out_file="$3"
             if [ "$API_KIND" = "chat" ]; then
               if [ "$ALLOW_TEMPERATURE" -eq 1 ]; then
-                jq -n --arg model "$MODEL" --arg max "$MAX_OUT_TOKENS" --arg temp "$TEMPERATURE" \
-                      --arg sys "$system_text" --rawfile prompt "$user_file" \
+                jq -n --arg model "$MODEL" --arg max "$MAX_OUT_TOKENS" --arg temp "$TEMPERATURE" --arg sys "$system_text" --rawfile prompt "$user_file" \
                   '{ "model":$model, "max_tokens":($max|tonumber), "temperature":($temp|tonumber),
                      "messages":[{"role":"system","content":$sys},{"role":"user","content":$prompt}] }' > "$out_file"
               else
-                jq -n --arg model "$MODEL" --arg max "$MAX_OUT_TOKENS" \
-                      --arg sys "$system_text" --rawfile prompt "$user_file" \
+                jq -n --arg model "$MODEL" --arg max "$MAX_OUT_TOKENS" --arg sys "$system_text" --rawfile prompt "$user_file" \
                   '{ "model":$model, "max_tokens":($max|tonumber),
                      "messages":[{"role":"system","content":$sys},{"role":"user","content":$prompt}] }' > "$out_file"
               fi
             else
               if [ "$ALLOW_TEMPERATURE" -eq 1 ]; then
-                jq -n --arg model "$MODEL" --arg max "$MAX_OUT_TOKENS" --arg temp "$TEMPERATURE" \
-                      --arg sys "$system_text" --rawfile prompt "$user_file" \
+                jq -n --arg model "$MODEL" --arg max "$MAX_OUT_TOKENS" --arg temp "$TEMPERATURE" --arg sys "$system_text" --rawfile prompt "$user_file" \
                   '{ "model":$model, "max_output_tokens":($max|tonumber), "temperature":($temp|tonumber),
                      "input":[ {"role":"system","content":[{"type":"input_text","text":$sys}]},
                                {"role":"user","content":[{"type":"input_text","text":$prompt}]} ] }' > "$out_file"
               else
-                jq -n --arg model "$MODEL" --arg max "$MAX_OUT_TOKENS" \
-                      --arg sys "$system_text" --rawfile prompt "$user_file" \
+                jq -n --arg model "$MODEL" --arg max "$MAX_OUT_TOKENS" --arg sys "$system_text" --rawfile prompt "$user_file" \
                   '{ "model":$model, "max_output_tokens":($max|tonumber),
                      "input":[ {"role":"system","content":[{"type":"input_text","text":$sys}]},
                                {"role":"user","content":[{"type":"input_text","text":$prompt}]} ] }' > "$out_file"
@@ -294,8 +281,7 @@ jobs:
 
               if [ "$status" -lt 300 ]; then return 0; fi
 
-              local msg=""
-              if command -v jq >/dev/null 2>&1; then msg="$(jq -r '.error?.message // empty' "$out")"; fi
+              local msg=""; if command -v jq >/dev/null 2>&1; then msg="$(jq -r '.error?.message // empty' "$out")"; fi
               [ -n "$msg" ] && echo "::notice::API error $status: $msg"
 
               case "$status" in
@@ -311,14 +297,11 @@ jobs:
                         ALLOW_TEMPERATURE=0
                         return 1
                       fi ;;
-                    *"only supported in v1/responses"* )
-                      API_KIND="responses"; ENDPOINT="${BASE}/v1/responses"; return 1 ;;
-                    *"only supported in v1/chat/completions"* )
-                      API_KIND="chat"; ENDPOINT="${BASE}/v1/chat/completions"; return 1 ;;
+                    *"only supported in v1/responses"* ) API_KIND="responses"; ENDPOINT="${BASE}/v1/responses"; return 1 ;;
+                    *"only supported in v1/chat/completions"* ) API_KIND="chat"; ENDPOINT="${BASE}/v1/chat/completions"; return 1 ;;
                   esac
                   echo "::error::fatal 400 for this model/endpoint"; return 2 ;;
-                *)
-                  echo "::error::fatal ${status}"; return 2 ;;
+                *) echo "::error::fatal ${status}"; return 2 ;;
               esac
             done
             echo "::error::repeated transient failures"; return 2
@@ -369,9 +352,10 @@ jobs:
             fi
           fi
 
-          # ---------- files-JSON フォールバック（抽出→フェンス除去→JSON正規化） ----------
+          # ---------- files-JSON フォールバック ----------
           if ! git diff --cached --name-only | grep -q "."; then
             echo "::warning::No staged changes after diff path; switching to files-JSON fallback"
+
             system3=$'Output ONLY a compact JSON with exact key `files`: [{ "path": "relative/path", "content": "UTF-8 file content" }, ...]. No prose, no markdown, no trailing text.\nImplement the SPEC as WORKING CODE (and minimal build/config/test files) under ALLOWED_PATHS.\nDo NOT include compliance/policy/README/meta documents.'
             gen_req "$system3" "$PROMPT_FILE" "ai/request.files.json"
             for _ in 1 2 3; do
@@ -379,13 +363,34 @@ jobs:
               else gen_req "$system3" "$PROMPT_FILE" "ai/request.files.json"; fi
             done
 
+            # 応答本文を抽出→フェンス除去
             jq -r -f "ai/extract.jq" "ai/response.files.json" > "ai/out.files.txt"
             sed -E -e '1{/^```[a-zA-Z-]*[[:space:]]*$/d;}' -e '${/^```[[:space:]]*$/d;}' -i "ai/out.files.txt" || true
 
-            if ! jq -e . "ai/out.files.txt" >/dev/null 2>&1; then
+            # ① 最初のパース
+            parse_ok=1
+            jq -e . "ai/out.files.txt" >/dev/null 2>&1 || parse_ok=0
+
+            # ② 失敗時は JSON 修復を 2 回まで
+            if [ $parse_ok -ne 1 ]; then
+              echo "::warning::files JSON not parseable; attempting repair"
+              cp "ai/out.files.txt" "ai/out.files.prev.txt"
+              system4=$'You will receive a model output that SHOULD be JSON but is not strictly parseable.\nReturn ONLY strict JSON with the exact top-level key `files` (array of {path, content} strings). No prose, no markdown, no extra keys.'
+              for i in 1 2; do
+                gen_req "$system4" "ai/out.files.prev.txt" "ai/request.files.repair.json"
+                if call_api_with_retry "ai/request.files.repair.json" "ai/response.files.repair.json"; then
+                  jq -r -f "ai/extract.jq" "ai/response.files.repair.json" > "ai/out.files.txt"
+                  sed -E -e '1{/^```[a-zA-Z-]*[[:space:]]*$/d;}' -e '${/^```[[:space:]]*$/d;}' -i "ai/out.files.txt" || true
+                  jq -e . "ai/out.files.txt" >/dev/null 2>&1 && { parse_ok=1; break; }
+                fi
+              done
+            fi
+
+            if [ $parse_ok -ne 1 ]; then
               echo "::error::Model did not return parseable JSON"; exit 7
             fi
 
+            # ③ 形の差を files 配列に正規化
             jq -c '
               def normalize:
                 if type=="array" then .
@@ -396,17 +401,21 @@ jobs:
               normalize
             ' "ai/out.files.txt" > "$FILES_JSON"
 
+            # ④ 検証
             if [ ! -s "$FILES_JSON" ] || ! jq -e 'type=="array" and length>0 and all(.[]; (has("path") and has("content")) and (.path|type=="string") and (.content|type=="string"))' "$FILES_JSON" >/dev/null; then
               echo "::error::Model did not return valid files JSON"; exit 7
             fi
 
+            # ⑤ 書き込み（ai/や非コード文書を除外、許可パスのみ）
             allow_all=0
             if [ -s "ai/allowed_paths.txt" ]; then mapfile -t ALLOWED < "ai/allowed_paths.txt"; else allow_all=1; fi
             jq -r '.[] | @base64' "$FILES_JSON" | while read -r row; do
               _jq(){ echo "$row" | base64 -d | jq -r "$1"; }
               p="$(_jq '.path')"; c="$(_jq '.content')"
 
+              # ai/ は常にスキップ
               if printf "%s" "$p" | grep -q '^ai/'; then echo "::warning::skip ai/: $p"; continue; fi
+              # 非コード文書は拒否
               if printf "%s" "$p" | grep -qiE '(COMPLIANCE|SECURITY|CODE_OF_CONDUCT|CONTRIBUTING|README)\.(md|txt|json)$'; then
                 echo "::warning::skip non-code doc: $p"; continue
               fi
@@ -424,11 +433,13 @@ jobs:
               git add "$p"
             done
           fi
-          # ------------------------------------------------------------------
+          # ---------- /files-JSON フォールバック ----------
 
+          # 何もステージされていない → 失敗
           if ! git diff --cached --name-only | grep -q "."; then
             echo "::error::No changes staged after all paths"; exit 6
           fi
+          # コード拡張子が無ければ失敗（非コードのみ）
           if ! git diff --cached --name-only | grep -E '\.(php|ts|tsx|js|jsx|py|rb|go|java|cs|sql)$' >/dev/null; then
             echo "::error::No code files staged (only non-code docs). Aborting."; exit 6
           fi
@@ -458,4 +469,7 @@ jobs:
             ai/request.files.json
             ai/response.files.json
             ai/out.files.txt
+            ai/out.files.prev.txt
+            ai/request.files.repair.json
+            ai/response.files.repair.json
             ai/files.json
