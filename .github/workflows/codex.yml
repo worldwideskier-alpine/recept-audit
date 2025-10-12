@@ -17,7 +17,7 @@ jobs:
 
     env:
       SPEC_ROOT: "spec"
-      SPEC_DIRS: "env foundation features tests"   # ← 誤記を排除
+      SPEC_DIRS: "env foundation features tests"
       PROMPT_FILE: "ai/prompt.md"
       PATCH_FILE: "ai/patch.diff"
       FILES_JSON: "ai/files.json"
@@ -25,9 +25,9 @@ jobs:
       OPENAI_API_KEY: "${{ secrets.OPENAI_API_KEY }}"
       OPENAI_BASE_URL: "${{ secrets.OPENAI_BASE_URL }}"
       BRANCH_PREFIX: "codex/autogen"
-      MAX_OUT_TOKENS: "12288"                      # 初期上限（必要に応じて縮小）
+      MAX_OUT_TOKENS: "12288"
       TEMPERATURE: "0"
-      CURL_TIMEOUT: "300"                          # 10s → 300s
+      CURL_TIMEOUT: "300"
       CURL_RETRIES: "5"
       CURL_RETRY_DELAY: "5"
 
@@ -47,6 +47,76 @@ jobs:
           fi
           mkdir -p ai
           command -v jq >/dev/null || (sudo apt-get update && sudo apt-get install -y jq)
+
+      - name: "Probe OpenAI API & model"
+        id: probe
+        run: |
+          set -euo pipefail
+          BASE="${OPENAI_BASE_URL:-https://api.openai.com}"
+          BASE="${BASE%/}"
+          echo "Base endpoint: $BASE"
+
+          mkdir -p ai
+
+          # --- モデル一覧 ---
+          m_tmp="$(mktemp)"
+          curl -sS -w "\n%{http_code}\n" \
+               -H "Authorization: Bearer ${OPENAI_API_KEY}" \
+               "$BASE/v1/models" | tee "$m_tmp" >/dev/null
+          m_code="$(tail -n1 "$m_tmp")"
+          head -n -1 "$m_tmp" > ai/models.json || true
+          rm -f "$m_tmp"
+
+          chosen="${OPENAI_MODEL}"
+          if [ "$m_code" -lt 300 ] && command -v jq >/dev/null 2>&1; then
+            if ! jq -e --arg id "$OPENAI_MODEL" '.data[].id | select(.==$id)' ai/models.json >/dev/null; then
+              for alt in codex-mini-latest o4-mini gpt-4.1-mini; do
+                if jq -e --arg id "$alt" '.data[].id | select(.==$id)' ai/models.json >/dev/null; then
+                  echo "::warning::fallback model selected: $alt"
+                  chosen="$alt"
+                  break
+                fi
+              done
+            fi
+          else
+            echo "::warning::/v1/models not available (code=$m_code); skip listing"
+          fi
+
+          # --- Responses API 疎通 ---
+          r_tmp="$(mktemp)"
+          req='{"model":"'"$chosen"'","input":[{"role":"user","content":[{"type":"input_text","text":"ping"}]}],"max_output_tokens":8}'
+          curl -sS -w "\n%{http_code}\n" \
+               -H "Authorization: Bearer ${OPENAI_API_KEY}" -H "Content-Type: application/json" \
+               -d "$req" "$BASE/v1/responses" | tee "$r_tmp" >/dev/null
+          r_code="$(tail -n1 "$r_tmp")"
+          head -n -1 "$r_tmp" > ai/probe.responses.json || true
+          rm -f "$r_tmp"
+
+          api_kind="responses"
+          if [ "$r_code" -ge 300 ]; then
+            echo "::warning::Responses API returned $r_code; trying Chat Completions"
+            c_tmp="$(mktemp)"
+            creq='{"model":"'"$chosen"'","max_tokens":8,"messages":[{"role":"system","content":"Reply with OK."},{"role":"user","content":"ping"}]}'
+            curl -sS -w "\n%{http_code}\n" \
+                 -H "Authorization: Bearer ${OPENAI_API_KEY}" -H "Content-Type: application/json" \
+                 -d "$creq" "$BASE/v1/chat/completions" | tee "$c_tmp" >/dev/null
+            c_code="$(tail -n1 "$c_tmp")"
+            head -n -1 "$c_tmp" > ai/probe.chat.json || true
+            rm -f "$c_tmp"
+            if [ "$c_code" -lt 300 ]; then
+              api_kind="chat"
+            fi
+          fi
+
+          # 後続ステップ用の出力
+          echo "base=$BASE"    >> "$GITHUB_OUTPUT"
+          echo "model=$chosen" >> "$GITHUB_OUTPUT"
+          echo "api=$api_kind" >> "$GITHUB_OUTPUT"
+
+          # 参考ログ
+          if [ "$r_code" -ge 300 ] && command -v jq >/dev/null 2>&1; then
+            echo "::notice::Responses probe error: $(jq -r '.error?.message // empty' ai/probe.responses.json)"
+          fi
 
       - name: "Compose prompt (FULL from specs)"
         id: compose
@@ -146,9 +216,18 @@ jobs:
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
-          MODEL="${OPENAI_MODEL}"
-          BASE="${OPENAI_BASE_URL:-https://api.openai.com}"
-          ENDPOINT="${BASE%/}/v1/responses"
+          MODEL="${{ steps.probe.outputs.model || env.OPENAI_MODEL }}"
+          BASE="${{ steps.probe.outputs.base || env.OPENAI_BASE_URL }}"
+          BASE="${BASE:-https://api.openai.com}"
+          BASE="${BASE%/}"
+
+          API_KIND="${{ steps.probe.outputs.api || 'responses' }}"
+          if [ "$API_KIND" = "chat" ]; then
+            ENDPOINT="${BASE}/v1/chat/completions"
+          else
+            ENDPOINT="${BASE}/v1/responses"
+          fi
+
           BRANCH_NAME="${BRANCH_PREFIX}-${GITHUB_RUN_ID}"
           git checkout -b "${BRANCH_NAME}"
 
@@ -162,15 +241,23 @@ jobs:
           [ texts ] | map(select(type=="string" and . != "")) | first // ""
           JQ
 
+          # リクエスト生成：API 種類で JSON を切替
           gen_req() {
             local system_text="$1"
             local user_file="$2"
             local out_file="$3"
-            jq -n --arg model "$MODEL" --arg max "$MAX_OUT_TOKENS" --arg temp "$TEMPERATURE" \
-                  --arg sys "$system_text" --rawfile prompt "$user_file" \
-              '{ "model":$model, "max_output_tokens":($max|tonumber), "temperature":($temp|tonumber),
-                 "input":[ {"role":"system","content":[{"type":"input_text","text":$sys}]},
-                           {"role":"user","content":[{"type":"input_text","text":$prompt}]} ] }' > "$out_file"
+            if [ "$API_KIND" = "chat" ]; then
+              jq -n --arg model "$MODEL" --arg max "$MAX_OUT_TOKENS" --arg temp "$TEMPERATURE" \
+                    --arg sys "$system_text" --rawfile prompt "$user_file" \
+                '{ "model":$model, "max_tokens":($max|tonumber), "temperature":($temp|tonumber),
+                   "messages":[{"role":"system","content":$sys},{"role":"user","content":$prompt}] }' > "$out_file"
+            else
+              jq -n --arg model "$MODEL" --arg max "$MAX_OUT_TOKENS" --arg temp "$TEMPERATURE" \
+                    --arg sys "$system_text" --rawfile prompt "$user_file" \
+                '{ "model":$model, "max_output_tokens":($max|tonumber), "temperature":($temp|tonumber),
+                   "input":[ {"role":"system","content":[{"type":"input_text","text":$sys}]},
+                             {"role":"user","content":[{"type":"input_text","text":$prompt}]} ] }' > "$out_file"
+            fi
           }
 
           call_api_with_retry() {
@@ -189,19 +276,36 @@ jobs:
               if [ "$status" -lt 300 ]; then
                 return 0
               fi
+
+              # エラーメッセージ可視化（可能なら）
+              if command -v jq >/dev/null 2>&1; then
+                echo "::notice::API error $status: $(jq -r '.error?.message // empty' "$out")"
+              fi
+
               case "$status" in
                 408|429|500|502|503|504)
                   echo "::warning::OpenAI transient ${status}; shrinking tokens and retrying (attempt $((attempt+1)))"
                   MAX_OUT_TOKENS=$(( MAX_OUT_TOKENS / 2 ))
                   [ "$MAX_OUT_TOKENS" -lt 4096 ] && MAX_OUT_TOKENS=4096
                   attempt=$((attempt+1))
-                  # 呼び出し側で request を作り直す
+                  return 1
+                  ;;
+                400)
+                  # 形式不一致の可能性 → もう一方の API へ切替して 1 回だけ再送
+                  if [ "$API_KIND" = "responses" ]; then
+                    echo "::warning::400 with Responses; switching to Chat Completions"
+                    API_KIND="chat"; ENDPOINT="${BASE}/v1/chat/completions"
+                  else
+                    echo "::warning::400 with Chat; switching to Responses API"
+                    API_KIND="responses"; ENDPOINT="${BASE}/v1/responses"
+                  fi
+                  return 1
                   ;;
                 *)
-                  echo "::error::OpenAI fatal ${status}"; return 2 ;;
+                  echo "::error::OpenAI fatal ${status}"
+                  return 2
+                  ;;
               esac
-              # 呼び出し側のループで req を再生成する前提で return 1
-              return 1
             done
             echo "::error::OpenAI repeated transient failures"; return 2
           }
@@ -210,7 +314,7 @@ jobs:
           system1=$'Output ONLY a Git unified diff.\nMUST start with: diff --git a/<path> b/<path>\nNo prose or fences.'
           gen_req "$system1" "$PROMPT_FILE" "ai/request.json"
 
-          # 送信＆トランジエント時は token を縮めつつ最大3回
+          # 送信＆必要に応じて API 種切替／token 縮小
           for _ in 1 2 3; do
             if call_api_with_retry "ai/request.json" "ai/response.json"; then
               break
@@ -327,6 +431,9 @@ jobs:
           name: "ai-artifacts"
           if-no-files-found: "ignore"
           path: |
+            ai/models.json
+            ai/probe.responses.json
+            ai/probe.chat.json
             ai/prompt.md
             ai/allowed_paths.txt
             ai/request.json
