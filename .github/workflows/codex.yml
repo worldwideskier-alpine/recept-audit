@@ -2,6 +2,11 @@ name: "codex"
 
 on:
   workflow_dispatch: {}
+  push:
+    branches: ["main"]
+    paths:
+      - "spec/**"
+      - ".github/workflows/codex.yml"
 
 permissions:
   contents: "write"
@@ -9,7 +14,7 @@ permissions:
 
 env:
   OPENAI_MODEL: "gpt-5-codex"
-  OPENAI_API_BASE: "https://api.openai.com/v1/chat/completions"
+  OPENAI_API_BASE: "https://api.openai.com/v1/responses"
   SPEC_ROOT: "spec"
   SPEC_DIRS: "env foundation features tests"
   PROMPT_FILE: "ai/prompt.md"
@@ -25,19 +30,18 @@ jobs:
   generate:
     name: "generate"
     runs-on: "ubuntu-24.04"
+
     steps:
       - name: "Checkout"
         uses: "actions/checkout@v4"
-        with:
-          fetch-depth: 1
-          persist-credentials: true
 
       - name: "Install jq"
         run: |
           sudo apt-get update -y
           sudo apt-get install -y jq coreutils
 
-      - name: "Prepare prompt from spec"
+      - name: "Build prompt from spec"
+        shell: "bash"
         run: |
           set -euo pipefail
           mkdir -p "ai"
@@ -68,7 +72,8 @@ jobs:
           done < "$tmp_list"
           rm -f "$tmp_list"
 
-      - name: "Create generation branch"
+      - name: "Create branch"
+        shell: "bash"
         run: |
           set -euo pipefail
           BRANCH_NAME="codex/autogen-${GITHUB_RUN_ID}"
@@ -77,7 +82,8 @@ jobs:
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git checkout -b "${BRANCH_NAME}"
 
-      - name: "Call OpenAI (strict JSON schema)"
+      - name: "Call OpenAI (Responses API, strict JSON schema)"
+        shell: "bash"
         env:
           OPENAI_API_KEY: "${{ secrets.OPENAI_API_KEY }}"
         run: |
@@ -86,20 +92,10 @@ jobs:
           jq -n \
             --arg model "$OPENAI_MODEL" \
             --rawfile prompt "$PROMPT_FILE" \
-            --argjson max_tokens "${MAX_TOKENS}" \
+            --argjson max_out "${MAX_TOKENS}" \
             '{
               "model": $model,
               "temperature": 0,
-              "messages": [
-                {
-                  "role": "system",
-                  "content": "You are Codex. Output only strict JSON that matches the response schema. Write full, runnable code without placeholders."
-                },
-                {
-                  "role": "user",
-                  "content": ("Implement the SPEC as runnable application code and tests. Return files to write as JSON only.\\n\\n" + $prompt)
-                }
-              ],
               "response_format": {
                 "type": "json_schema",
                 "json_schema": {
@@ -116,7 +112,7 @@ jobs:
                         "items": {
                           "type": "object",
                           "additionalProperties": false,
-                          "required": ["path", "content"],
+                          "required": ["path","content"],
                           "properties": {
                             "path":    { "type": "string", "minLength": 1 },
                             "content": { "type": "string" }
@@ -127,10 +123,18 @@ jobs:
                   }
                 }
               },
-              "max_tokens": $max_tokens
-            }' > "$REQUEST_JSON"
+              "input": [
+                {
+                  "role": "system",
+                  "content": "You are Codex. Output only strict JSON that matches the response schema. Write full, runnable code without placeholders."
+                },
+                {
+                  "role": "user",
+                  "content": ("Implement the SPEC as runnable application code and tests. Return files to write as JSON only.\n\n" + $prompt)
+                }
+              ]
+            } + ( ($max_out|tonumber) > 0 ? {"max_output_tokens": ($max_out|tonumber)} : {} )' > "$REQUEST_JSON"
 
-          # Call API
           status="$(curl -sS --connect-timeout 30 --max-time "${CURL_TIMEOUT}" \
             --retry "${CURL_RETRIES}" --retry-all-errors --retry-delay "${CURL_RETRY_DELAY}" \
             -H "Authorization: Bearer ${OPENAI_API_KEY}" \
@@ -143,17 +147,31 @@ jobs:
           echo "OpenAI HTTP status: ${status}"
           [ "${status}" -ge 200 ] && [ "${status}" -lt 300 ]
 
-          # Extract strict JSON content
-          jq -e -r '.choices[0].message.content' "$RESPONSE_JSON" | jq -e '.' > "$OUT_JSON"
+          # Extract model JSON string from Responses API result and validate
+          jq -e -r '
+            # Prefer Responses API structure
+            (.output[0].content[]? | select(.type=="output_text") | .text) //
+            (.output[0].content[0].text) //
+            (.output_text) //
+            (.response) //
+            # Fallback to Chat-style just in case
+            (.choices[0].message.content)
+          ' "$RESPONSE_JSON" | jq -e '.' > "$OUT_JSON"
 
-          # Materialize files
+      - name: "Write files and commit"
+        shell: "bash"
+        run: |
+          set -euo pipefail
+
           jq -r '.files[] | @base64' "$OUT_JSON" | while read -r row; do
             _jq(){ echo "$row" | base64 -d | jq -r "$1"; }
             path="$(_jq ".path")"
             content="$(_jq ".content")"
+
             case "$path" in
               ai/*) echo "::warning::skip ai/: ${path}"; continue ;;
             esac
+
             mkdir -p "$(dirname "$path")"
             printf "%s" "$content" > "$path"
             git add "$path"
@@ -167,21 +185,29 @@ jobs:
           git commit -m "codex(init): seed via ${OPENAI_MODEL}"
           git push -u origin "${BRANCH_NAME}"
 
-      - name: "Open Pull Request"
+      - name: "Open pull request"
         uses: "actions/github-script@v7"
-        env:
-          BRANCH_NAME: "${{ env.BRANCH_NAME }}"
         with:
           script: |
-            const { owner, repo } = context.repo;
-            const head = process.env.BRANCH_NAME;
-            const body = "Auto-generated by Codex workflow using \"gpt-5-codex\".";
-            const title = "codex(init): seed via gpt-5-codex";
-            const base = "main";
-            const res = await github.rest.pulls.create({ owner, repo, title, head, base, body });
-            core.info(`PR #${res.data.number} created`);
+            const branch = process.env.BRANCH_NAME;
+            const { data: prs } = await github.rest.pulls.list({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: "open",
+              head: `${context.repo.owner}:${branch}`
+            });
+            if (prs.length === 0) {
+              await github.rest.pulls.create({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                title: "codex(init): seed generated code",
+                head: branch,
+                base: "main",
+                body: "Automated code generation via gpt-5-codex (Responses API)."
+              });
+            }
 
-      - name: "Upload AI debug bundle"
+      - name: "Upload debug artifacts"
         if: "always()"
         uses: "actions/upload-artifact@v4"
         with:
@@ -191,5 +217,3 @@ jobs:
             ai/request.json
             ai/response.json
             ai/out.files.json
-          if-no-files-found: "warn"
-          compression-level: 6
