@@ -8,18 +8,18 @@ permissions:
   pull-requests: "write"
 
 env:
+  OPENAI_MODEL: "gpt-5-codex"
+  OPENAI_API_BASE: "https://api.openai.com/v1/chat/completions"
   SPEC_ROOT: "spec"
   SPEC_DIRS: "env foundation features tests"
   PROMPT_FILE: "ai/prompt.md"
-  FILES_JSON: "ai/files.json"
-  OPENAI_MODEL: "gpt-5-codex"
-  BRANCH_PREFIX: "codex/autogen"
+  REQUEST_JSON: "ai/request.json"
+  RESPONSE_JSON: "ai/response.json"
+  OUT_JSON: "ai/out.files.json"
   MAX_TOKENS: "12288"
   CURL_TIMEOUT: "300"
   CURL_RETRIES: "5"
   CURL_RETRY_DELAY: "5"
-  # 公開で問題ない固定エンドポイント（ご要望どおり secrets 不要）
-  ENDPOINT: "https://api.openai.com/v1/chat/completions"
 
 jobs:
   generate:
@@ -29,80 +29,30 @@ jobs:
       - name: "Checkout"
         uses: "actions/checkout@v4"
         with:
-          ref: "main"
+          fetch-depth: 1
+          persist-credentials: true
 
-      - name: "Compose prompt and allowed paths"
-        shell: "bash"
-        env:
-          SPEC_ROOT: "${{ env.SPEC_ROOT }}"
-          SPEC_DIRS: "${{ env.SPEC_DIRS }}"
-          PROMPT_FILE: "${{ env.PROMPT_FILE }}"
+      - name: "Install jq"
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y jq coreutils
+
+      - name: "Prepare prompt from spec"
         run: |
           set -euo pipefail
           mkdir -p "ai"
-          : > "ai/allowed_paths.txt"
           : > "$PROMPT_FILE"
-
-          LANG_HINT=""
-          for root in "${SPEC_ROOT}/env" "${SPEC_ROOT}/foundation" "${SPEC_ROOT}/features" "${SPEC_ROOT}"; do
-            [ -d "$root" ] || continue
-            hit="$(grep -R -n -i -E "^\s*(language|runtime\.language|lang|stack\.language|runtime)\s*[:=]\s*" "$root" 2>/dev/null | head -n1 || true)"
-            if [ -n "$hit" ]; then
-              LANG_HINT="$(printf "%s" "$hit" | sed -E "s/.*[:=]\s*//; s/[\",]//g; s/\s+$//;" | tr "A-Z" "a-z")"
-              break
-            fi
-          done
-          case "${LANG_HINT:-}" in
-            php*|composer*|psr*) LANG_HINT="php" ;;
-            ts|typescript*|node*|javascript*) LANG_HINT="typescript" ;;
-            py|python*)          LANG_HINT="python" ;;
-            go|golang*)          LANG_HINT="go" ;;
-            ruby*)               LANG_HINT="ruby" ;;
-            java*)               LANG_HINT="java" ;;
-            c#|dotnet*|.net*|cs) LANG_HINT="csharp" ;;
-            "" )                 LANG_HINT="auto" ;;
-          esac
-          if [ "$LANG_HINT" = "auto" ]; then
-            if   find . -type f \( -name "*.ts" -o -name "*.tsx" -o -name "*.js" -o -name "*.jsx" \) -print -quit | grep -q .; then LANG_HINT="typescript"
-            elif find . -type f -name "*.py" -print -quit | grep -q .; then LANG_HINT="python"
-            elif find . -type f -name "*.php" -print -quit | grep -q . || [ -f composer.json ]; then LANG_HINT="php"
-            elif [ -f go.mod ]; then LANG_HINT="go"
-            else LANG_HINT="typescript"
-            fi
-          fi
-          echo "lang_hint=$LANG_HINT" >> "$GITHUB_OUTPUT"
-
-          # allowlist 候補収集
-          grep -R -n -E '(^|\s)(file|path|destination|output|生成先|出力先)\s*:\s*([A-Za-z0-9_./-]+(\.[A-Za-z0-9]+)?)' "$SPEC_ROOT" \
-            | sed -E 's/.*:\s*//; s/["'\'']//g' >> "ai/allowed_paths.txt" || true
-          grep -R -h -E '[/A-Za-z0-9_.-]+\.(php|ts|tsx|js|jsx|py|rb|go|java|cs|sql|html|css|yml|yaml|json|ini|xml|env|conf|cfg|sh|htaccess)' "$SPEC_ROOT" \
-            | grep -o -E '[/A-Za-z0-9_.-]+\.(php|ts|tsx|js|jsx|py|rb|go|java|cs|sql|html|css|yml|yaml|json|ini|xml|env|conf|cfg|sh|htaccess)' >> "ai/allowed_paths.txt" || true
-          grep -R -h -E '(^|\s)(dir|directory|folder|ディレクトリ)\s*:\s*[A-Za-z0-9_./-]+/?' "$SPEC_ROOT" \
-            | sed -E 's/.*:\s*//; s/["'\'']//g' | awk '{gsub(/\/?$/,"/");print}' >> "ai/allowed_paths.txt" || true
-
-          # 最低限のデフォルト
-          if ! grep -Eq '\.(php|ts|tsx|js|jsx|py|rb|go|java|cs|sql)$' ai/allowed_paths.txt; then
-            case "$LANG_HINT" in
-              typescript) printf "%s\n" "src/" "app/" "lib/" "package.json" "tsconfig.json" >> ai/allowed_paths.txt ;;
-              python)     printf "%s\n" "src/" "app/" "pyproject.toml" "requirements.txt" >> ai/allowed_paths.txt ;;
-              php)        printf "%s\n" "src/" "app/" "public/" "composer.json" >> ai/allowed_paths.txt ;;
-              go)         printf "%s\n" "cmd/" "internal/" "pkg/" "go.mod" >> ai/allowed_paths.txt ;;
-            esac
-          fi
-
-          sed -E 's#^\./##; s#//+#/#g' -i "ai/allowed_paths.txt" || true
-          LC_ALL=C sort -u -o "ai/allowed_paths.txt" "ai/allowed_paths.txt"
 
           {
             printf "# Codex generation prompt\n\n"
-            printf "## LANGUAGE (MUST)\n\nlanguage: %s\n" "$LANG_HINT"
-            printf "\n## ALLOWED_PATHS (only modify/create under these; NEVER touch ai/)\n\n"
-            while IFS= read -r line; do printf -- "- %s\n" "$line"; done < "ai/allowed_paths.txt"
-            printf "\n## STRICT OUTPUT RULES\n\n"
-            printf -- "- Use the tool function \`emit_files\` to return files to create/modify.\n"
-            printf -- "- Implement the SPEC as runnable APPLICATION CODE and TESTS under ALLOWED_PATHS.\n"
-            printf -- "- Do NOT create compliance/policy/README/meta documents.\n"
-            printf -- "- Include real code (no placeholders).\n"
+            printf "## STRICT RULES\n\n"
+            printf -- "- Return ONLY JSON (no prose) conforming to the provided response schema.\n"
+            printf -- "- Implement runnable APPLICATION CODE and TESTS.\n"
+            printf -- "- Emit at least one code file under \"/src\" or \"/app\".\n"
+            printf -- "- You may also emit build files: \"package.json\", \"tsconfig.json\", \"pyproject.toml\", \"requirements.txt\", \"composer.json\", \"go.mod\".\n"
+            printf -- "- Do NOT create policy/compliance/README/meta docs.\n"
+            printf -- "- NEVER write under the \"ai/\" directory.\n\n"
+            printf "## SPEC CONTENT\n"
           } >> "$PROMPT_FILE"
 
           tmp_list="$(mktemp)"
@@ -111,214 +61,135 @@ jobs:
             find "${SPEC_ROOT}/${d}" -type f \( -name "*.md" -o -name "*.txt" -o -name "*.yaml" -o -name "*.yml" -o -name "*.json" \) >> "$tmp_list"
           done
           LC_ALL=C sort -o "$tmp_list" "$tmp_list" || true
+
           while IFS= read -r f; do
             printf "\n### %s\n\n" "$f" >> "$PROMPT_FILE"
             sed -e 's/\r$//' "$f" | head -n 4000 >> "$PROMPT_FILE"
           done < "$tmp_list"
           rm -f "$tmp_list"
 
-      - name: "Create working branch"
-        shell: "bash"
-        env:
-          BRANCH_PREFIX: "${{ env.BRANCH_PREFIX }}"
+      - name: "Create generation branch"
         run: |
           set -euo pipefail
+          BRANCH_NAME="codex/autogen-${GITHUB_RUN_ID}"
+          echo "BRANCH_NAME=${BRANCH_NAME}" >> "$GITHUB_ENV"
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          BRANCH_NAME="${BRANCH_PREFIX}-${GITHUB_RUN_ID}"
           git checkout -b "${BRANCH_NAME}"
-          echo "BRANCH_NAME=${BRANCH_NAME}" >> "$GITHUB_ENV"
 
-      - name: "Call model (tool calling) and materialize files"
-        shell: "bash"
+      - name: "Call OpenAI (strict JSON schema)"
         env:
-          ENDPOINT: "${{ env.ENDPOINT }}"
-          OPENAI_MODEL: "${{ env.OPENAI_MODEL }}"
-          MAX_TOKENS: "${{ env.MAX_TOKENS }}"
-          PROMPT_FILE: "${{ env.PROMPT_FILE }}"
-          FILES_JSON: "${{ env.FILES_JSON }}"
-          CURL_TIMEOUT: "${{ env.CURL_TIMEOUT }}"
-          CURL_RETRIES: "${{ env.CURL_RETRIES }}"
-          CURL_RETRY_DELAY: "${{ env.CURL_RETRY_DELAY }}"
-          # API キーのみ secrets から取得（Bearer で送信）
           OPENAI_API_KEY: "${{ secrets.OPENAI_API_KEY }}"
         run: |
           set -euo pipefail
-          command -v jq >/dev/null || (sudo apt-get update -y && sudo apt-get install -y jq coreutils)
 
-          tools_json=$(cat <<'JSON'
-          [
-            {
-              "type": "function",
-              "function": {
-                "name": "emit_files",
-                "description": "Create or modify project files. Return all files to write.",
-                "parameters": {
-                  "type": "object",
-                  "additionalProperties": false,
-                  "required": ["files"],
-                  "properties": {
-                    "files": {
-                      "type": "array",
-                      "items": {
-                        "type": "object",
-                        "additionalProperties": false,
-                        "required": ["path","content"],
-                        "properties": {
-                          "path":    { "type": "string", "minLength": 1 },
-                          "content": { "type": "string" }
+          jq -n \
+            --arg model "$OPENAI_MODEL" \
+            --rawfile prompt "$PROMPT_FILE" \
+            --argjson max_tokens "${MAX_TOKENS}" \
+            '{
+              "model": $model,
+              "temperature": 0,
+              "messages": [
+                {
+                  "role": "system",
+                  "content": "You are Codex. Output only strict JSON that matches the response schema. Write full, runnable code without placeholders."
+                },
+                {
+                  "role": "user",
+                  "content": ("Implement the SPEC as runnable application code and tests. Return files to write as JSON only.\\n\\n" + $prompt)
+                }
+              ],
+              "response_format": {
+                "type": "json_schema",
+                "json_schema": {
+                  "name": "emit_files",
+                  "strict": true,
+                  "schema": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["files"],
+                    "properties": {
+                      "files": {
+                        "type": "array",
+                        "minItems": 1,
+                        "items": {
+                          "type": "object",
+                          "additionalProperties": false,
+                          "required": ["path", "content"],
+                          "properties": {
+                            "path":    { "type": "string", "minLength": 1 },
+                            "content": { "type": "string" }
+                          }
                         }
                       }
                     }
                   }
                 }
-              }
-            }
-          ]
-          JSON
-          )
+              },
+              "max_tokens": $max_tokens
+            }' > "$REQUEST_JSON"
 
-          read -r -d '' SYS_MSG <<'EOS'
-          You MUST call the function tool "emit_files" only. Do not write prose or code fences.
-          Implement runnable application code and tests strictly under ALLOWED_PATHS.
-          Skip compliance/policy/README/meta docs. Use real code with no placeholders.
-          EOS
+          # Call API
+          status="$(curl -sS --connect-timeout 30 --max-time "${CURL_TIMEOUT}" \
+            --retry "${CURL_RETRIES}" --retry-all-errors --retry-delay "${CURL_RETRY_DELAY}" \
+            -H "Authorization: Bearer ${OPENAI_API_KEY}" \
+            -H "Content-Type: application/json" \
+            -w "\n%{http_code}\n" \
+            -d @"$REQUEST_JSON" "$OPENAI_API_BASE" | tee "$RESPONSE_JSON" | tail -n1)"
 
-          jq -n \
-            --arg model "$OPENAI_MODEL" \
-            --rawfile prompt "$PROMPT_FILE" \
-            --argjson tools "$tools_json" \
-            --arg sys "$SYS_MSG" \
-            --argjson max_tokens "${MAX_TOKENS:-0}" \
-            '{
-              model: $model,
-              messages: [
-                {role:"system", content:$sys},
-                {role:"user",   content:$prompt}
-              ],
-              tools: $tools,
-              tool_choice: {type:"function", function:{name:"emit_files"}}
-            } + ( ($max_tokens|tonumber) > 0
-                ? {max_tokens: ($max_tokens|tonumber)}
-                : {} )' > "ai/request.tools.json"
+          head -n -1 "$RESPONSE_JSON" > "${RESPONSE_JSON}.tmp" && mv -f "${RESPONSE_JSON}.tmp" "$RESPONSE_JSON"
 
-          call_api_with_retry() {
-            local req="$1"; local out="$2"; local attempt=1
-            while [ "$attempt" -le 3 ]; do
-              local tmp; tmp="$(mktemp)"
-              curl -sS --connect-timeout 30 --max-time "$CURL_TIMEOUT" \
-                   --retry "$CURL_RETRIES" --retry-all-errors --retry-delay "$CURL_RETRY_DELAY" \
-                   -H "Authorization: Bearer ${OPENAI_API_KEY}" -H "Content-Type: application/json" \
-                   -w "\n%{http_code}\n" -d @"$req" "$ENDPOINT" | tee "$tmp" >/dev/null
-              local status; status="$(tail -n1 "$tmp")"
-              head -n -1 "$tmp" > "$out"; rm -f "$tmp"
-              echo "::notice::OpenAI HTTP status: ${status}"
-              [ "$status" -lt 300 ] && return 0
-              case "$status" in
-                408|429|500|502|503|504) attempt=$((attempt+1)); continue ;;
-                *)   return 2 ;;
-              esac
-            done
-            return 2
-          }
+          echo "OpenAI HTTP status: ${status}"
+          [ "${status}" -ge 200 ] && [ "${status}" -lt 300 ]
 
-          call_api_with_retry "ai/request.tools.json" "ai/response.tools.json" || true
-          cp -f "ai/response.tools.json" "ai/response.raw.json" || true
+          # Extract strict JSON content
+          jq -e -r '.choices[0].message.content' "$RESPONSE_JSON" | jq -e '.' > "$OUT_JSON"
 
-          jq -r '
-            (.choices[0].message.tool_calls // [])
-            | map(select(.type=="function" and .function.name=="emit_files"))
-            | .[0].function.arguments // empty
-          ' "ai/response.tools.json" > "ai/out.files.txt" || true
-
-          if ! jq -e . "ai/out.files.txt" >/dev/null 2>&1; then
-            echo "::group::raw tool arguments (first 2KB)"
-            head -c 2048 "ai/out.files.txt" | sed "s/^/RAW: /"
-            echo "::endgroup::"
-            echo "::error::Tool arguments were not valid JSON"
-            exit 7
-          fi
-
-          jq -c '
-            def to_text(x):
-              if x==null then "" elif (x|type)=="string" then x
-              elif (x|type)=="array" then (x|map(tostring)|join("\n"))
-              elif (x|type)=="object" and has("code") then to_text(.code)
-              elif (x|type)=="object" and has("text") then to_text(.text)
-              else tostring end;
-            .files
-            | (if type=="array" then . else [] end)
-            | map({
-                path:    ((.path // .file // .name // .filename // "") | tostring),
-                content: to_text(.content // .code // .text // "")
-              })
-          ' "ai/out.files.txt" > "$FILES_JSON"
-
-          allow_all=0
-          if [ -s "ai/allowed_paths.txt" ]; then mapfile -t ALLOWED < "ai/allowed_paths.txt"; else allow_all=1; fi
-
-          jq -r '.[] | @base64' "$FILES_JSON" | while read -r row; do
+          # Materialize files
+          jq -r '.files[] | @base64' "$OUT_JSON" | while read -r row; do
             _jq(){ echo "$row" | base64 -d | jq -r "$1"; }
-            p="$(_jq '.path')"; c="$(_jq '.content')"
-            case "$p" in ai/*) echo "::warning::skip ai/: $p"; continue ;; esac
-            if printf "%s" "$p" | grep -qiE '(COMPLIANCE|SECURITY|CODE_OF_CONDUCT|CONTRIBUTING|README)\.(md|txt|json)$'; then
-              echo "::warning::skip non-code doc: $p"; continue
-            fi
-            ok="$allow_all"
-            if [ "$allow_all" -ne 1 ]; then
-              for pat in "${ALLOWED[@]}"; do
-                if [ "${p#"$pat"}" != "$p" ] || [ "$p" = "$pat" ]; then ok=1; break; fi
-              done
-            fi
-            [ "$ok" -ne 1 ] && { echo "::warning::skip (not allowed): $p"; continue; }
-            mkdir -p "$(dirname "$p")"
-            printf "%s" "$c" > "$p"
-            git add "$p"
+            path="$(_jq ".path")"
+            content="$(_jq ".content")"
+            case "$path" in
+              ai/*) echo "::warning::skip ai/: ${path}"; continue ;;
+            esac
+            mkdir -p "$(dirname "$path")"
+            printf "%s" "$content" > "$path"
+            git add "$path"
           done
 
           if ! git diff --cached --name-only | grep -q "."; then
-            echo "::error::No changes staged after all paths"; exit 6
+            echo "::error::No files were emitted by the model."
+            exit 6
           fi
 
-          if ! git diff --cached --name-only | grep -E '\.(php|ts|tsx|js|jsx|py|rb|go|java|cs|sql|sh|conf|cfg)$|(^|/)\.htaccess$|(^|/)Dockerfile$|(^|/)Makefile$' >/dev/null; then
-            echo "::error::No code files staged (only non-code docs). Aborting."; exit 6
-          fi
+          git commit -m "codex(init): seed via ${OPENAI_MODEL}"
+          git push -u origin "${BRANCH_NAME}"
 
-          git commit -m "codex(init): seed from specs via ${OPENAI_MODEL}"
-
-      - name: "Push branch"
-        shell: "bash"
+      - name: "Open Pull Request"
+        uses: "actions/github-script@v7"
         env:
           BRANCH_NAME: "${{ env.BRANCH_NAME }}"
-        run: |
-          set -euo pipefail
-          git push -u "origin" "${BRANCH_NAME}"
-
-      - name: "Open pull request"
-        uses: "actions/github-script@v7"
         with:
           script: |
-            const branch = process.env.BRANCH_NAME;
-            const { data: pr } = await github.rest.pulls.create({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              title: "codex(init): seed from specs",
-              head: branch,
-              base: "main",
-              body: "Auto-generated by codex.yml"
-            });
-            core.setOutput("pr", pr.html_url);
+            const { owner, repo } = context.repo;
+            const head = process.env.BRANCH_NAME;
+            const body = "Auto-generated by Codex workflow using \"gpt-5-codex\".";
+            const title = "codex(init): seed via gpt-5-codex";
+            const base = "main";
+            const res = await github.rest.pulls.create({ owner, repo, title, head, base, body });
+            core.info(`PR #${res.data.number} created`);
 
-      - name: "Upload artifacts"
+      - name: "Upload AI debug bundle"
         if: "always()"
         uses: "actions/upload-artifact@v4"
         with:
           name: "ai-debug"
           path: |
-            ai/request.tools.json
-            ai/response.tools.json
-            ai/response.raw.json
-            ai/out.files.txt
-            ai/files.json
             ai/prompt.md
-            ai/allowed_paths.txt
+            ai/request.json
+            ai/response.json
+            ai/out.files.json
+          if-no-files-found: "warn"
+          compression-level: 6
