@@ -1,48 +1,60 @@
-name: "Codex"
+name: "codex"
 
 on:
-  workflow_dispatch:
+  workflow_dispatch: {}
+  push:
+    paths:
+      - "spec/**"
+      - ".github/workflows/codex.yml"
+
+concurrency:
+  group: "codex-${{ github.ref }}"
+  cancel-in-progress: true
 
 permissions:
   contents: write
 
 env:
-  SPEC_ROOT: spec
-  SPEC_DIRS: env foundation features tests
-  PROMPT_FILE: ai/prompt.md
-  FILES_JSON: ai/files.json
-  OPENAI_MODEL: gpt-5-codex
+  SPEC_ROOT: "spec"
+  SPEC_DIRS: "env foundation features tests"
+  PROMPT_FILE: "ai/prompt.md"
+  FILES_JSON: "ai/files.json"
+  OPENAI_MODEL: "gpt-5-codex"
   OPENAI_BASE_URL: ""
-  BRANCH_PREFIX: codex/autogen
-  MAX_TOKENS: "12288"
-  CURL_TIMEOUT: "300"
-  CURL_RETRIES: "5"
-  CURL_RETRY_DELAY: "5"
+  BRANCH_PREFIX: "codex/autogen"
+  MAX_TOKENS: 12288
+  CURL_TIMEOUT: 300
+  CURL_RETRIES: 5
+  CURL_RETRY_DELAY: 5
 
 jobs:
   generate:
-    runs-on: ubuntu-24.04
+    name: "generate"
+    runs-on: "ubuntu-24.04"
 
     steps:
       - name: "Checkout"
-        uses: actions/checkout@v4
+        uses: "actions/checkout@v4"
         with:
-          ref: main
+          ref: "main"
 
-      - name: "Preflight"
-        shell: bash
-        env:
-          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+      - name: "Preflight (jq, folders, API key)"
+        shell: "bash"
         run: |
           set -euo pipefail
           if [ -z "${OPENAI_API_KEY:-}" ]; then
-            echo "::error::OPENAI_API_KEY is not set"; exit 1
+            echo "::error::OPENAI_API_KEY is not set"
+            exit 1
           fi
           mkdir -p ai
           command -v jq >/dev/null || (sudo apt-get update -y && sudo apt-get install -y jq coreutils)
 
-      - name: "Build prompt and allowed paths"
-        shell: bash
+      - name: "Compose prompt and allowed paths"
+        shell: "bash"
+        env:
+          SPEC_ROOT: "${{ env.SPEC_ROOT }}"
+          SPEC_DIRS: "${{ env.SPEC_DIRS }}"
+          PROMPT_FILE: "${{ env.PROMPT_FILE }}"
         run: |
           set -euo pipefail
           : > "ai/allowed_paths.txt"
@@ -120,29 +132,41 @@ jobs:
           done < "$tmp_list"
           rm -f "$tmp_list"
 
-      - name: "Select endpoint (chat/completions with tools)"
-        id: ep
-        shell: bash
+      - name: "Resolve endpoint"
+        id: "endpoint"
+        shell: "bash"
+        env:
+          OPENAI_BASE_URL: "${{ env.OPENAI_BASE_URL }}"
         run: |
           set -euo pipefail
           BASE="${OPENAI_BASE_URL:-https://api.openai.com}"
           BASE="${BASE%/}"
           echo "endpoint=${BASE}/v1/chat/completions" >> "$GITHUB_OUTPUT"
 
-      - name: "Create branch"
-        shell: bash
+      - name: "Create working branch"
+        shell: "bash"
+        env:
+          BRANCH_PREFIX: "${{ env.BRANCH_PREFIX }}"
         run: |
           set -euo pipefail
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           BRANCH_NAME="${BRANCH_PREFIX}-${GITHUB_RUN_ID}"
           git checkout -b "${BRANCH_NAME}"
+          echo "BRANCH_NAME=${BRANCH_NAME}" >> "$GITHUB_ENV"
 
       - name: "Call model (tool calling) and materialize files"
-        shell: bash
+        shell: "bash"
         env:
-          ENDPOINT: ${{ steps.ep.outputs.endpoint }}
-          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          PROMPT_FILE: "${{ env.PROMPT_FILE }}"
+          FILES_JSON: "${{ env.FILES_JSON }}"
+          OPENAI_MODEL: "${{ env.OPENAI_MODEL }}"
+          MAX_TOKENS: "${{ env.MAX_TOKENS }}"
+          CURL_TIMEOUT: "${{ env.CURL_TIMEOUT }}"
+          CURL_RETRIES: "${{ env.CURL_RETRIES }}"
+          CURL_RETRY_DELAY: "${{ env.CURL_RETRY_DELAY }}"
+          ENDPOINT: "${{ steps.endpoint.outputs.endpoint }}"
+          OPENAI_API_KEY: "${{ secrets.OPENAI_API_KEY }}"
         run: |
           set -euo pipefail
 
@@ -239,7 +263,8 @@ jobs:
             echo "::group::raw tool arguments (first 2KB)"
             head -c 2048 ai/out.files.txt | sed "s/^/RAW: /"
             echo "::endgroup::"
-            echo "::error::Tool arguments were not valid JSON"; exit 7
+            echo "::error::Tool arguments were not valid JSON"
+            exit 7
           fi
 
           # Normalize to array of {path,content}
@@ -260,7 +285,8 @@ jobs:
           ' "ai/out.files.txt" > "$FILES_JSON"
 
           if [ ! -s "$FILES_JSON" ] || ! jq -e 'type=="array" and length>0 and all(.[]; has("path") and has("content"))' "$FILES_JSON" >/dev/null; then
-            echo "::error::Model did not return valid files JSON"; exit 7
+            echo "::error::Model did not return valid files JSON"
+            exit 7
           fi
 
           # Enforce allowed paths and write files
@@ -287,29 +313,36 @@ jobs:
           done
 
           if ! git diff --cached --name-only | grep -q "."; then
-            echo "::error::No changes staged after all paths"; exit 6
+            echo "::error::No changes staged after all paths"
+            exit 6
           fi
 
           if ! git diff --cached --name-only | grep -E '\.(php|ts|tsx|js|jsx|py|rb|go|java|cs|sql|sh|conf|cfg)$|(^|/)\.htaccess$|(^|/)Dockerfile$|(^|/)Makefile$' >/dev/null; then
-            echo "::error::No code files staged (only non-code docs). Aborting."; exit 6
+            echo "::error::No code files staged (only non-code docs). Aborting."
+            exit 6
           fi
 
           git commit -m "codex(init): seed from specs via ${OPENAI_MODEL}"
 
-      - name: "Upload AI artifacts"
-        uses: actions/upload-artifact@v4
+      - name: "Upload API artifacts"
+        if: "always()"
+        uses: "actions/upload-artifact@v4"
         with:
-          name: ai-artifacts-${{ github.run_id }}
+          name: "codex-ai"
           path: |
-            ai/**
-            !**/*.tmp
-          if-no-files-found: warn
-          compression-level: 6
-          overwrite: false
+            ai/request.tools.json
+            ai/response.tools.json
+            ai/out.files.txt
+            ai/allowed_paths.txt
+            ai/files.json
+          if-no-files-found: "warn"
+          retention-days: 7
 
-      - name: "Summary"
-        shell: bash
+      - name: "Push branch and open PR"
+        shell: "bash"
+        env:
+          GH_TOKEN: "${{ github.token }}"
         run: |
-          echo "Branch created: $(git branch --show-current)"
-          echo "Seed files:"
-          git show --name-only --pretty="" HEAD || true
+          set -euo pipefail
+          git push --set-upstream origin "${BRANCH_NAME}"
+          gh pr create --fill --base "main" --head "${BRANCH_NAME}" || echo "::notice::PR already exists or creation failed"
