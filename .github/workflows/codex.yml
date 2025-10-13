@@ -1,11 +1,7 @@
-name: "Codex"
+name: Codex
 
 on:
-  workflow_dispatch:
-  push:
-    paths:
-      - "spec/**"
-      - ".github/workflows/codex.yml"
+  workflow_dispatch: {}
 
 permissions:
   contents: write
@@ -13,35 +9,34 @@ permissions:
 
 jobs:
   generate:
-    runs-on: "ubuntu-24.04"
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
     env:
-      OPENAI_API_KEY: "${{ secrets.OPENAI_API_KEY }}"
-      OPENAI_MODEL: "gpt-5-codex"
-      ENDPOINT: "https://api.openai.com/v1/chat/completions"
-      SPEC_ROOT: "spec"
-      SPEC_DIRS: "env foundation features tests"
-      PROMPT_FILE: "ai/prompt.md"
-      REQUEST_JSON: "ai/request.json"
-      RESPONSE_JSON: "ai/response.json"
-      OUT_JSON: "ai/out.files.json"
-      MAX_TOKENS: "12288"
-      CURL_TIMEOUT: "300"
-      CURL_RETRIES: "5"
-      CURL_RETRY_DELAY: "5"
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+      OPENAI_MODEL: gpt-5-codex
+      ENDPOINT: https://api.openai.com/v1/responses
+      SPEC_ROOT: spec
+      SPEC_DIRS: env foundation features tests
+      PROMPT_FILE: ai/prompt.md
+      REQUEST_JSON: ai/request.json
+      RESPONSE_JSON: ai/response.json
+      OUT_JSON: ai/out.files.json
+      MAX_TOKENS: 12288
+      CURL_TIMEOUT: 300
+      CURL_RETRIES: 5
+      CURL_RETRY_DELAY: 5
 
     steps:
-      - name: "Checkout"
-        uses: "actions/checkout@v4"
-        with:
-          fetch-depth: 1
+      - name: Checkout
+        uses: actions/checkout@v4
 
-      - name: "Install jq and coreutils"
+      - name: Ensure tools
         run: |
           sudo apt-get update -y
           sudo apt-get install -y jq coreutils
 
-      - name: "Build prompt"
-        shell: "bash"
+      - name: Build prompt from SPEC
+        shell: bash
         run: |
           set -euo pipefail
           mkdir -p "ai"
@@ -64,62 +59,103 @@ jobs:
             find "${SPEC_ROOT}/${d}" -type f \( -name "*.md" -o -name "*.txt" -o -name "*.yaml" -o -name "*.yml" -o -name "*.json" \) >> "$tmp_list"
           done
           LC_ALL=C sort -o "$tmp_list" "$tmp_list" || true
+
           while IFS= read -r f; do
             printf "\n### %s\n\n" "$f" >> "$PROMPT_FILE"
-            sed -e "s/\r$//" "$f" | head -n 4000 >> "$PROMPT_FILE"
+            sed -e 's/\r$//' "$f" | head -n 4000 >> "$PROMPT_FILE"
           done < "$tmp_list"
           rm -f "$tmp_list"
 
-      - name: "Create branch"
-        shell: "bash"
+      - name: Create branch
+        shell: bash
         run: |
           set -euo pipefail
           BRANCH_NAME="codex/autogen-${GITHUB_RUN_ID}"
           echo "BRANCH_NAME=${BRANCH_NAME}" >> "$GITHUB_ENV"
-          git config user.name "github-actions[bot]"
+          git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git checkout -b "${BRANCH_NAME}"
 
-      - name: "Call OpenAI (Chat Completions, JSON-only)"
-        shell: "bash"
-        env:
-          AUTH_HEADER: "Authorization: Bearer ${{ secrets.OPENAI_API_KEY }}"
+      - name: Call OpenAI (Responses API, strict JSON schema)
+        shell: bash
         run: |
           set -euo pipefail
 
           jq -n \
             --arg model "$OPENAI_MODEL" \
             --rawfile prompt "$PROMPT_FILE" \
-            --argjson max_tokens "${MAX_TOKENS}" \
+            --argjson max_out "${MAX_TOKENS:-0}" \
             '{
-               "model": $model,
-               "temperature": 0,
-               "response_format": {"type":"json_object"},
-               "messages": [
-                 {"role":"system","content":"You are Codex. Output ONLY a JSON object with the exact shape {\"files\":[{\"path\":string,\"content\":string},...]}. No prose, no code fences. Write full, runnable code. No placeholders. Never write inside ai/."},
-                 {"role":"user","content": ("Implement the SPEC as runnable application code and tests. Return files to write as JSON only.\n\n" + $prompt)}
+               model: $model,
+               temperature: 0,
+               response_format: {
+                 type: "json_schema",
+                 json_schema: {
+                   name: "emit_files",
+                   strict: true,
+                   schema: {
+                     type: "object",
+                     additionalProperties: false,
+                     required: ["files"],
+                     properties: {
+                       files: {
+                         type: "array",
+                         minItems: 1,
+                         items: {
+                           type: "object",
+                           additionalProperties: false,
+                           required: ["path","content"],
+                           properties: {
+                             path: { type: "string", minLength: 1 },
+                             content: { type: "string" }
+                           }
+                         }
+                       }
+                     }
+                   }
+                 }
+               },
+               input: [
+                 {
+                   role: "system",
+                   content: "You are Codex. Output ONLY a JSON object with the exact shape {\\\"files\\\":[{\\\"path\\\":string,\\\"content\\\":string},...]}. No prose, no code fences. Write full, runnable code. No placeholders. Never write inside ai/."
+                 },
+                 {
+                   role: "user",
+                   content: ("Implement the SPEC as runnable application code and tests. Return files to write as JSON only.\n\n" + $prompt)
+                 }
                ]
              }
-             | if ($max_tokens // 0) > 0 then . + {"max_tokens": $max_tokens} else . end' > "$REQUEST_JSON"
+             | if $max_out > 0 then . + {max_output_tokens: $max_out} else . end' > "$REQUEST_JSON"
 
           status="$(curl -sS --connect-timeout 30 --max-time "${CURL_TIMEOUT}" \
             --retry "${CURL_RETRIES}" --retry-all-errors --retry-delay "${CURL_RETRY_DELAY}" \
-            -H "$AUTH_HEADER" \
+            -H "Authorization: Bearer ${OPENAI_API_KEY}" \
             -H "Content-Type: application/json" \
             -w "\n%{http_code}\n" \
             -d @"$REQUEST_JSON" "$ENDPOINT" | tee "$RESPONSE_JSON" | tail -n1)"
 
+          # Remove the trailing HTTP code line that tee captured
           head -n -1 "$RESPONSE_JSON" > "${RESPONSE_JSON}.tmp" && mv -f "${RESPONSE_JSON}.tmp" "$RESPONSE_JSON"
 
           echo "OpenAI HTTP status: ${status}"
           [ "${status}" -ge 200 ] && [ "${status}" -lt 300 ]
 
-          jq -e -r '.choices[0].message.content' "$RESPONSE_JSON" | jq -e '.' > "$OUT_JSON"
+          # Extract the model's JSON (Responses API preferred paths)
+          jq -e -r '
+            (.output[]?.content[]? | select(.type=="output_text") | .text) //
+            (.output_text) //
+            (.response)
+          ' "$RESPONSE_JSON" | jq -e '.' > "$OUT_JSON"
 
+      - name: Write emitted files
+        shell: bash
+        run: |
+          set -euo pipefail
           jq -r '.files[] | @base64' "$OUT_JSON" | while read -r row; do
             _jq(){ echo "$row" | base64 -d | jq -r "$1"; }
-            path="$(_jq ".path")"
-            content="$(_jq ".content")"
+            path="$(_jq '.path')"
+            content="$(_jq '.content')"
             case "$path" in
               ai/*) echo "::warning::skip ai/: ${path}"; continue ;;
             esac
@@ -136,14 +172,13 @@ jobs:
           git commit -m "codex(init): seed via ${OPENAI_MODEL}"
           git push -u origin "${BRANCH_NAME}"
 
-      - name: "Upload debug artifacts"
-        if: "always()"
-        uses: "actions/upload-artifact@v4"
+      - name: Upload debug artifacts
+        uses: actions/upload-artifact@v4
         with:
-          name: "ai-debug"
+          name: ai-debug
           path: |
             ai/prompt.md
             ai/request.json
             ai/response.json
             ai/out.files.json
-          if-no-files-found: "warn"
+          if-no-files-found: warn
