@@ -1,42 +1,45 @@
-"name": "codex"
+name: "codex"
 
-"on":
-  "workflow_dispatch": {}
-  "push":
-    "paths":
-      - ".github/workflows/codex.yml"
-      - "spec/**"
+on:
+  workflow_dispatch: {}
 
-"permissions":
-  "contents": "write"
-  "pull-requests": "write"
+permissions:
+  contents: "write"
+  pull-requests: "write"
 
-"env":
-  "SPEC_ROOT": "spec"
-  "SPEC_DIRS": "env foundation features tests"
-  "PROMPT_FILE": "ai/prompt.md"
-  "FILES_JSON": "ai/files.json"
-  "OPENAI_MODEL": "gpt-5-codex"
-  "BRANCH_PREFIX": "codex/autogen"
-  "MAX_TOKENS": "12288"
-  "CURL_TIMEOUT": "300"
-  "CURL_RETRIES": "5"
-  "CURL_RETRY_DELAY": "5"
-  "ENDPOINT": "https://api.openai.com/v1/chat/completions"
+env:
+  SPEC_ROOT: "spec"
+  SPEC_DIRS: "env foundation features tests"
+  PROMPT_FILE: "ai/prompt.md"
+  FILES_JSON: "ai/files.json"
+  OPENAI_MODEL: "gpt-5-codex"
+  BRANCH_PREFIX: "codex/autogen"
+  MAX_TOKENS: "12288"
+  CURL_TIMEOUT: "300"
+  CURL_RETRIES: "5"
+  CURL_RETRY_DELAY: "5"
+  # 公開で問題ない固定エンドポイント（ご要望どおり secrets 不要）
+  ENDPOINT: "https://api.openai.com/v1/chat/completions"
 
-"jobs":
-  "generate":
-    "runs-on": "ubuntu-24.04"
+jobs:
+  generate:
+    name: "generate"
+    runs-on: "ubuntu-24.04"
+    steps:
+      - name: "Checkout"
+        uses: "actions/checkout@v4"
+        with:
+          ref: "main"
 
-    "steps":
-      - "name": "Checkout"
-        "uses": "actions/checkout@v4"
-
-      - "name": "Compose prompt and allowed paths"
-        "shell": "bash"
-        "run": |
+      - name: "Compose prompt and allowed paths"
+        shell: "bash"
+        env:
+          SPEC_ROOT: "${{ env.SPEC_ROOT }}"
+          SPEC_DIRS: "${{ env.SPEC_DIRS }}"
+          PROMPT_FILE: "${{ env.PROMPT_FILE }}"
+        run: |
           set -euo pipefail
-          mkdir -p ai
+          mkdir -p "ai"
           : > "ai/allowed_paths.txt"
           : > "$PROMPT_FILE"
 
@@ -69,13 +72,15 @@
           fi
           echo "lang_hint=$LANG_HINT" >> "$GITHUB_OUTPUT"
 
-          grep -R -n -E "(^|\s)(file|path|destination|output|生成先|出力先)\s*:\s*([A-Za-z0-9_./-]+(\.[A-Za-z0-9]+)?)" "$SPEC_ROOT" \
-            | sed -E "s/.*:\s*//; s/[\"']//g" >> "ai/allowed_paths.txt" || true
-          grep -R -h -E "[/A-Za-z0-9_.-]+\.(php|ts|tsx|js|jsx|py|rb|go|java|cs|sql|html|css|yml|yaml|json|ini|xml|env|conf|cfg|sh|htaccess)" "$SPEC_ROOT" \
-            | grep -o -E "[/A-Za-z0-9_.-]+\.(php|ts|tsx|js|jsx|py|rb|go|java|cs|sql|html|css|yml|yaml|json|ini|xml|env|conf|cfg|sh|htaccess)" >> "ai/allowed_paths.txt" || true
-          grep -R -h -E "(^|\s)(dir|directory|folder|ディレクトリ)\s*:\s*[A-Za-z0-9_./-]+/?" "$SPEC_ROOT" \
-            | sed -E "s/.*:\s*//; s/[\"']//g" | awk '{gsub(/\/?$/,"/");print}' >> "ai/allowed_paths.txt" || true
+          # allowlist 候補収集
+          grep -R -n -E '(^|\s)(file|path|destination|output|生成先|出力先)\s*:\s*([A-Za-z0-9_./-]+(\.[A-Za-z0-9]+)?)' "$SPEC_ROOT" \
+            | sed -E 's/.*:\s*//; s/["'\'']//g' >> "ai/allowed_paths.txt" || true
+          grep -R -h -E '[/A-Za-z0-9_.-]+\.(php|ts|tsx|js|jsx|py|rb|go|java|cs|sql|html|css|yml|yaml|json|ini|xml|env|conf|cfg|sh|htaccess)' "$SPEC_ROOT" \
+            | grep -o -E '[/A-Za-z0-9_.-]+\.(php|ts|tsx|js|jsx|py|rb|go|java|cs|sql|html|css|yml|yaml|json|ini|xml|env|conf|cfg|sh|htaccess)' >> "ai/allowed_paths.txt" || true
+          grep -R -h -E '(^|\s)(dir|directory|folder|ディレクトリ)\s*:\s*[A-Za-z0-9_./-]+/?' "$SPEC_ROOT" \
+            | sed -E 's/.*:\s*//; s/["'\'']//g' | awk '{gsub(/\/?$/,"/");print}' >> "ai/allowed_paths.txt" || true
 
+          # 最低限のデフォルト
           if ! grep -Eq '\.(php|ts|tsx|js|jsx|py|rb|go|java|cs|sql)$' ai/allowed_paths.txt; then
             case "$LANG_HINT" in
               typescript) printf "%s\n" "src/" "app/" "lib/" "package.json" "tsconfig.json" >> ai/allowed_paths.txt ;;
@@ -85,8 +90,8 @@
             esac
           fi
 
-          sed -E "s#^\./##; s#//+#/#g" -i "ai/allowed_paths.txt" || true
-          LC_ALL=C sort -u -o ai/allowed_paths.txt ai/allowed_paths.txt
+          sed -E 's#^\./##; s#//+#/#g' -i "ai/allowed_paths.txt" || true
+          LC_ALL=C sort -u -o "ai/allowed_paths.txt" "ai/allowed_paths.txt"
 
           {
             printf "# Codex generation prompt\n\n"
@@ -100,11 +105,23 @@
             printf -- "- Include real code (no placeholders).\n"
           } >> "$PROMPT_FILE"
 
-      - "name": "Create working branch"
-        "shell": "bash"
-        "env":
-          "BRANCH_PREFIX": "${{ env.BRANCH_PREFIX }}"
-        "run": |
+          tmp_list="$(mktemp)"
+          for d in $SPEC_DIRS; do
+            [ -d "${SPEC_ROOT}/${d}" ] || continue
+            find "${SPEC_ROOT}/${d}" -type f \( -name "*.md" -o -name "*.txt" -o -name "*.yaml" -o -name "*.yml" -o -name "*.json" \) >> "$tmp_list"
+          done
+          LC_ALL=C sort -o "$tmp_list" "$tmp_list" || true
+          while IFS= read -r f; do
+            printf "\n### %s\n\n" "$f" >> "$PROMPT_FILE"
+            sed -e 's/\r$//' "$f" | head -n 4000 >> "$PROMPT_FILE"
+          done < "$tmp_list"
+          rm -f "$tmp_list"
+
+      - name: "Create working branch"
+        shell: "bash"
+        env:
+          BRANCH_PREFIX: "${{ env.BRANCH_PREFIX }}"
+        run: |
           set -euo pipefail
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
@@ -112,19 +129,22 @@
           git checkout -b "${BRANCH_NAME}"
           echo "BRANCH_NAME=${BRANCH_NAME}" >> "$GITHUB_ENV"
 
-      - "name": "Call model (tool calling) and materialize files"
-        "shell": "bash"
-        "env":
-          "OPENAI_API_KEY": "${{ secrets.OPENAI_API_KEY }}"
-          "ENDPOINT": "${{ env.ENDPOINT }}"
-          "MAX_TOKENS": "${{ env.MAX_TOKENS }}"
-          "CURL_TIMEOUT": "${{ env.CURL_TIMEOUT }}"
-          "CURL_RETRIES": "${{ env.CURL_RETRIES }}"
-          "CURL_RETRY_DELAY": "${{ env.CURL_RETRY_DELAY }}"
-          "OPENAI_MODEL": "${{ env.OPENAI_MODEL }}"
-          "FILES_JSON": "${{ env.FILES_JSON }}"
-        "run": |
+      - name: "Call model (tool calling) and materialize files"
+        shell: "bash"
+        env:
+          ENDPOINT: "${{ env.ENDPOINT }}"
+          OPENAI_MODEL: "${{ env.OPENAI_MODEL }}"
+          MAX_TOKENS: "${{ env.MAX_TOKENS }}"
+          PROMPT_FILE: "${{ env.PROMPT_FILE }}"
+          FILES_JSON: "${{ env.FILES_JSON }}"
+          CURL_TIMEOUT: "${{ env.CURL_TIMEOUT }}"
+          CURL_RETRIES: "${{ env.CURL_RETRIES }}"
+          CURL_RETRY_DELAY: "${{ env.CURL_RETRY_DELAY }}"
+          # API キーのみ secrets から取得（Bearer で送信）
+          OPENAI_API_KEY: "${{ secrets.OPENAI_API_KEY }}"
+        run: |
           set -euo pipefail
+          command -v jq >/dev/null || (sudo apt-get update -y && sudo apt-get install -y jq coreutils)
 
           tools_json=$(cat <<'JSON'
           [
@@ -180,11 +200,11 @@
               tool_choice: {type:"function", function:{name:"emit_files"}}
             } + ( ($max_tokens|tonumber) > 0
                 ? {max_tokens: ($max_tokens|tonumber)}
-                : {} )' > ai/request.tools.json
+                : {} )' > "ai/request.tools.json"
 
           call_api_with_retry() {
             local req="$1"; local out="$2"; local attempt=1
-            while [ $attempt -le 3 ]; do
+            while [ "$attempt" -le 3 ]; do
               local tmp; tmp="$(mktemp)"
               curl -sS --connect-timeout 30 --max-time "$CURL_TIMEOUT" \
                    --retry "$CURL_RETRIES" --retry-all-errors --retry-delay "$CURL_RETRY_DELAY" \
@@ -192,36 +212,36 @@
                    -w "\n%{http_code}\n" -d @"$req" "$ENDPOINT" | tee "$tmp" >/dev/null
               local status; status="$(tail -n1 "$tmp")"
               head -n -1 "$tmp" > "$out"; rm -f "$tmp"
+              echo "::notice::OpenAI HTTP status: ${status}"
               [ "$status" -lt 300 ] && return 0
-              echo "::notice::API error $status"
               case "$status" in
                 408|429|500|502|503|504) attempt=$((attempt+1)); continue ;;
-                400) echo "::error::fatal 400 for this model/endpoint"; return 2 ;;
-                *)   echo "::error::fatal ${status}"; return 2 ;;
+                *)   return 2 ;;
               esac
             done
             return 2
           }
 
-          call_api_with_retry "ai/request.tools.json" "ai/response.tools.json"
+          call_api_with_retry "ai/request.tools.json" "ai/response.tools.json" || true
+          cp -f "ai/response.tools.json" "ai/response.raw.json" || true
 
           jq -r '
             (.choices[0].message.tool_calls // [])
             | map(select(.type=="function" and .function.name=="emit_files"))
             | .[0].function.arguments // empty
-          ' "ai/response.tools.json" > "ai/out.files.txt"
+          ' "ai/response.tools.json" > "ai/out.files.txt" || true
 
           if ! jq -e . "ai/out.files.txt" >/dev/null 2>&1; then
             echo "::group::raw tool arguments (first 2KB)"
-            head -c 2048 ai/out.files.txt | sed "s/^/RAW: /"
+            head -c 2048 "ai/out.files.txt" | sed "s/^/RAW: /"
             echo "::endgroup::"
-            echo "::error::Tool arguments were not valid JSON"; exit 7
+            echo "::error::Tool arguments were not valid JSON"
+            exit 7
           fi
 
           jq -c '
             def to_text(x):
-              if x==null then ""
-              elif (x|type)=="string" then x
+              if x==null then "" elif (x|type)=="string" then x
               elif (x|type)=="array" then (x|map(tostring)|join("\n"))
               elif (x|type)=="object" and has("code") then to_text(.code)
               elif (x|type)=="object" and has("text") then to_text(.text)
@@ -266,37 +286,39 @@
 
           git commit -m "codex(init): seed from specs via ${OPENAI_MODEL}"
 
-      - "name": "Push branch"
-        "shell": "bash"
-        "run": |
+      - name: "Push branch"
+        shell: "bash"
+        env:
+          BRANCH_NAME: "${{ env.BRANCH_NAME }}"
+        run: |
           set -euo pipefail
-          git push --set-upstream origin "${BRANCH_NAME}"
+          git push -u "origin" "${BRANCH_NAME}"
 
-      - "name": "Create Pull Request"
-        "uses": "actions/github-script@v7"
-        "with":
-          "script": |
+      - name: "Open pull request"
+        uses: "actions/github-script@v7"
+        with:
+          script: |
             const branch = process.env.BRANCH_NAME;
-            const title = `codex: generate via ${process.env.OPENAI_MODEL}`;
-            const body  = "Automated code generation by codex.yml.";
-            const {context, github, core} = require("@actions/github");
-            const {data: pr} = await github.rest.pulls.create({
+            const { data: pr } = await github.rest.pulls.create({
               owner: context.repo.owner,
               repo: context.repo.repo,
+              title: "codex(init): seed from specs",
               head: branch,
               base: "main",
-              title,
-              body
+              body: "Auto-generated by codex.yml"
             });
-            core.setOutput("url", pr.html_url);
+            core.setOutput("pr", pr.html_url);
 
-      - "name": "Upload debug artifacts"
-        "uses": "actions/upload-artifact@v4"
-        "with":
-          "name": "codex-debug"
-          "path": |
-            ai/prompt.md
+      - name: "Upload artifacts"
+        if: "always()"
+        uses: "actions/upload-artifact@v4"
+        with:
+          name: "ai-debug"
+          path: |
             ai/request.tools.json
             ai/response.tools.json
+            ai/response.raw.json
             ai/out.files.txt
+            ai/files.json
+            ai/prompt.md
             ai/allowed_paths.txt
