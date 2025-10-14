@@ -1,4 +1,4 @@
-name: "Codex"
+name: Codex
 
 on:
   workflow_dispatch:
@@ -7,45 +7,39 @@ permissions:
   contents: write
   pull-requests: write
 
-concurrency:
-  group: codex
-  cancel-in-progress: false
-
-env:
-  OPENAI_MODEL: gpt-5-codex
-  ENDPOINT: https://api.openai.com/v1/responses
-  SPEC_ROOT: spec
-  SPEC_DIRS: env foundation features tests
-  PROMPT_FILE: ai/prompt.md
-  REQUEST_JSON: ai/request.json
-  RESPONSE_JSON: ai/response.json
-  OUT_JSON: ai/out.files.json
-  MAX_TOKENS: 12288
-  CURL_TIMEOUT: 300
-  CURL_RETRIES: 5
-  CURL_RETRY_DELAY: 5
-
 jobs:
   generate:
-    name: generate
     runs-on: ubuntu-24.04
 
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 1
+    env:
+      OPENAI_MODEL: gpt-5-codex
+      ENDPOINT: https://api.openai.com/v1/responses
+      SPEC_ROOT: spec
+      SPEC_DIRS: env foundation features tests
+      PROMPT_FILE: ai/prompt.md
+      REQUEST_JSON: ai/request.json
+      RESPONSE_JSON: ai/response.json
+      OUT_JSON: ai/out.files.json
+      # 出力トークン上限。安全値から開始（必要に応じて上げる）
+      MAX_TOKENS: 4096
+      CURL_TIMEOUT: 300
+      CURL_RETRIES: 5
+      CURL_RETRY_DELAY: 5
 
-      - name: Install jq & coreutils
+    steps:
+      - uses: actions/checkout@v4
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+
+      - name: Install jq
         run: |
           sudo apt-get update -y
           sudo apt-get install -y jq coreutils
 
       - name: Build prompt from SPEC
-        shell: bash --noprofile --norc -e -o pipefail {0}
         run: |
           set -euo pipefail
-          mkdir -p "ai"
+          mkdir -p ai
           : > "$PROMPT_FILE"
           {
             printf "# Codex generation prompt\n\n"
@@ -62,100 +56,117 @@ jobs:
           tmp_list="$(mktemp)"
           for d in $SPEC_DIRS; do
             [ -d "${SPEC_ROOT}/${d}" ] || continue
-            find "${SPEC_ROOT}/${d}" -type f \
-              \( -name "*.md" -o -name "*.txt" -o -name "*.yaml" -o -name "*.yml" -o -name "*.json" \) >> "$tmp_list"
+            find "${SPEC_ROOT}/${d}" -type f \( -name "*.md" -o -name "*.txt" -o -name "*.yaml" -o -name "*.yml" -o -name "*.json" \) >> "$tmp_list"
           done
           LC_ALL=C sort -o "$tmp_list" "$tmp_list" || true
-
           while IFS= read -r f; do
             printf "\n### %s\n\n" "$f" >> "$PROMPT_FILE"
+            # 各ファイルの先頭 4000 行までを取り込み（過剰な入力での 400 を回避）
             sed -e 's/\r$//' "$f" | head -n 4000 >> "$PROMPT_FILE"
           done < "$tmp_list"
           rm -f "$tmp_list"
 
       - name: Create working branch
-        shell: bash --noprofile --norc -e -o pipefail {0}
         run: |
           set -euo pipefail
           BRANCH_NAME="codex/autogen-${GITHUB_RUN_ID}"
           echo "BRANCH_NAME=${BRANCH_NAME}" >> "$GITHUB_ENV"
-          git config user.name  "github-actions[bot]"
+          git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git checkout -b "${BRANCH_NAME}"
 
       - name: Call OpenAI (Responses API, strict JSON schema)
         env:
-          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-        shell: bash --noprofile --norc -e -o pipefail {0}
+          AUTH_HEADER: Authorization: Bearer ${{ secrets.OPENAI_API_KEY }}
         run: |
           set -euo pipefail
 
-          # Build request body for Responses API with typed parts + strict schema
+          # Build request body (typed content + strict JSON Schema)
           jq -n \
             --arg model "$OPENAI_MODEL" \
             --rawfile prompt "$PROMPT_FILE" \
             --argjson max_out "${MAX_TOKENS:-0}" \
             '{
-               model: $model,
-               temperature: 0,
-               response_format: {
-                 type: "json_schema",
-                 json_schema: {
-                   name: "emit_files",
-                   strict: true,
-                   schema: {
-                     type: "object",
-                     additionalProperties: false,
-                     required: ["files"],
-                     properties: {
-                       files: {
-                         type: "array",
-                         minItems: 1,
-                         items: {
-                           type: "object",
-                           additionalProperties: false,
-                           required: ["path","content"],
-                           properties: {
-                             path:    { type: "string", minLength: 1 },
-                             content: { type: "string" }
-                           }
-                         }
-                       }
-                     }
-                   }
-                 }
-               },
-               input: [
-                 {
-                   role: "system",
-                   content: "You are Codex. Output ONLY a JSON object with the exact shape {\\\"files\\\":[{\\\"path\\\":string,\\\"content\\\":string},...]}. No prose, no code fences. Write full, runnable code. No placeholders. Never write inside ai/."
-                 },
-                 {
-                   role: "user",
-                   content: ("Implement the SPEC as runnable application code and tests. Return files to write as JSON only.\n\n" + $prompt)
-                 }
-               ]
-             }
-             | if $max_out > 0 then . + {max_output_tokens: $max_out} else . end' > "$REQUEST_JSON"
+              model: $model,
+              temperature: 0,
+              modalities: ["text"],
+              response_format: {
+                type: "json_schema",
+                json_schema: {
+                  name: "emit_files",
+                  schema: {
+                    type: "object",
+                    additionalProperties: false,
+                    required: ["files"],
+                    properties: {
+                      files: {
+                        type: "array",
+                        minItems: 1,
+                        items: {
+                          type: "object",
+                          additionalProperties: false,
+                          required: ["path","content"],
+                          properties: {
+                            path:    { type: "string", minLength: 1 },
+                            content: { type: "string" }
+                          }
+                        }
+                      }
+                    }
+                  },
+                  strict: true
+                }
+              },
+              input: [
+                {
+                  role: "system",
+                  content: [
+                    { "type":"input_text",
+                      "text":"You are Codex. Output ONLY a JSON object with the exact shape {\\\"files\\\":[{\\\"path\\\":string,\\\"content\\\":string},...]}. No prose, no code fences. Write full, runnable code. No placeholders. Never write inside ai/."
+                    }
+                  ]
+                },
+                {
+                  role: "user",
+                  content: [
+                    { "type":"input_text",
+                      "text": ("Implement the SPEC as runnable application code and tests. Return files to write as JSON only.\n\n" + $prompt)
+                    }
+                  ]
+                }
+              ]
+            }
+            | if $max_out > 0 then . + {max_output_tokens: $max_out} else . end' > "$REQUEST_JSON"
 
-          # Call API. We want to keep the body even on errors for debugging.
-          # With pipefail, a 4xx/5xx will fail the step but still write the body to $RESPONSE_JSON via tee.
-          curl --fail-with-body -sS --connect-timeout 30 --max-time "${CURL_TIMEOUT}" \
+          # Call API (必ずボディを保存し、HTTP ステータスで分岐)
+          status="$(curl -sS --connect-timeout 30 --max-time "${CURL_TIMEOUT}" \
             --retry "${CURL_RETRIES}" --retry-all-errors --retry-delay "${CURL_RETRY_DELAY}" \
-            -H "Authorization: Bearer ${OPENAI_API_KEY}" \
+            -H "$AUTH_HEADER" \
             -H "Content-Type: application/json" \
+            -w "\n%{http_code}\n" \
             -d @"$REQUEST_JSON" "$ENDPOINT" \
-            | tee "$RESPONSE_JSON" >/dev/null
+            | tee "$RESPONSE_JSON" | tail -n1)"
 
-          # Extract model JSON to OUT_JSON (covering all Responses API shapes)
+          # tee が付けた末尾の HTTP コード行を除去
+          head -n -1 "$RESPONSE_JSON" > "${RESPONSE_JSON}.tmp" && mv -f "${RESPONSE_JSON}.tmp" "$RESPONSE_JSON"
+
+          echo "OpenAI HTTP status: ${status}"
+
+          # 200 台以外は error.message を表示して fail
+          if [ "$status" -lt 200 ] || [ "$status" -ge 300 ]; then
+            msg="$(jq -r '.error.message // .message // "Unknown error"' "$RESPONSE_JSON")"
+            echo "::error title=OpenAI API error::${msg}"
+            exit 1
+          fi
+
+          # Responses API のどの形でも拾える抽出パス
           jq -e -r '
             (.output[]?.content[]? | select(.type=="output_text") | .text)
             // (.output_text)
             // (.response)
           ' "$RESPONSE_JSON" | jq -e '.' > "$OUT_JSON"
 
-      - name: Write emitted files to repo
-        shell: bash --noprofile --norc -e -o pipefail {0}
+      - name: Write emitted files & push branch
         run: |
           set -euo pipefail
           jq -r '.files[] | @base64' "$OUT_JSON" | while read -r row; do
@@ -172,57 +183,16 @@ jobs:
             git add "$path"
           done
 
-          if ! git diff --cached --name-only | grep -q "."; then
+          if ! git diff --cached --name-only | grep -q .; then
             echo "::error::No files were emitted by the model."
             exit 6
           fi
 
-      - name: Commit & push
-        shell: bash --noprofile --norc -e -o pipefail {0}
-        run: |
-          set -euo pipefail
           git commit -m "codex(init): seed via ${OPENAI_MODEL}"
           git push -u origin "${BRANCH_NAME}"
 
-      - name: Open PR
-        uses: actions/github-script@v7
-        with:
-          script: |
-            const branch = process.env.BRANCH_NAME;
-            const { owner, repo } = context.repo;
-            try {
-              const title = `Codex: auto-generated code (${branch})`;
-              const body  = [
-                'This PR was created automatically by **Codex**.',
-                '',
-                '- Model: `' + process.env.OPENAI_MODEL + '`',
-                '- Endpoint: `' + process.env.ENDPOINT + '`',
-                '',
-                'Artifacts with request/response are attached to the workflow run for debugging.'
-              ].join('\n');
-
-              // If an open PR from this branch already exists, do nothing.
-              const existing = await github.rest.pulls.list({
-                owner, repo, state: 'open', head: `${owner}:${branch}`
-              });
-              if (existing.data.length > 0) {
-                core.info('PR already exists. Skipping creation.');
-              } else {
-                await github.rest.pulls.create({
-                  owner, repo, title: title, body: body, head: branch, base: 'main'
-                });
-              }
-            } catch (e) {
-              core.warning('PR creation failed: ' + (e?.message ?? e));
-            }
-        env:
-          BRANCH_NAME: ${{ env.BRANCH_NAME }}
-          OPENAI_MODEL: ${{ env.OPENAI_MODEL }}
-          ENDPOINT: ${{ env.ENDPOINT }}
-
-      - name: Upload AI debug bundle
+      - uses: actions/upload-artifact@v4
         if: always()
-        uses: actions/upload-artifact@v4
         with:
           name: ai-debug
           path: |
@@ -230,4 +200,3 @@ jobs:
             ai/request.json
             ai/response.json
             ai/out.files.json
-          if-no-files-found: warn
