@@ -94,8 +94,8 @@ jobs:
           {
             model: $model,
             temperature: 0,
-            response_format: {
-              type: "json_schema",
+            text: {
+              format: "json_schema",
               json_schema: {
                 name: "emit_files",
                 strict: true,
