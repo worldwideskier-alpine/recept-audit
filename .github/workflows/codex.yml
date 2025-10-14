@@ -1,15 +1,20 @@
 name: "codex"
 
 on:
-  workflow_dispatch:
-  push:
-    paths:
-      - "spec/**"
-      - ".github/workflows/codex.yml"
+  workflow_dispatch: {}
+
+permissions:
+  contents: "read"
+
+concurrency:
+  group: "codex-generate"
+  cancel-in-progress: true
 
 jobs:
   generate:
+    name: "generate"
     runs-on: "ubuntu-24.04"
+    timeout-minutes: 30
     env:
       OPENAI_API_KEY: "${{ secrets.OPENAI_API_KEY }}"
       OPENAI_MODEL: "gpt-5-codex"
@@ -20,14 +25,21 @@ jobs:
       REQUEST_JSON: "ai/request.json"
       RESPONSE_JSON: "ai/response.json"
       OUT_JSON: "ai/out.files.json"
+      STAGING_DIR: "codex_out"
       CURL_TIMEOUT: "300"
       CURL_RETRIES: "5"
       CURL_RETRY_DELAY: "5"
       TITLE: "Codex generation prompt"
+
     steps:
-      - uses: "actions/checkout@v4"
+      - name: "Checkout"
+        uses: "actions/checkout@v4"
+        with:
+          persist-credentials: "false"
+          fetch-depth: 1
 
       - name: "Install jq and coreutils"
+        shell: "bash"
         run: |
           set -euo pipefail
           sudo apt-get update -y
@@ -63,16 +75,8 @@ jobs:
           done < "$tmp_list"
           rm -f "$tmp_list"
 
-      - name: "Create branch"
-        run: |
-          set -euo pipefail
-          BRANCH_NAME="codex/autogen-${GITHUB_RUN_ID}"
-          echo "BRANCH_NAME=${BRANCH_NAME}" >> "$GITHUB_ENV"
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git checkout -b "${BRANCH_NAME}"
-
       - name: "Call Responses API"
+        shell: "bash"
         run: |
           set -euo pipefail
           jq -n \
@@ -80,28 +84,28 @@ jobs:
             --rawfile prompt "$PROMPT_FILE" \
             --argjson max_out "${MAX_TOKENS:-0}" \
             '{
-               model: $model,
-               temperature: 0,
-               response_format: {
-                 type: "json_schema",
-                 json_schema: {
-                   name: "emit_files",
-                   strict: true,
-                   schema: {
-                     type: "object",
-                     additionalProperties: false,
-                     required: ["files"],
-                     properties: {
-                       files: {
-                         type: "array",
-                         minItems: 1,
-                         items: {
-                           type: "object",
-                           additionalProperties: false,
-                           required: ["path","content"],
-                           properties: {
-                             path:    { type: "string", minLength: 1 },
-                             content: { type: "string" }
+               "model": $model,
+               "temperature": 0,
+               "response_format": {
+                 "type": "json_schema",
+                 "json_schema": {
+                   "name": "emit_files",
+                   "strict": true,
+                   "schema": {
+                     "type": "object",
+                     "additionalProperties": false,
+                     "required": ["files"],
+                     "properties": {
+                       "files": {
+                         "type": "array",
+                         "minItems": 1,
+                         "items": {
+                           "type": "object",
+                           "additionalProperties": false,
+                           "required": ["path","content"],
+                           "properties": {
+                             "path": { "type": "string", "minLength": 1 },
+                             "content": { "type": "string" }
                            }
                          }
                        }
@@ -109,32 +113,32 @@ jobs:
                    }
                  }
                },
-               input: [
+               "input": [
                  {
-                   role: "system",
-                   content: [
+                   "role": "system",
+                   "content": [
                      {
-                       type: "text",
-                       text: "You are Codex. Output ONLY a JSON object with the exact shape {\\\"files\\\":[{\\\"path\\\":string,\\\"content\\\":string},...]}. No prose, no code fences. Write full, runnable code. No placeholders. Never write inside ai/."
+                       "type": "input_text",
+                       "text": "You are Codex. Output ONLY a JSON object with the exact shape {\\\"files\\\":[{\\\"path\\\":string,\\\"content\\\":string},...]}. No prose, no code fences. Write full, runnable code. No placeholders. Never write inside ai/."
                      }
                    ]
                  },
                  {
-                   role: "user",
-                   content: [
+                   "role": "user",
+                   "content": [
                      {
-                       type: "text",
-                       text: ("Implement the SPEC as runnable application code and tests. Return files to write as JSON only.\n\n" + $prompt)
+                       "type": "input_text",
+                       "text": ("Implement the SPEC as runnable application code and tests. Return files to write as JSON only.\n\n" + $prompt)
                      }
                    ]
                  }
                ]
              }
-             | if $max_out > 0 then . + {max_output_tokens: $max_out} else . end' > "$REQUEST_JSON"
+             | if $max_out > 0 then . + { "max_output_tokens": $max_out } else . end' > "$REQUEST_JSON"
 
-          curl --fail-with-body -sS --connect-timeout 30 --max-time "${CURL_TIMEOUT}" \
-            --retry "${CURL_RETRIES}" --retry-all-errors --retry-delay "${CURL_RETRY_DELAY}" \
-            -H "Authorization: Bearer ${OPENAI_API_KEY}" \
+          curl --fail-with-body -sS --connect-timeout 30 --max-time "$CURL_TIMEOUT" \
+            --retry "$CURL_RETRIES" --retry-all-errors --retry-delay "$CURL_RETRY_DELAY" \
+            -H "Authorization: Bearer $OPENAI_API_KEY" \
             -H "Content-Type: application/json" \
             -d @"$REQUEST_JSON" "$ENDPOINT" \
             | tee "$RESPONSE_JSON" >/dev/null
@@ -145,9 +149,12 @@ jobs:
             // (.response)
           ' "$RESPONSE_JSON" | jq -e '.' > "$OUT_JSON"
 
-      - name: "Write files"
+      - name: "Stage outputs to separate folder (no repo changes)"
+        shell: "bash"
         run: |
           set -euo pipefail
+          rm -rf "$STAGING_DIR"
+          mkdir -p "$STAGING_DIR"
           jq -r '.files[] | @base64' "$OUT_JSON" | while read -r row; do
             _jq(){ echo "$row" | base64 -d | jq -r "$1"; }
             path="$(_jq ".path")"
@@ -155,17 +162,17 @@ jobs:
             case "$path" in
               ai/*) echo "::warning::skip ai/: ${path}"; continue ;;
             esac
-            mkdir -p "$(dirname "$path")"
-            printf "%s" "$content" > "$path"
-            git add "$path"
+            mkdir -p "$STAGING_DIR/$(dirname "$path")"
+            printf "%s" "$content" > "$STAGING_DIR/$path"
           done
-          if ! git diff --cached --name-only | grep -q "."; then
-            echo "::error::No files were emitted by the model."
-            exit 6
-          fi
+          echo "STAGED_PATHS=$(jq -r '.files[].path' "$OUT_JSON" | paste -sd "," -)" >> "$GITHUB_ENV"
 
-      - name: "Commit and push"
-        run: |
-          set -euo pipefail
-          git commit -m "codex(init): seed via ${OPENAI_MODEL}"
-          git push -u origin "${BRANCH_NAME}"
+      - name: "Upload generated files"
+        uses: "actions/upload-artifact@v4"
+        with:
+          name: "codex-generated-files"
+          path: |
+            ${{ env.STAGING_DIR }}/**
+            ${{ env.OUT_JSON }}
+            ${{ env.REQUEST_JSON }}
+            ${{ env.RESPONSE_JSON }}
