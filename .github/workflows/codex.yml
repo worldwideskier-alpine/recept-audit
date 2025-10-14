@@ -1,42 +1,37 @@
 name: "Codex"
 
 on:
-  workflow_dispatch:
+  workflow_dispatch: {}
 
 permissions:
-  contents: "write"
-  pull-requests: "write"
+  contents: write
+  pull-requests: write
+
+env:
+  OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+  OPENAI_MODEL: "gpt-5-codex"
+  ENDPOINT: "https://api.openai.com/v1/responses"
+  SPEC_ROOT: "spec"
+  SPEC_DIRS: "env foundation features tests"
+  PROMPT_FILE: "ai/prompt.md"
+  REQUEST_JSON: "ai/request.json"
+  RESPONSE_JSON: "ai/response.json"
+  OUT_JSON: "ai/out.files.json"
+  CURL_TIMEOUT: "300"
+  CURL_RETRIES: "5"
+  CURL_RETRY_DELAY: "5"
+  TITLE: "Codex generation prompt"
 
 jobs:
   generate:
-    name: "generate"
     runs-on: "ubuntu-24.04"
-
-    env:
-      OPENAI_API_KEY: "${{ secrets.OPENAI_API_KEY }}"
-      OPENAI_MODEL: "gpt-5-codex"
-      ENDPOINT: "https://api.openai.com/v1/responses"
-      SPEC_ROOT: "spec"
-      SPEC_DIRS: "env foundation features tests"
-      PROMPT_FILE: "ai/prompt.md"
-      REQUEST_JSON: "ai/request.json"
-      RESPONSE_JSON: "ai/response.json"
-      OUT_JSON: "ai/out.files.json"
-      MAX_TOKENS: "12288"
-      CURL_TIMEOUT: "300"
-      CURL_RETRIES: "5"
-      CURL_RETRY_DELAY: "5"
-      TITLE: "Codex generation prompt"
 
     steps:
       - name: "Checkout"
-        uses: "actions/checkout@v4"
-        with:
-          fetch-depth: 1
-          lfs: false
-          submodules: false
+        uses: actions/checkout@v4
 
-      - name: "Install jq and coreutils"
+      - name: "Install jq & coreutils"
+        shell: bash
         run: |
           set -euo pipefail
           sudo apt-get update -y
@@ -48,7 +43,6 @@ jobs:
           set -euo pipefail
           mkdir -p "ai"
           : > "$PROMPT_FILE"
-
           {
             printf "# %s\n\n" "$TITLE"
             printf "## STRICT RULES\n\n"
@@ -75,7 +69,7 @@ jobs:
           done < "$tmp_list"
           rm -f "$tmp_list"
 
-      - name: "Create work branch"
+      - name: "Create working branch"
         shell: bash
         run: |
           set -euo pipefail
@@ -88,7 +82,10 @@ jobs:
       - name: "Call OpenAI Responses API (typed content + strict JSON schema)"
         shell: bash
         env:
-          BRANCH_NAME: "${{ env.BRANCH_NAME }}"
+          # Note: MAX_TOKENS is intentionally UNSET (option #3). Do not add max_output_tokens.
+          # If someone sets MAX_TOKENS at dispatch-time, it will still be ignored unless > 0 per jq guard below.
+          # Leaving env absent keeps the UI free of extra inputs and sends no upper bound by default.
+          :
         run: |
           set -euo pipefail
 
@@ -153,7 +150,7 @@ jobs:
           # Call API (keep body even on errors for debugging)
           curl --fail-with-body -sS --connect-timeout 30 --max-time "${CURL_TIMEOUT}" \
             --retry "${CURL_RETRIES}" --retry-all-errors --retry-delay "${CURL_RETRY_DELAY}" \
-            -H "Authorization: Bearer ${OPENAI_API_KEY}" \
+            -H "Authorization: Bearer $OPENAI_API_KEY" \
             -H "Content-Type: application/json" \
             -d @"$REQUEST_JSON" "$ENDPOINT" \
             | tee "$RESPONSE_JSON" >/dev/null
@@ -165,11 +162,7 @@ jobs:
             // (.response)
           ' "$RESPONSE_JSON" | jq -e '.' > "$OUT_JSON"
 
-      - name: "Write files, commit, and push branch"
-        shell: bash
-        run: |
-          set -euo pipefail
-
+          # Write files and stage them
           jq -r '.files[] | @base64' "$OUT_JSON" | while read -r row; do
             _jq(){ echo "$row" | base64 -d | jq -r "$1"; }
             path="$(_jq ".path")"
@@ -191,16 +184,3 @@ jobs:
 
           git commit -m "codex(init): seed via ${OPENAI_MODEL}"
           git push -u origin "${BRANCH_NAME}"
-
-      - name: "Upload debug artifacts"
-        uses: "actions/upload-artifact@v4"
-        with:
-          name: "ai-debug"
-          path: |
-            ai/prompt.md
-            ai/request.json
-            ai/response.json
-            ai/out.files.json
-          if-no-files-found: "warn"
-          overwrite: false
-          include-hidden-files: false
