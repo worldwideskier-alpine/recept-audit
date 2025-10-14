@@ -1,12 +1,7 @@
 name: "Codex"
 
 on:
-  workflow_dispatch:
-    inputs:
-      max_output_tokens:
-        description: "Upper bound for model tokens (Responses API: max_output_tokens). 0 disables the field."
-        required: false
-        default: "12288"
+  workflow_dispatch: {}
 
 permissions:
   contents: "write"
@@ -72,15 +67,11 @@ jobs:
 
           while IFS= read -r f; do
             printf "\n### %s\n\n" "$f" >> "$PROMPT_FILE"
-            # 仕様書は長すぎると API 入力を圧迫するため各ファイル先頭 4000 行のみ
             sed -e 's/\r$//' "$f" | head -n 4000 >> "$PROMPT_FILE"
           done < "$tmp_list"
           rm -f "$tmp_list"
 
       - name: "Create branch"
-        id: "gitprep"
-        env:
-          GITHUB_RUN_ID: "${{ github.run_id }}"
         run: |
           set -euo pipefail
           BRANCH_NAME="codex/autogen-${GITHUB_RUN_ID}"
@@ -92,20 +83,13 @@ jobs:
       - name: "Call OpenAI (Responses API, strict JSON schema)"
         env:
           AUTH_HEADER: "Authorization: Bearer ${{ secrets.OPENAI_API_KEY }}"
-          INPUT_MAX: "${{ inputs.max_output_tokens }}"
         run: |
           set -euo pipefail
 
-          # Resolve max tokens (prefer input, fallback to env)
-          max_out="${INPUT_MAX:-}"
-          if [ -z "${max_out}" ]; then max_out="${MAX_TOKENS:-0}"; fi
-          max_out="${max_out:-0}"
-
-          # Build request body for Responses API with typed parts + strict schema
           jq -n \
             --arg model "$OPENAI_MODEL" \
             --rawfile prompt "$PROMPT_FILE" \
-            --argjson max_out "${max_out:-0}" \
+            --argjson max_out "${MAX_TOKENS:-0}" \
             '{
                model: $model,
                temperature: 0,
@@ -149,8 +133,6 @@ jobs:
              }
              | if $max_out > 0 then . + {max_output_tokens: $max_out} else . end' > "$REQUEST_JSON"
 
-          # Call API. Keep body even on errors for debugging.
-          # With --fail-with-body, a 4xx/5xx fails the step but we still have the JSON in $RESPONSE_JSON via tee.
           curl --fail-with-body -sS --connect-timeout 30 --max-time "${CURL_TIMEOUT}" \
             --retry "${CURL_RETRIES}" --retry-all-errors --retry-delay "${CURL_RETRY_DELAY}" \
             -H "$AUTH_HEADER" \
@@ -158,7 +140,6 @@ jobs:
             -d @"$REQUEST_JSON" "$ENDPOINT" \
             | tee "$RESPONSE_JSON" >/dev/null
 
-          # Extract model JSON to OUT_JSON (cover all Responses API shapes)
           jq -e -r '
             (.output[]?.content[]? | select(.type=="output_text") | .text)
             // (.output_text)
@@ -168,17 +149,13 @@ jobs:
       - name: "Write returned files & commit"
         run: |
           set -euo pipefail
-
-          # Write files
           jq -r '.files[] | @base64' "$OUT_JSON" | while read -r row; do
             _jq(){ echo "$row" | base64 -d | jq -r "$1"; }
             path="$(_jq ".path")"
             content="$(_jq ".content")"
-
             case "$path" in
               ai/*) echo "::warning::skip ai/: ${path}"; continue ;;
             esac
-
             mkdir -p "$(dirname "$path")"
             printf "%s" "$content" > "$path"
             git add "$path"
@@ -193,8 +170,8 @@ jobs:
           git push -u origin "${BRANCH_NAME}"
 
       - name: "Upload AI debug artifacts"
-        uses: "actions/upload-artifact@v4"
         if: "always()"
+        uses: "actions/upload-artifact@v4"
         with:
           name: "ai-debug"
           path: |
