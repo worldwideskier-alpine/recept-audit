@@ -7,14 +7,14 @@ permissions:
   contents: "read"
 
 concurrency:
-  group: "codex-generate"
+  group: "codex"
   cancel-in-progress: true
 
 jobs:
   generate:
     name: "generate"
     runs-on: "ubuntu-24.04"
-    timeout-minutes: 30
+    timeout-minutes: "30"
     env:
       OPENAI_API_KEY: "${{ secrets.OPENAI_API_KEY }}"
       OPENAI_MODEL: "gpt-5-codex"
@@ -36,7 +36,7 @@ jobs:
         uses: "actions/checkout@v4"
         with:
           persist-credentials: "false"
-          fetch-depth: 1
+          fetch-depth: "1"
 
       - name: "Install jq and coreutils"
         shell: "bash"
