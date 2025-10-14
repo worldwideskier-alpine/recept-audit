@@ -1,43 +1,38 @@
 name: "Codex"
 
 on:
-  workflow_dispatch: {}
+  workflow_dispatch:
 
 permissions:
   contents: write
   pull-requests: write
 
-env:
-  OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-  OPENAI_MODEL: "gpt-5-codex"
-  ENDPOINT: "https://api.openai.com/v1/responses"
-  SPEC_ROOT: "spec"
-  SPEC_DIRS: "env foundation features tests"
-  PROMPT_FILE: "ai/prompt.md"
-  REQUEST_JSON: "ai/request.json"
-  RESPONSE_JSON: "ai/response.json"
-  OUT_JSON: "ai/out.files.json"
-  CURL_TIMEOUT: "300"
-  CURL_RETRIES: "5"
-  CURL_RETRY_DELAY: "5"
-  TITLE: "Codex generation prompt"
-
 jobs:
   generate:
-    runs-on: "ubuntu-24.04"
+    runs-on: ubuntu-latest
+    env:
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+      OPENAI_MODEL: gpt-5-codex
+      ENDPOINT: https://api.openai.com/v1/responses
+      SPEC_ROOT: spec
+      SPEC_DIRS: env foundation features tests
+      PROMPT_FILE: ai/prompt.md
+      REQUEST_JSON: ai/request.json
+      RESPONSE_JSON: ai/response.json
+      OUT_JSON: ai/out.files.json
+      CURL_TIMEOUT: 300
+      CURL_RETRIES: 5
+      CURL_RETRY_DELAY: 5
+      TITLE: Codex generation prompt
     steps:
-      - name: "Checkout"
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: "Install jq and coreutils"
-        shell: bash
+      - name: install jq
         run: |
-          set -euo pipefail
           sudo apt-get update -y
           sudo apt-get install -y jq coreutils
 
-      - name: "Build prompt from SPEC"
-        shell: bash
+      - name: build prompt
         run: |
           set -euo pipefail
           mkdir -p "ai"
@@ -53,6 +48,7 @@ jobs:
             printf -- "- NEVER write under the \"ai/\" directory.\n\n"
             printf "## SPEC CONTENT\n"
           } >> "$PROMPT_FILE"
+
           tmp_list="$(mktemp)"
           for d in $SPEC_DIRS; do
             [ -d "${SPEC_ROOT}/${d}" ] || continue
@@ -66,8 +62,7 @@ jobs:
           done < "$tmp_list"
           rm -f "$tmp_list"
 
-      - name: "Create working branch"
-        shell: bash
+      - name: create working branch
         run: |
           set -euo pipefail
           BRANCH_NAME="codex/autogen-${GITHUB_RUN_ID}"
@@ -76,10 +71,10 @@ jobs:
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git checkout -b "${BRANCH_NAME}"
 
-      - name: "Call OpenAI Responses API"
-        shell: bash
+      - name: call OpenAI Responses API
         run: |
           set -euo pipefail
+
           jq -n \
             --arg model "$OPENAI_MODEL" \
             --rawfile prompt "$PROMPT_FILE" \
@@ -119,7 +114,7 @@ jobs:
                    role: "system",
                    content: [
                      {
-                       type: "text",
+                       type: "input_text",
                        text: "You are Codex. Output ONLY a JSON object with the exact shape {\\\"files\\\":[{\\\"path\\\":string,\\\"content\\\":string},...]}. No prose, no code fences. Write full, runnable code. No placeholders. Never write inside ai/."
                      }
                    ]
@@ -128,7 +123,7 @@ jobs:
                    role: "user",
                    content: [
                      {
-                       type: "text",
+                       type: "input_text",
                        text: ("Implement the SPEC as runnable application code and tests. Return files to write as JSON only.\n\n" + $prompt)
                      }
                    ]
@@ -139,7 +134,7 @@ jobs:
 
           curl --fail-with-body -sS --connect-timeout 30 --max-time "${CURL_TIMEOUT}" \
             --retry "${CURL_RETRIES}" --retry-all-errors --retry-delay "${CURL_RETRY_DELAY}" \
-            -H "Authorization: Bearer $OPENAI_API_KEY" \
+            -H "Authorization: Bearer ${OPENAI_API_KEY}" \
             -H "Content-Type: application/json" \
             -d @"$REQUEST_JSON" "$ENDPOINT" \
             | tee "$RESPONSE_JSON" >/dev/null
