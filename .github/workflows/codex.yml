@@ -93,7 +93,6 @@ jobs:
             --argjson max_out "${MAX_TOKENS:-0}" '
           {
             model: $model,
-            temperature: 0,
             text: {
               format: {
                 type: "json_schema",
