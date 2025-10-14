@@ -7,32 +7,36 @@ permissions:
   contents: write
   pull-requests: write
 
+env:
+  OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+  OPENAI_MODEL: gpt-5-codex
+  ENDPOINT: https://api.openai.com/v1/responses
+  SPEC_ROOT: spec
+  SPEC_DIRS: env foundation features tests
+  PROMPT_FILE: ai/prompt.md
+  REQUEST_JSON: ai/request.json
+  RESPONSE_JSON: ai/response.json
+  OUT_JSON: ai/out.files.json
+  CURL_TIMEOUT: 300
+  CURL_RETRIES: 5
+  CURL_RETRY_DELAY: 5
+  TITLE: Codex generation prompt
+
 jobs:
   generate:
     runs-on: ubuntu-latest
-    env:
-      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-      OPENAI_MODEL: gpt-5-codex
-      ENDPOINT: https://api.openai.com/v1/responses
-      SPEC_ROOT: spec
-      SPEC_DIRS: env foundation features tests
-      PROMPT_FILE: ai/prompt.md
-      REQUEST_JSON: ai/request.json
-      RESPONSE_JSON: ai/response.json
-      OUT_JSON: ai/out.files.json
-      CURL_TIMEOUT: 300
-      CURL_RETRIES: 5
-      CURL_RETRY_DELAY: 5
-      TITLE: Codex generation prompt
     steps:
       - uses: actions/checkout@v4
 
-      - name: install jq
+      - name: Install tools
+        shell: bash
         run: |
+          set -euo pipefail
           sudo apt-get update -y
           sudo apt-get install -y jq coreutils
 
-      - name: build prompt
+      - name: Build prompt from SPEC
+        shell: bash
         run: |
           set -euo pipefail
           mkdir -p "ai"
@@ -56,13 +60,15 @@ jobs:
               \( -name "*.md" -o -name "*.txt" -o -name "*.yaml" -o -name "*.yml" -o -name "*.json" \) >> "$tmp_list"
           done
           LC_ALL=C sort -o "$tmp_list" "$tmp_list" || true
+
           while IFS= read -r f; do
             printf "\n### %s\n\n" "$f" >> "$PROMPT_FILE"
             sed -e 's/\r$//' "$f" | head -n 4000 >> "$PROMPT_FILE"
           done < "$tmp_list"
           rm -f "$tmp_list"
 
-      - name: create working branch
+      - name: Create working branch
+        shell: bash
         run: |
           set -euo pipefail
           BRANCH_NAME="codex/autogen-${GITHUB_RUN_ID}"
@@ -71,7 +77,8 @@ jobs:
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git checkout -b "${BRANCH_NAME}"
 
-      - name: call OpenAI Responses API
+      - name: Call OpenAI Responses API (typed content + strict JSON schema)
+        shell: bash
         run: |
           set -euo pipefail
 
@@ -164,3 +171,9 @@ jobs:
 
           git commit -m "codex(init): seed via ${OPENAI_MODEL}"
           git push -u origin "${BRANCH_NAME}"
+
+      - name: Upload response.json
+        uses: actions/upload-artifact@v4
+        with:
+          name: response-json
+          path: ai/response.json
