@@ -1,48 +1,57 @@
-name: Codex
+name: "Codex"
 
 on:
   workflow_dispatch:
+    inputs:
+      max_output_tokens:
+        description: "Upper bound for model tokens (Responses API: max_output_tokens). 0 disables the field."
+        required: false
+        default: "12288"
 
 permissions:
-  contents: write
-  pull-requests: write
+  contents: "write"
+  pull-requests: "write"
+
+env:
+  OPENAI_MODEL: "gpt-5-codex"
+  ENDPOINT: "https://api.openai.com/v1/responses"
+  SPEC_ROOT: "spec"
+  SPEC_DIRS: "env foundation features tests"
+  PROMPT_FILE: "ai/prompt.md"
+  REQUEST_JSON: "ai/request.json"
+  RESPONSE_JSON: "ai/response.json"
+  OUT_JSON: "ai/out.files.json"
+  MAX_TOKENS: "12288"
+  CURL_TIMEOUT: "300"
+  CURL_RETRIES: "5"
+  CURL_RETRY_DELAY: "5"
 
 jobs:
   generate:
-    runs-on: ubuntu-24.04
-
-    env:
-      OPENAI_MODEL: gpt-5-codex
-      ENDPOINT: https://api.openai.com/v1/responses
-      SPEC_ROOT: spec
-      SPEC_DIRS: env foundation features tests
-      PROMPT_FILE: ai/prompt.md
-      REQUEST_JSON: ai/request.json
-      RESPONSE_JSON: ai/response.json
-      OUT_JSON: ai/out.files.json
-      # 出力トークン上限。安全値から開始（必要に応じて上げる）
-      MAX_TOKENS: 4096
-      CURL_TIMEOUT: 300
-      CURL_RETRIES: 5
-      CURL_RETRY_DELAY: 5
+    name: "generate"
+    runs-on: "ubuntu-24.04"
 
     steps:
-      - uses: actions/checkout@v4
-        env:
-          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+      - name: "Checkout"
+        uses: "actions/checkout@v4"
 
-      - name: Install jq
+      - name: "Install tools"
         run: |
+          set -euo pipefail
           sudo apt-get update -y
           sudo apt-get install -y jq coreutils
 
-      - name: Build prompt from SPEC
+      - name: "Assemble prompt from SPEC (full)"
+        env:
+          TITLE: "Codex generation prompt"
         run: |
           set -euo pipefail
-          mkdir -p ai
+
+          mkdir -p "ai"
           : > "$PROMPT_FILE"
+
           {
-            printf "# Codex generation prompt\n\n"
+            printf "# %s\n\n" "$TITLE"
             printf "## STRICT RULES\n\n"
             printf -- "- Return ONLY JSON (no prose) that matches {\"files\":[{\"path\":string,\"content\":string},...]}.\n"
             printf -- "- Implement runnable APPLICATION CODE and TESTS.\n"
@@ -56,119 +65,111 @@ jobs:
           tmp_list="$(mktemp)"
           for d in $SPEC_DIRS; do
             [ -d "${SPEC_ROOT}/${d}" ] || continue
-            find "${SPEC_ROOT}/${d}" -type f \( -name "*.md" -o -name "*.txt" -o -name "*.yaml" -o -name "*.yml" -o -name "*.json" \) >> "$tmp_list"
+            find "${SPEC_ROOT}/${d}" -type f \
+              \( -name "*.md" -o -name "*.txt" -o -name "*.yaml" -o -name "*.yml" -o -name "*.json" \) >> "$tmp_list"
           done
           LC_ALL=C sort -o "$tmp_list" "$tmp_list" || true
+
           while IFS= read -r f; do
             printf "\n### %s\n\n" "$f" >> "$PROMPT_FILE"
-            # 各ファイルの先頭 4000 行までを取り込み（過剰な入力での 400 を回避）
+            # 仕様書は長すぎると API 入力を圧迫するため各ファイル先頭 4000 行のみ
             sed -e 's/\r$//' "$f" | head -n 4000 >> "$PROMPT_FILE"
           done < "$tmp_list"
           rm -f "$tmp_list"
 
-      - name: Create working branch
+      - name: "Create branch"
+        id: "gitprep"
+        env:
+          GITHUB_RUN_ID: "${{ github.run_id }}"
         run: |
           set -euo pipefail
           BRANCH_NAME="codex/autogen-${GITHUB_RUN_ID}"
           echo "BRANCH_NAME=${BRANCH_NAME}" >> "$GITHUB_ENV"
-          git config user.name "github-actions[bot]"
+          git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git checkout -b "${BRANCH_NAME}"
 
-      - name: Call OpenAI (Responses API, strict JSON schema)
+      - name: "Call OpenAI (Responses API, strict JSON schema)"
         env:
-          AUTH_HEADER: Authorization: Bearer ${{ secrets.OPENAI_API_KEY }}
+          AUTH_HEADER: "Authorization: Bearer ${{ secrets.OPENAI_API_KEY }}"
+          INPUT_MAX: "${{ inputs.max_output_tokens }}"
         run: |
           set -euo pipefail
 
-          # Build request body (typed content + strict JSON Schema)
+          # Resolve max tokens (prefer input, fallback to env)
+          max_out="${INPUT_MAX:-}"
+          if [ -z "${max_out}" ]; then max_out="${MAX_TOKENS:-0}"; fi
+          max_out="${max_out:-0}"
+
+          # Build request body for Responses API with typed parts + strict schema
           jq -n \
             --arg model "$OPENAI_MODEL" \
             --rawfile prompt "$PROMPT_FILE" \
-            --argjson max_out "${MAX_TOKENS:-0}" \
+            --argjson max_out "${max_out:-0}" \
             '{
-              model: $model,
-              temperature: 0,
-              modalities: ["text"],
-              response_format: {
-                type: "json_schema",
-                json_schema: {
-                  name: "emit_files",
-                  schema: {
-                    type: "object",
-                    additionalProperties: false,
-                    required: ["files"],
-                    properties: {
-                      files: {
-                        type: "array",
-                        minItems: 1,
-                        items: {
-                          type: "object",
-                          additionalProperties: false,
-                          required: ["path","content"],
-                          properties: {
-                            path:    { type: "string", minLength: 1 },
-                            content: { type: "string" }
-                          }
-                        }
-                      }
-                    }
-                  },
-                  strict: true
-                }
-              },
-              input: [
-                {
-                  role: "system",
-                  content: [
-                    { "type":"input_text",
-                      "text":"You are Codex. Output ONLY a JSON object with the exact shape {\\\"files\\\":[{\\\"path\\\":string,\\\"content\\\":string},...]}. No prose, no code fences. Write full, runnable code. No placeholders. Never write inside ai/."
-                    }
-                  ]
-                },
-                {
-                  role: "user",
-                  content: [
-                    { "type":"input_text",
-                      "text": ("Implement the SPEC as runnable application code and tests. Return files to write as JSON only.\n\n" + $prompt)
-                    }
-                  ]
-                }
-              ]
-            }
-            | if $max_out > 0 then . + {max_output_tokens: $max_out} else . end' > "$REQUEST_JSON"
+               model: $model,
+               temperature: 0,
+               response_format: {
+                 type: "json_schema",
+                 json_schema: {
+                   name: "emit_files",
+                   strict: true,
+                   schema: {
+                     type: "object",
+                     additionalProperties: false,
+                     required: ["files"],
+                     properties: {
+                       files: {
+                         type: "array",
+                         minItems: 1,
+                         items: {
+                           type: "object",
+                           additionalProperties: false,
+                           required: ["path","content"],
+                           properties: {
+                             path:    { type: "string", minLength: 1 },
+                             content: { type: "string" }
+                           }
+                         }
+                       }
+                     }
+                   }
+                 }
+               },
+               input: [
+                 {
+                   role: "system",
+                   content: "You are Codex. Output ONLY a JSON object with the exact shape {\\\"files\\\":[{\\\"path\\\":string,\\\"content\\\":string},...]}. No prose, no code fences. Write full, runnable code. No placeholders. Never write inside ai/."
+                 },
+                 {
+                   role: "user",
+                   content: ("Implement the SPEC as runnable application code and tests. Return files to write as JSON only.\n\n" + $prompt)
+                 }
+               ]
+             }
+             | if $max_out > 0 then . + {max_output_tokens: $max_out} else . end' > "$REQUEST_JSON"
 
-          # Call API (必ずボディを保存し、HTTP ステータスで分岐)
-          status="$(curl -sS --connect-timeout 30 --max-time "${CURL_TIMEOUT}" \
+          # Call API. Keep body even on errors for debugging.
+          # With --fail-with-body, a 4xx/5xx fails the step but we still have the JSON in $RESPONSE_JSON via tee.
+          curl --fail-with-body -sS --connect-timeout 30 --max-time "${CURL_TIMEOUT}" \
             --retry "${CURL_RETRIES}" --retry-all-errors --retry-delay "${CURL_RETRY_DELAY}" \
             -H "$AUTH_HEADER" \
             -H "Content-Type: application/json" \
-            -w "\n%{http_code}\n" \
             -d @"$REQUEST_JSON" "$ENDPOINT" \
-            | tee "$RESPONSE_JSON" | tail -n1)"
+            | tee "$RESPONSE_JSON" >/dev/null
 
-          # tee が付けた末尾の HTTP コード行を除去
-          head -n -1 "$RESPONSE_JSON" > "${RESPONSE_JSON}.tmp" && mv -f "${RESPONSE_JSON}.tmp" "$RESPONSE_JSON"
-
-          echo "OpenAI HTTP status: ${status}"
-
-          # 200 台以外は error.message を表示して fail
-          if [ "$status" -lt 200 ] || [ "$status" -ge 300 ]; then
-            msg="$(jq -r '.error.message // .message // "Unknown error"' "$RESPONSE_JSON")"
-            echo "::error title=OpenAI API error::${msg}"
-            exit 1
-          fi
-
-          # Responses API のどの形でも拾える抽出パス
+          # Extract model JSON to OUT_JSON (cover all Responses API shapes)
           jq -e -r '
             (.output[]?.content[]? | select(.type=="output_text") | .text)
             // (.output_text)
             // (.response)
           ' "$RESPONSE_JSON" | jq -e '.' > "$OUT_JSON"
 
-      - name: Write emitted files & push branch
+      - name: "Write returned files & commit"
         run: |
           set -euo pipefail
+
+          # Write files
           jq -r '.files[] | @base64' "$OUT_JSON" | while read -r row; do
             _jq(){ echo "$row" | base64 -d | jq -r "$1"; }
             path="$(_jq ".path")"
@@ -183,7 +184,7 @@ jobs:
             git add "$path"
           done
 
-          if ! git diff --cached --name-only | grep -q .; then
+          if ! git diff --cached --name-only | grep -q "."; then
             echo "::error::No files were emitted by the model."
             exit 6
           fi
@@ -191,12 +192,14 @@ jobs:
           git commit -m "codex(init): seed via ${OPENAI_MODEL}"
           git push -u origin "${BRANCH_NAME}"
 
-      - uses: actions/upload-artifact@v4
-        if: always()
+      - name: "Upload AI debug artifacts"
+        uses: "actions/upload-artifact@v4"
+        if: "always()"
         with:
-          name: ai-debug
+          name: "ai-debug"
           path: |
             ai/prompt.md
             ai/request.json
             ai/response.json
             ai/out.files.json
+          if-no-files-found: "warn"
