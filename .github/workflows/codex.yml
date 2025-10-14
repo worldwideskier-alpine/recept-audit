@@ -1,42 +1,40 @@
-name: "Codex"
+name: "codex"
 
 on:
   workflow_dispatch:
-
-permissions:
-  contents: write
-  pull-requests: write
-
-env:
-  OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-  OPENAI_MODEL: gpt-5-codex
-  ENDPOINT: https://api.openai.com/v1/responses
-  SPEC_ROOT: spec
-  SPEC_DIRS: env foundation features tests
-  PROMPT_FILE: ai/prompt.md
-  REQUEST_JSON: ai/request.json
-  RESPONSE_JSON: ai/response.json
-  OUT_JSON: ai/out.files.json
-  CURL_TIMEOUT: 300
-  CURL_RETRIES: 5
-  CURL_RETRY_DELAY: 5
-  TITLE: Codex generation prompt
+  push:
+    paths:
+      - "spec/**"
+      - ".github/workflows/codex.yml"
 
 jobs:
   generate:
-    runs-on: ubuntu-latest
+    runs-on: "ubuntu-24.04"
+    env:
+      OPENAI_API_KEY: "${{ secrets.OPENAI_API_KEY }}"
+      OPENAI_MODEL: "gpt-5-codex"
+      ENDPOINT: "https://api.openai.com/v1/responses"
+      SPEC_ROOT: "spec"
+      SPEC_DIRS: "env foundation features tests"
+      PROMPT_FILE: "ai/prompt.md"
+      REQUEST_JSON: "ai/request.json"
+      RESPONSE_JSON: "ai/response.json"
+      OUT_JSON: "ai/out.files.json"
+      CURL_TIMEOUT: "300"
+      CURL_RETRIES: "5"
+      CURL_RETRY_DELAY: "5"
+      TITLE: "Codex generation prompt"
     steps:
-      - uses: actions/checkout@v4
+      - uses: "actions/checkout@v4"
 
-      - name: Install tools
-        shell: bash
+      - name: "Install jq and coreutils"
         run: |
           set -euo pipefail
           sudo apt-get update -y
           sudo apt-get install -y jq coreutils
 
-      - name: Build prompt from SPEC
-        shell: bash
+      - name: "Build prompt"
+        shell: "bash"
         run: |
           set -euo pipefail
           mkdir -p "ai"
@@ -52,7 +50,6 @@ jobs:
             printf -- "- NEVER write under the \"ai/\" directory.\n\n"
             printf "## SPEC CONTENT\n"
           } >> "$PROMPT_FILE"
-
           tmp_list="$(mktemp)"
           for d in $SPEC_DIRS; do
             [ -d "${SPEC_ROOT}/${d}" ] || continue
@@ -60,15 +57,13 @@ jobs:
               \( -name "*.md" -o -name "*.txt" -o -name "*.yaml" -o -name "*.yml" -o -name "*.json" \) >> "$tmp_list"
           done
           LC_ALL=C sort -o "$tmp_list" "$tmp_list" || true
-
           while IFS= read -r f; do
             printf "\n### %s\n\n" "$f" >> "$PROMPT_FILE"
             sed -e 's/\r$//' "$f" | head -n 4000 >> "$PROMPT_FILE"
           done < "$tmp_list"
           rm -f "$tmp_list"
 
-      - name: Create working branch
-        shell: bash
+      - name: "Create branch"
         run: |
           set -euo pipefail
           BRANCH_NAME="codex/autogen-${GITHUB_RUN_ID}"
@@ -77,11 +72,9 @@ jobs:
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git checkout -b "${BRANCH_NAME}"
 
-      - name: Call OpenAI Responses API (typed content + strict JSON schema)
-        shell: bash
+      - name: "Call Responses API"
         run: |
           set -euo pipefail
-
           jq -n \
             --arg model "$OPENAI_MODEL" \
             --rawfile prompt "$PROMPT_FILE" \
@@ -121,7 +114,7 @@ jobs:
                    role: "system",
                    content: [
                      {
-                       type: "input_text",
+                       type: "text",
                        text: "You are Codex. Output ONLY a JSON object with the exact shape {\\\"files\\\":[{\\\"path\\\":string,\\\"content\\\":string},...]}. No prose, no code fences. Write full, runnable code. No placeholders. Never write inside ai/."
                      }
                    ]
@@ -130,7 +123,7 @@ jobs:
                    role: "user",
                    content: [
                      {
-                       type: "input_text",
+                       type: "text",
                        text: ("Implement the SPEC as runnable application code and tests. Return files to write as JSON only.\n\n" + $prompt)
                      }
                    ]
@@ -152,6 +145,9 @@ jobs:
             // (.response)
           ' "$RESPONSE_JSON" | jq -e '.' > "$OUT_JSON"
 
+      - name: "Write files"
+        run: |
+          set -euo pipefail
           jq -r '.files[] | @base64' "$OUT_JSON" | while read -r row; do
             _jq(){ echo "$row" | base64 -d | jq -r "$1"; }
             path="$(_jq ".path")"
@@ -163,17 +159,13 @@ jobs:
             printf "%s" "$content" > "$path"
             git add "$path"
           done
-
           if ! git diff --cached --name-only | grep -q "."; then
             echo "::error::No files were emitted by the model."
             exit 6
           fi
 
+      - name: "Commit and push"
+        run: |
+          set -euo pipefail
           git commit -m "codex(init): seed via ${OPENAI_MODEL}"
           git push -u origin "${BRANCH_NAME}"
-
-      - name: Upload response.json
-        uses: actions/upload-artifact@v4
-        with:
-          name: response-json
-          path: ai/response.json
