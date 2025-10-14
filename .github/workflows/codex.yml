@@ -126,7 +126,7 @@ jobs:
                 role: "system",
                 content: [
                   {
-                    type: "text",
+                    type: "input_text",
                     text: "You are Codex. Output ONLY a JSON object with the exact shape {\\\"files\\\":[{\\\"path\\\":string,\\\"content\\\":string},...]}. No prose, no code fences. Write full, runnable code. No placeholders. Never write inside ai/."
                   }
                 ]
@@ -135,7 +135,7 @@ jobs:
                 role: "user",
                 content: [
                   {
-                    type: "text",
+                    type: "input_text",
                     text: ("Implement the SPEC as runnable application code and tests. Return files to write as JSON only.\n\n" + $prompt)
                   }
                 ]
