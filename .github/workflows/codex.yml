@@ -5,6 +5,7 @@ on:
 
 permissions:
   contents: "read"
+  metadata: "read"
 
 concurrency:
   group: "codex"
@@ -14,47 +15,45 @@ jobs:
   generate:
     name: "generate"
     runs-on: "ubuntu-24.04"
-    timeout-minutes: 30
+
     env:
-      OPENAI_API_KEY: "${{ secrets.OPENAI_API_KEY }}"
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
       OPENAI_MODEL: "gpt-5-codex"
       ENDPOINT: "https://api.openai.com/v1/responses"
+
       SPEC_ROOT: "spec"
       SPEC_DIRS: "env foundation features tests"
+
       PROMPT_FILE: "ai/prompt.md"
       REQUEST_JSON: "ai/request.json"
       RESPONSE_JSON: "ai/response.json"
       OUT_JSON: "ai/out.files.json"
       STAGING_DIR: "codex_out"
+
       CURL_TIMEOUT: 300
       CURL_RETRIES: 5
       CURL_RETRY_DELAY: 5
+
       TITLE: "Codex generation prompt"
 
-    steps:
-      - name: "Checkout"
-        uses: "actions/checkout@v4"
-        with:
-          repository: "${{ github.repository }}"
-          token: "${{ secrets.GITHUB_TOKEN }}"
-          ssh-strict: true
-          ssh-user: "git"
-          persist-credentials: true
-          clean: true
-          sparse-checkout-cone-mode: true
-          fetch-depth: 1
-          fetch-tags: false
-          show-progress: true
-          lfs: false
-          submodules: false
-          set-safe-directory: true
+      # 恒久対策・切り分け用
+      MAX_PROMPT_BYTES: 2000000   # 2 MB 上限（数値はダブルコーテーションなし）
+      HEAD_LINES: 400             # 各ファイルの先頭を採用
+      TAIL_LINES: 150             # 末尾も少量保持
 
-      - name: "Install jq and coreutils"
+    steps:
+      - name: "checkout"
+        uses: "actions/checkout@v4"
+
+      - name: "Install jq & coreutils"
+        shell: bash
         run: |
+          set -euo pipefail
           sudo apt-get update -y
           sudo apt-get install -y jq coreutils
 
-      - name: "Build prompt"
+      - name: "Build prompt (trim & log size)"
+        shell: bash
         run: |
           set -euo pipefail
           mkdir -p "ai"
@@ -78,15 +77,44 @@ jobs:
               \( -name "*.md" -o -name "*.txt" -o -name "*.yaml" -o -name "*.yml" -o -name "*.json" \) >> "$tmp_list"
           done
           LC_ALL=C sort -o "$tmp_list" "$tmp_list" || true
+
           while IFS= read -r f; do
             printf "\n### %s\n\n" "$f" >> "$PROMPT_FILE"
-            sed -e 's/\r$//' "$f" | head -n 4000 >> "$PROMPT_FILE"
+            line_count=$(wc -l < "$f" || echo 0)
+            if [ "$line_count" -gt "$HEAD_LINES" ]; then
+              sed -e 's/\r$//' "$f" | head -n "$HEAD_LINES" >> "$PROMPT_FILE"
+              mid_snip=$(( line_count - HEAD_LINES - TAIL_LINES ))
+              if [ "$mid_snip" -gt 0 ]; then
+                printf "\n... [snip %s lines] ...\n" "$mid_snip" >> "$PROMPT_FILE"
+              fi
+              if [ "$TAIL_LINES" -gt 0 ]; then
+                sed -e 's/\r$//' "$f" | tail -n "$TAIL_LINES" >> "$PROMPT_FILE"
+              fi
+            else
+              sed -e 's/\r$//' "$f" >> "$PROMPT_FILE"
+            fi
           done < "$tmp_list"
           rm -f "$tmp_list"
 
-      - name: "Prepare request.json"
+          # === 切り分けログ（サイズ出力） ===
+          bytes=$(wc -c < "$PROMPT_FILE" || echo 0)
+          echo "PROMPT_FILE bytes: $bytes"
+          du -h "$PROMPT_FILE" || true
+
+          # === 上限超過時の最終トリム（確実に 400 を回避） ===
+          if [ "$bytes" -gt "$MAX_PROMPT_BYTES" ]; then
+            echo "::warning::Prompt too large ($bytes bytes) > MAX_PROMPT_BYTES=$MAX_PROMPT_BYTES. Truncating to byte limit."
+            head -c "$MAX_PROMPT_BYTES" "$PROMPT_FILE" > "${PROMPT_FILE}.trim"
+            mv "${PROMPT_FILE}.trim" "$PROMPT_FILE"
+            bytes=$(wc -c < "$PROMPT_FILE" || echo 0)
+            echo "PROMPT_FILE bytes (after truncate): $bytes"
+          fi
+
+      - name: "Build request.json"
+        shell: bash
         run: |
           set -euo pipefail
+          mkdir -p "$(dirname "$REQUEST_JSON")"
           jq -n \
             --arg model "$OPENAI_MODEL" \
             --rawfile prompt "$PROMPT_FILE" \
@@ -144,32 +172,56 @@ jobs:
              }
              | if $max_out > 0 then . + {max_output_tokens: $max_out} else . end' > "$REQUEST_JSON"
 
-      - name: "Call Responses API"
+          # 切り分けログ
+          echo "REQUEST_JSON bytes: $(wc -c < "$REQUEST_JSON")"
+          du -h "$REQUEST_JSON" || true
+          jq -e '.' "$REQUEST_JSON" >/dev/null
+
+      - name: "Call OpenAI Responses API (log status & body)"
+        shell: bash
         run: |
           set -euo pipefail
-          curl --fail-with-body -sS --connect-timeout 30 --max-time "$CURL_TIMEOUT" \
+          mkdir -p "$(dirname "$RESPONSE_JSON")"
+          http_code=$(curl -sS -o "$RESPONSE_JSON" -w "%{http_code}" \
+            --connect-timeout 30 --max-time "$CURL_TIMEOUT" \
             --retry "$CURL_RETRIES" --retry-all-errors --retry-delay "$CURL_RETRY_DELAY" \
             -H "Authorization: Bearer ${OPENAI_API_KEY}" \
             -H "Content-Type: application/json" \
-            -d @"$REQUEST_JSON" "$ENDPOINT" \
-            | tee "$RESPONSE_JSON" >/dev/null
+            -d @"$REQUEST_JSON" "$ENDPOINT")
+          echo "HTTP $http_code"
 
-      - name: "Extract files"
+          if jq -e '.' "$RESPONSE_JSON" >/dev/null 2>&1; then
+            echo "Response JSON (truncated preview):"
+            jq '. | del(.usage)' "$RESPONSE_JSON" | head -n 200
+          else
+            echo "Non-JSON response (first 200 lines):"
+            head -n 200 "$RESPONSE_JSON" || true
+          fi
+
+          case "$http_code" in
+            2*) : ;;  # success
+            *) echo "::error::API returned HTTP $http_code"; exit 22 ;;
+          esac
+
+      - name: "Extract files JSON"
+        shell: bash
         run: |
           set -euo pipefail
-          mkdir -p "$STAGING_DIR"
           jq -e -r '
             (.output[]?.content[]? | select(.type=="output_text") | .text)
             // (.output_text)
             // (.response)
           ' "$RESPONSE_JSON" | jq -e '.' > "$OUT_JSON"
+          echo "OUT_JSON bytes: $(wc -c < "$OUT_JSON")"
+          jq -r '.files[] | @base64' "$OUT_JSON" | head -n 3 || true
 
-          count="$(jq '.files | length' "$OUT_JSON")"
-          if [ "$count" -lt 1 ]; then
-            echo "::error::No files were emitted by the model."
-            exit 6
-          fi
-
+      - name: "Write files to staging dir (no git push)"
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf "$STAGING_DIR"
+          mkdir -p "$STAGING_DIR"
+          echo "Writing files under $STAGING_DIR"
           jq -r '.files[] | @base64' "$OUT_JSON" | while read -r row; do
             _jq(){ echo "$row" | base64 -d | jq -r "$1"; }
             path="$(_jq ".path")"
@@ -177,12 +229,28 @@ jobs:
             case "$path" in
               ai/*) echo "::warning::skip ai/: ${path}"; continue ;;
             esac
-            mkdir -p "$STAGING_DIR/$(dirname "$path")"
-            printf "%s" "$content" > "$STAGING_DIR/$path"
+            abs="$STAGING_DIR/$path"
+            mkdir -p "$(dirname "$abs")"
+            printf "%s" "$content" > "$abs"
+            echo "wrote: $abs"
           done
 
-      - name: "Upload generated files"
+      - name: "List staged output"
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -d "$STAGING_DIR" ]; then
+            echo "Staged files:"
+            find "$STAGING_DIR" -type f -maxdepth 10 | LC_ALL=C sort
+          else
+            echo "::error::No staged directory found."
+            exit 6
+          fi
+
+      - name: "Upload artifact"
         uses: "actions/upload-artifact@v4"
         with:
           name: "codex_out"
-          path: "${{ env.STAGING_DIR }}"
+          path: "codex_out"
+          if-no-files-found: "error"
+          retention-days: 7
