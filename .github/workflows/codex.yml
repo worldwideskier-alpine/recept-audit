@@ -2,15 +2,18 @@ name: "Codex"
 
 on:
   workflow_dispatch:
-  push:
-    paths:
-      - "spec/**"
-      - ".github/workflows/codex.yml"
+
+permissions:
+  contents: "write"
+  pull-requests: "write"
 
 jobs:
   generate:
+    name: "generate"
     runs-on: "ubuntu-24.04"
+
     env:
+      OPENAI_API_KEY: "${{ secrets.OPENAI_API_KEY }}"
       OPENAI_MODEL: "gpt-5-codex"
       ENDPOINT: "https://api.openai.com/v1/responses"
       SPEC_ROOT: "spec"
@@ -19,24 +22,28 @@ jobs:
       REQUEST_JSON: "ai/request.json"
       RESPONSE_JSON: "ai/response.json"
       OUT_JSON: "ai/out.files.json"
-      MAX_TOKENS: "0"              # 0 のままなら max_output_tokens は送信しません
+      MAX_TOKENS: "12288"
       CURL_TIMEOUT: "300"
       CURL_RETRIES: "5"
       CURL_RETRY_DELAY: "5"
+      TITLE: "Codex generation prompt"
 
     steps:
       - name: "Checkout"
         uses: "actions/checkout@v4"
+        with:
+          fetch-depth: 1
+          lfs: false
+          submodules: false
 
-      - name: "Install jq"
+      - name: "Install jq and coreutils"
         run: |
           set -euo pipefail
           sudo apt-get update -y
           sudo apt-get install -y jq coreutils
 
-      - name: "Build prompt"
-        env:
-          TITLE: "Codex generation prompt"
+      - name: "Build prompt from SPEC"
+        shell: bash
         run: |
           set -euo pipefail
           mkdir -p "ai"
@@ -48,6 +55,7 @@ jobs:
             printf -- "- Return ONLY JSON (no prose) that matches {\"files\":[{\"path\":string,\"content\":string},...]}.\n"
             printf -- "- Implement runnable APPLICATION CODE and TESTS.\n"
             printf -- "- Emit at least one code file under \"/src\" or \"/app\".\n"
+            printf -- "- You may also emit build files: \"package.json\", \"tsconfig.json\", \"pyproject.toml\", \"requirements.txt\", \"composer.json\", \"go.mod\".\n"
             printf -- "- Do NOT create policy/compliance/README/meta docs.\n"
             printf -- "- NEVER write under the \"ai/\" directory.\n\n"
             printf "## SPEC CONTENT\n"
@@ -60,19 +68,31 @@ jobs:
               \( -name "*.md" -o -name "*.txt" -o -name "*.yaml" -o -name "*.yml" -o -name "*.json" \) >> "$tmp_list"
           done
           LC_ALL=C sort -o "$tmp_list" "$tmp_list" || true
+
           while IFS= read -r f; do
             printf "\n### %s\n\n" "$f" >> "$PROMPT_FILE"
             sed -e 's/\r$//' "$f" | head -n 4000 >> "$PROMPT_FILE"
           done < "$tmp_list"
           rm -f "$tmp_list"
 
-      - name: "Call OpenAI (Responses API, typed content + strict JSON schema)"
+      - name: "Create work branch"
+        shell: bash
+        run: |
+          set -euo pipefail
+          BRANCH_NAME="codex/autogen-${GITHUB_RUN_ID}"
+          echo "BRANCH_NAME=${BRANCH_NAME}" >> "$GITHUB_ENV"
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git checkout -b "${BRANCH_NAME}"
+
+      - name: "Call OpenAI Responses API (typed content + strict JSON schema)"
+        shell: bash
         env:
-          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          BRANCH_NAME: "${{ env.BRANCH_NAME }}"
         run: |
           set -euo pipefail
 
-          # Build request body (typed content array) with strict JSON schema
+          # Build request body for Responses API with typed parts + strict schema
           jq -n \
             --arg model "$OPENAI_MODEL" \
             --rawfile prompt "$PROMPT_FILE" \
@@ -98,8 +118,8 @@ jobs:
                            additionalProperties: false,
                            required: ["path","content"],
                            properties: {
-                             path:    { "type": "string", "minLength": 1 },
-                             content: { "type": "string" }
+                             path:    { type: "string", minLength: 1 },
+                             content: { type: "string" }
                            }
                          }
                        }
@@ -130,23 +150,26 @@ jobs:
              }
              | if $max_out > 0 then . + {max_output_tokens: $max_out} else . end' > "$REQUEST_JSON"
 
-          # Call API (keep body even on errors)
-          curl --fail-with-body -sS \
-            --connect-timeout 30 --max-time "${CURL_TIMEOUT}" \
+          # Call API (keep body even on errors for debugging)
+          curl --fail-with-body -sS --connect-timeout 30 --max-time "${CURL_TIMEOUT}" \
             --retry "${CURL_RETRIES}" --retry-all-errors --retry-delay "${CURL_RETRY_DELAY}" \
             -H "Authorization: Bearer ${OPENAI_API_KEY}" \
             -H "Content-Type: application/json" \
             -d @"$REQUEST_JSON" "$ENDPOINT" \
             | tee "$RESPONSE_JSON" >/dev/null
 
-          # Extract model JSON -> OUT_JSON (cover all Responses API shapes)
+          # Extract model JSON to OUT_JSON (covering all Responses API shapes)
           jq -e -r '
             (.output[]?.content[]? | select(.type=="output_text") | .text)
             // (.output_text)
             // (.response)
           ' "$RESPONSE_JSON" | jq -e '.' > "$OUT_JSON"
 
-          # Write emitted files
+      - name: "Write files, commit, and push branch"
+        shell: bash
+        run: |
+          set -euo pipefail
+
           jq -r '.files[] | @base64' "$OUT_JSON" | while read -r row; do
             _jq(){ echo "$row" | base64 -d | jq -r "$1"; }
             path="$(_jq ".path")"
@@ -166,13 +189,6 @@ jobs:
             exit 6
           fi
 
-      - name: "Commit & push"
-        run: |
-          set -euo pipefail
-          BRANCH_NAME="codex/autogen-${GITHUB_RUN_ID}"
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git checkout -b "${BRANCH_NAME}"
           git commit -m "codex(init): seed via ${OPENAI_MODEL}"
           git push -u origin "${BRANCH_NAME}"
 
@@ -186,3 +202,5 @@ jobs:
             ai/response.json
             ai/out.files.json
           if-no-files-found: "warn"
+          overwrite: false
+          include-hidden-files: false
