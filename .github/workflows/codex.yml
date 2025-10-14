@@ -4,7 +4,7 @@ on:
   workflow_dispatch: {}
 
 permissions:
-  contents: "read"
+  contents: read
 
 concurrency:
   group: "codex"
@@ -13,41 +13,47 @@ concurrency:
 jobs:
   generate:
     name: "generate"
-    runs-on: "ubuntu-24.04"
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
 
     env:
       OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
       OPENAI_MODEL: "gpt-5-codex"
       ENDPOINT: "https://api.openai.com/v1/responses"
+
       SPEC_ROOT: "spec"
       SPEC_DIRS: "env foundation features tests"
+
       PROMPT_FILE: "ai/prompt.md"
       REQUEST_JSON: "ai/request.json"
       RESPONSE_JSON: "ai/response.json"
       OUT_JSON: "ai/out.files.json"
       STAGING_DIR: "codex_out"
+
       CURL_TIMEOUT: 300
       CURL_RETRIES: 5
       CURL_RETRY_DELAY: 5
+
       TITLE: "Codex generation prompt"
 
     steps:
       - name: "checkout"
-        uses: "actions/checkout@v4"
+        uses: actions/checkout@v4
         with:
           fetch-depth: 1
           persist-credentials: false
           lfs: false
           submodules: false
+          sparse-checkout-cone-mode: true
+          set-safe-directory: true
 
-      - name: "Install tools"
+      - name: "install jq/coreutils"
         run: |
           set -euo pipefail
           sudo apt-get update -y
           sudo apt-get install -y jq coreutils
 
-      - name: "Assemble prompt"
+      - name: "assemble prompt.md from spec"
         run: |
           set -euo pipefail
           mkdir -p "ai"
@@ -78,70 +84,76 @@ jobs:
           done < "$tmp_list"
           rm -f "$tmp_list"
 
-      - name: "Build request.json"
+      - name: "build ai/request.json (Responses API: text.format=json_schema)"
         run: |
           set -euo pipefail
           jq -n \
             --arg model "$OPENAI_MODEL" \
             --rawfile prompt "$PROMPT_FILE" \
-            --argjson max_out "${MAX_TOKENS:-0}" \
-            '{
-               model: $model,
-               temperature: 0,
-               response_format: {
-                 type: "json_schema",
-                 json_schema: {
-                   name: "emit_files",
-                   strict: true,
-                   schema: {
-                     type: "object",
-                     additionalProperties: false,
-                     required: ["files"],
-                     properties: {
-                       files: {
-                         type: "array",
-                         minItems: 1,
-                         items: {
-                           type: "object",
-                           additionalProperties: false,
-                           required: ["path","content"],
-                           properties: {
-                             path:    { type: "string", minLength: 1 },
-                             content: { type: "string" }
-                           }
-                         }
-                       }
-                     }
-                   }
-                 }
-               },
-               input: [
-                 {
-                   role: "system",
-                   content: [
-                     { type: "text", text: "You are Codex. Output ONLY a JSON object with the exact shape {\\\"files\\\":[{\\\"path\\\":string,\\\"content\\\":string},...]}. No prose, no code fences. Write full, runnable code. No placeholders. Never write inside ai/." }
-                   ]
-                 },
-                 {
-                   role: "user",
-                   content: [
-                     { type: "text", text: ("Implement the SPEC as runnable application code and tests. Return files to write as JSON only.\n\n" + $prompt) }
-                   ]
-                 }
-               ]
-             }
-             | if $max_out > 0 then . + {max_output_tokens: $max_out} else . end' > "$REQUEST_JSON"
+            --argjson max_out "${MAX_TOKENS:-0}" '
+          {
+            model: $model,
+            temperature: 0,
+            text: {
+              format: "json_schema",
+              json_schema: {
+                name: "emit_files",
+                strict: true,
+                schema: {
+                  type: "object",
+                  additionalProperties: false,
+                  required: ["files"],
+                  properties: {
+                    files: {
+                      type: "array",
+                      minItems: 1,
+                      items: {
+                        type: "object",
+                        additionalProperties: false,
+                        required: ["path","content"],
+                        properties: {
+                          path:    { type: "string", minLength: 1 },
+                          content: { type: "string" }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            },
+            input: [
+              {
+                role: "system",
+                content: [
+                  {
+                    type: "text",
+                    text: "You are Codex. Output ONLY a JSON object with the exact shape {\\\"files\\\":[{\\\"path\\\":string,\\\"content\\\":string},...]}. No prose, no code fences. Write full, runnable code. No placeholders. Never write inside ai/."
+                  }
+                ]
+              },
+              {
+                role: "user",
+                content: [
+                  {
+                    type: "text",
+                    text: ("Implement the SPEC as runnable application code and tests. Return files to write as JSON only.\n\n" + $prompt)
+                  }
+                ]
+              }
+            ]
+          }
+          | if $max_out > 0 then . + {max_output_tokens: $max_out} else . end
+          ' > "$REQUEST_JSON"
 
           echo "::group::diagnostics: request.json (first 120 lines)"
           head -n 120 "$REQUEST_JSON" || true
           echo "::endgroup::"
 
-      - name: "Call Responses API"
-        id: "call_api"
+      - name: "call OpenAI Responses API"
         run: |
           set -euo pipefail
           echo "::group::curl command line"
-          echo "curl --fail-with-body -sS --connect-timeout 30 --max-time ${CURL_TIMEOUT} --retry ${CURL_RETRIES} --retry-all-errors --retry-delay ${CURL_RETRY_DELAY} -H 'Authorization: Bearer ***' -H 'Content-Type: application/json' -d @\"$REQUEST_JSON\" \"$ENDPOINT\""
+          echo "curl --fail-with-body -sS --connect-timeout 30 --max-time ${CURL_TIMEOUT} --retry ${CURL_RETRIES} --retry-all-errors --retry-delay ${CURL_RETRY_DELAY} -H 'Authorization: ***' -H 'Content-Type: application/json' -d @\"$REQUEST_JSON\" \"$ENDPOINT\""
           echo "::endgroup::"
 
           http_code="$(
@@ -170,39 +182,54 @@ jobs:
           head -n 80 "$RESPONSE_JSON" || true
           echo "::endgroup::"
 
-      - name: "Extract files from response"
-        run: |
-          set -euo pipefail
-          jq -e -r '
-            (.output[]?.content[]? | select(.type=="text") | .text)
-            // (.output[]?.content[]? | select(.type=="output_text") | .text)
-            // (.output_text)
-            // (.response)
-          ' "$RESPONSE_JSON" | jq -e '.' > "$OUT_JSON"
-
-          echo "::group::out.files.json (first 80 lines)"
-          head -n 80 "$OUT_JSON" || true
-          echo "::endgroup::"
-
-      - name: "Materialize files to staging"
+      - name: "extract model JSON and write files"
         run: |
           set -euo pipefail
           mkdir -p "$STAGING_DIR"
-          jq -r '.files[] | @base64' "$OUT_JSON" | while read -r row; do
-            _jq(){ echo "$row" | base64 -d | jq -r "$1"; }
-            path="$(_jq ".path")"
-            content="$(_jq ".content")"
+
+          # 1) 取り出し：output_text（新APIの便宜プロパティ）優先、なければ content[].text を走査
+          jq -e -r '
+            .output_text
+            // ( [ .output[]? .content[]? | select(.type=="output_text") | .text ] | .[0] )
+            // ( [ .output[]? .content[]? | select(.type=="text")        | .text ] | .[0] )
+          ' "$RESPONSE_JSON" > ai/out.raw.txt
+
+          # 2) JSONバリデーション
+          jq -e . ai/out.raw.txt > "$OUT_JSON"
+
+          # 3) スキーマ簡易検証
+          jq -e '
+            type=="object" and has("files") and (.files|type=="array") and (.files|length>0)
+          ' "$OUT_JSON" >/dev/null
+
+          # 4) 展開（ai/ 直下への書き込みは禁止）
+          i=0
+          jq -c '.files[]' "$OUT_JSON" | while read -r row; do
+            path=$(printf '%s' "$row" | jq -r '.path')
+            content=$(printf '%s' "$row" | jq -r '.content')
+
             case "$path" in
-              ai/*) echo "::warning::skip ai/: ${path}"; continue ;;
+              ai/*|./ai/*)
+                echo "::warning title=skipped forbidden path::$path"
+                continue
+                ;;
             esac
-            mkdir -p "$(dirname "${STAGING_DIR}/${path}")"
-            printf "%s" "$content" > "${STAGING_DIR}/${path}"
+
+            mkdir -p "$(dirname "$path")" "$(dirname "$STAGING_DIR/$path")"
+            printf '%s' "$content" > "$path"
+            printf '%s' "$content" > "$STAGING_DIR/$path"
+            echo "wrote $path"
+            i=$((i+1))
           done
 
-      - name: "Upload generated files (artifact)"
-        uses: "actions/upload-artifact@v4"
+          if [ "$i" -eq 0 ]; then
+            echo "::error title=no files emitted::Model returned zero writable files"
+            exit 1
+          fi
+
+      - name: "upload artifact (codex_out)"
+        uses: actions/upload-artifact@v4
         with:
           name: "codex_out"
-          path: "codex_out"
-          if-no-files-found: "warn"
-          retention-days: 7
+          path: "${{ env.STAGING_DIR }}"
+          if-no-files-found: "error"
