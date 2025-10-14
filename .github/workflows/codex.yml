@@ -29,7 +29,7 @@ jobs:
       OUT_JSON: "ai/out.files.json"
       STAGING_DIR: "codex_out"
 
-      CURL_TIMEOUT: 300
+      CURL_TIMEOUT: 1800
       CURL_RETRIES: 5
       CURL_RETRY_DELAY: 5
 
