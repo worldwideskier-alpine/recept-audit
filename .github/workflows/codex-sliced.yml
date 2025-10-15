@@ -43,9 +43,6 @@ jobs:
       CURL_RETRIES: 5
       CURL_RETRY_DELAY: 5
 
-      # keep output reasonable for each slice
-      MAX_TOKENS: "8192"
-
       TITLE: "Codex generation prompt"
 
     steps:
@@ -225,6 +222,17 @@ jobs:
           echo "::group::response.json (first 80 lines)"
           head -n 80 "$RESPONSE_JSON" || true
           echo "::endgroup::"
+
+          # === 応答の完了チェック（不完全なら即失敗）===
+          STATUS="$(jq -r '.status // empty' "$RESPONSE_JSON")"
+          if [ "${STATUS}" != "completed" ]; then
+            REASON="$(jq -r '.incomplete_details.reason // "unknown"' "$RESPONSE_JSON")"
+            echo "::error title=OpenAI response incomplete::status=${STATUS}, reason=${REASON}"
+            echo "::group::response.json (first 200 lines)"
+            head -n 200 "$RESPONSE_JSON" || true
+            echo "::endgroup::"
+            exit 22
+          fi
 
       - name: "extract model JSON and write files"
         run: |
