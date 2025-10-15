@@ -1,6 +1,11 @@
 name: "Codex (sliced)"
 on:
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      tasks_glob:
+        description: "Task file patterns (space-separated pathspecs, e.g. 'spec/tasks/*.yml spec/custom/**/*.yml')"
+        required: false
+        default: "spec/tasks/*.yml"
 
 permissions:
   contents: read
@@ -10,23 +15,50 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # 追加: タスクリストを自動収集して matrix を生成
+  discover:
+    name: "discover tasks"
+    runs-on: ubuntu-24.04
+    outputs:
+      matrix: ${{ steps.build.outputs.matrix }}
+    steps:
+      - name: "checkout"
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+          lfs: false
+          submodules: false
+          sparse-checkout-cone-mode: true
+          set-safe-directory: true
+
+      - name: "build dynamic matrix from tasks_glob"
+        id: build
+        shell: bash
+        run: |
+          set -euo pipefail
+          PATTERNS="${{ github.event.inputs.tasks_glob }}"
+          # Git の pathspec(** 含む)でマッチ。存在しなくてもエラーにしないために || true
+          git ls-files -z -- $PATTERNS > files.z || true
+          if [ ! -s files.z ]; then
+            echo "::error::No task files matched pattern(s): $PATTERNS"
+            exit 1
+          fi
+          tr '\0' '\n' < files.z | sed '/^$/d' | sort -u > files.txt
+          echo "Resolved tasks:"
+          cat files.txt
+          MATRIX_JSON="$(jq -Rs '{task: (split("\n") | map(select(length>0)))}' < files.txt)"
+          echo "matrix=${MATRIX_JSON}" >> "$GITHUB_OUTPUT"
+
   codex:
     name: "codex (sliced)"
     runs-on: ubuntu-24.04
+    needs: discover
 
     strategy:
       fail-fast: false
       max-parallel: 2
-      matrix:
-        task:
-          - "spec/tasks/00_boot.yml"
-          - "spec/tasks/11_endpoints_env.yml"
-          - "spec/tasks/12_endpoints_redirects.yml"
-          - "spec/tasks/10_health.yml"
-          - "spec/tasks/20_provider_setup.yml"
-          - "spec/tasks/30_imports_cli.yml"
-          - "spec/tasks/40_provider_db.yml"
-          - "spec/tasks/50_ui_rbac.yml"
+      matrix: ${{ fromJSON(needs.discover.outputs.matrix) }}
 
     env:
       OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
@@ -74,6 +106,16 @@ jobs:
           set -euo pipefail
           TASK_FILE="${{ matrix.task }}"
           echo "task_file=${TASK_FILE}" >> "$GITHUB_OUTPUT"
+
+      # スロットごとに固有名でアップロード（replace関数は使わずシェルで安全名化）
+      - name: "compute artifact name (per slot)"
+        id: art
+        run: |
+          set -euo pipefail
+          task="${{ steps.task.outputs.task_file }}"
+          safe="${task//\//_}"
+          safe="${safe//./_}"
+          echo "name=codex_out_${safe}" >> "$GITHUB_OUTPUT"
 
       - name: "assemble prompt.md (includes only)"
         run: |
@@ -259,6 +301,6 @@ jobs:
       - name: "upload artifact (codex_out)"
         uses: actions/upload-artifact@v4
         with:
-          name: "codex_out_${{ replace(replace(matrix.task, '/', '_'), '.', '_') }}"
+          name: "${{ steps.art.outputs.name }}"
           path: "${{ env.STAGING_DIR }}"
           if-no-files-found: "error"
