@@ -1,5 +1,4 @@
-name: "codex (sliced)"
-
+name: "Codex (sliced)"
 on:
   workflow_dispatch: {}
 
@@ -11,40 +10,41 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  generate:
-    name: "generate (sliced)"
+  codex:
+    name: "codex (sliced)"
     runs-on: ubuntu-24.04
-
     strategy:
       fail-fast: false
+      max-parallel: 2
       matrix:
         task:
-          - "spec/tasks/01.endpoints.json"
-          - "spec/tasks/02.provider-setup.json"
-          - "spec/tasks/03.provider-db.json"
-          - "spec/tasks/04.cli.json"
-          - "spec/tasks/05.logs.json"
+          - "spec/tasks/00_boot.yml"
+          - "spec/tasks/11_endpoints_env.yml"
+          - "spec/tasks/12_endpoints_redirects.yml"
+          - "spec/tasks/10_health.yml"
+          - "spec/tasks/20_provider_setup.yml"
+          - "spec/tasks/30_imports_cli.yml"
+          - "spec/tasks/40_provider_db.yml"
+          - "spec/tasks/50_ui_rbac.yml"
 
     env:
       OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
       OPENAI_MODEL: "gpt-5-codex"
+      OPENAI_BASE_URL: ${{ secrets.OPENAI_BASE_URL }}
       ENDPOINT: "https://api.openai.com/v1/responses"
 
       SPEC_ROOT: "spec"
-      SPEC_DIRS: "env foundation features tests"
-
       PROMPT_FILE: "ai/prompt.md"
       REQUEST_JSON: "ai/request.json"
       RESPONSE_JSON: "ai/response.json"
       OUT_JSON: "ai/out.files.json"
       STAGING_DIR: "codex_out"
 
-      # (1) 時間短縮＆再試行回数の抑制
       CURL_TIMEOUT: 900
       CURL_RETRIES: 2
-      CURL_RETRY_DELAY: 5
-
+      CURL_RETRY_DELAY: 15
       TITLE: "Codex generation prompt"
+      MAX_TOKENS: "8192"
 
     steps:
       - name: "checkout"
@@ -70,70 +70,51 @@ jobs:
           TASK_FILE="${{ matrix.task }}"
           echo "task_file=${TASK_FILE}" >> "$GITHUB_OUTPUT"
 
-      - name: "assemble prompt.md from task includes (no heredoc)"
+      - name: "assemble prompt.md (includes only)"
         run: |
           set -euo pipefail
           mkdir -p "ai"
           : > "$PROMPT_FILE"
-
-          # タスクファイル（JSON）
           TASK_FILE="${{ steps.task.outputs.task_file }}"
 
-          # タイトル（タスクに title があれば上書き）
           TITLE_VAL="$TITLE"
           if [ -f "$TASK_FILE" ]; then
-            T="$(jq -r 'select(.title != null) | .title' "$TASK_FILE" 2>/dev/null || true)"
-            if [ -n "${T:-}" ] && [ "$T" != "null" ]; then
-              TITLE_VAL="$T"
-            fi
+            T="$(yq -r '.title // empty' "$TASK_FILE" 2>/dev/null || true)"
+            if [ -n "${T:-}" ]; then TITLE_VAL="$T"; fi
           fi
 
-          {
-            printf "# %s\n\n" "$TITLE_VAL"
-            printf "## STRICT RULES\n\n"
-            printf -- "- Return ONLY JSON (no prose) that matches {\"files\":[{\"path\":string,\"content\":string},...]}.\n"
-            printf -- "- Implement runnable APPLICATION CODE and TESTS.\n"
-            printf -- "- Emit at least one code file under \"/src\" or \"/app\".\n"
-            printf -- "- You may also emit build files: \"package.json\", \"tsconfig.json\", \"pyproject.toml\", \"requirements.txt\", \"composer.json\", \"go.mod\".\n"
-            printf -- "- Do NOT create policy/compliance/README/meta docs.\n"
-            printf -- "- NEVER write under the \"ai/\" directory.\n\n"
-            printf "## SPEC CONTENT\n"
-          } >> "$PROMPT_FILE"
+          printf "# %s
 
-          add_file () {
-            local f="$1"
-            [ -f "$f" ] || return 0
-            printf "\n### %s\n\n" "$f" >> "$PROMPT_FILE"
-            # CRLF 正規化＋安全に最大 4000 行まで
-            sed -e 's/\r$//' "$f" | head -n 4000 >> "$PROMPT_FILE"
-          }
+" "$TITLE_VAL" >> "$PROMPT_FILE"
+          printf "## STRICT RULES
 
-          # includes 指定があればそれを優先、無ければ従来の自動走査
-          if [ -f "$TASK_FILE" ] && jq -e '.includes and (.includes|type=="array") and (.includes|length>0)' "$TASK_FILE" >/dev/null 2>&1; then
-            jq -r '.includes[]' "$TASK_FILE" | while IFS= read -r f; do
-              add_file "$f"
+" >> "$PROMPT_FILE"
+          printf -- "- Return ONLY JSON (no prose) that matches {\"files\":[{\"path\":string,\"content\":string},...]}.
+" >> "$PROMPT_FILE"
+          printf -- "- Implement runnable APPLICATION CODE and TESTS.
+" >> "$PROMPT_FILE"
+          printf -- "- Emit at least one code file under \"/src\" or \"/app\".
+" >> "$PROMPT_FILE"
+          printf -- "- NEVER write under the \"ai/\" directory.
+
+" >> "$PROMPT_FILE"
+          printf "## SPEC CONTENT
+" >> "$PROMPT_FILE"
+
+          # includes only
+          if yq -e '.include' "$TASK_FILE" >/dev/null 2>&1; then
+            yq -r '.include[]' "$TASK_FILE" | while read -r f; do
+              [ -f "$SPEC_ROOT/$f" ] || continue
+              printf "\n### %s\n\n" "$f" >> "$PROMPT_FILE"
+              sed -e 's/\r$//' "$SPEC_ROOT/$f" | head -n 4000 >> "$PROMPT_FILE"
             done
-          else
-            tmp_list="$(mktemp)"
-            for d in $SPEC_DIRS; do
-              [ -d "${SPEC_ROOT}/${d}" ] || continue
-              find "${SPEC_ROOT}/${d}" -type f \
-                \( -name "*.md" -o -name "*.txt" -o -name "*.yaml" -o -name "*.yml" -o -name "*.json" \) >> "$tmp_list"
-            done
-            LC_ALL=C sort -o "$tmp_list" "$tmp_list" || true
-            while IFS= read -r f; do
-              add_file "$f"
-            done < "$tmp_list"
-            rm -f "$tmp_list"
           fi
 
-      - name: "build ai/request.json (Responses API: text.format=json_schema)"
+      - name: "build ai/request.json"
         run: |
           set -euo pipefail
-          jq -n \
-            --arg model "$OPENAI_MODEL" \
-            --rawfile prompt "$PROMPT_FILE" \
-            --argjson max_out "${MAX_TOKENS:-0}" '
+          ENDPOINT="${ENDPOINT:-${OPENAI_BASE_URL:-https://api.openai.com}/v1/responses}"
+          jq -n             --arg model "$OPENAI_MODEL"             --rawfile prompt "$PROMPT_FILE"             --argjson max_out "${MAX_TOKENS:-8192}" '
           {
             model: $model,
             text: {
@@ -164,129 +145,47 @@ jobs:
               }
             },
             input: [
-              {
-                role: "system",
-                content: [
-                  {
-                    type: "input_text",
-                    text: "You are Codex. Output ONLY a JSON object with the exact shape {\\\"files\\\":[{\\\"path\\\":string,\\\"content\\\":string},...]}. No prose, no code fences. Write full, runnable code. No placeholders. Never write inside ai/."
-                  }
-                ]
-              },
-              {
-                role: "user",
-                content: [
-                  {
-                    type: "input_text",
-                    text: ("Implement the SPEC as runnable application code and tests. Return files to write as JSON only.\n\n" + $prompt)
-                  }
-                ]
-              }
-            ]
-          }
-          | if $max_out > 0 then . + {max_output_tokens: $max_out} else . end
-          ' > "$REQUEST_JSON"
-
-          echo "::group::diagnostics: request.json (first 120 lines)"
-          head -n 120 "$REQUEST_JSON" || true
-          echo "::endgroup::"
+              { role: "system", content: [ { type: "input_text", text: "You are Codex. Output ONLY a JSON object with the exact shape {\\\"files\\\":[{\\\"path\\\":string,\\\"content\\\":string},...]}. No prose, no code fences. Write full, runnable code. No placeholders. Never write inside ai/." } ] },
+              { role: "user",   content: [ { type: "input_text", text: ("Implement the SPEC as runnable application code and tests. Return files to write as JSON only.\n\n" + $prompt) } ] }
+            ],
+            max_output_tokens: $max_out
+          }' > "$REQUEST_JSON"
 
       - name: "call OpenAI Responses API"
         run: |
           set -euo pipefail
-          echo "::group::curl command line"
-          echo "curl --fail-with-body -sS --connect-timeout 30 --max-time ${CURL_TIMEOUT} --retry ${CURL_RETRIES} --retry-all-errors --retry-delay ${CURL_RETRY_DELAY} -H 'Authorization: ***' -H 'Content-Type: application/json' -d @\"$REQUEST_JSON\" \"$ENDPOINT\""
-          echo "::endgroup::"
-
-          do_error_logging () {
-            # (3) エラー詳細の抽出表示（code / message / request_id）
-            if [ -f "$RESPONSE_JSON" ]; then
-              ERR_CODE="$(jq -r '.error.code // empty' "$RESPONSE_JSON" 2>/dev/null || true)"
-              ERR_MSG="$(jq -r '.error.message // empty' "$RESPONSE_JSON" 2>/dev/null || true)"
-              REQ_ID="$(jq -r '(.error.message // "") | capture("request ID (?<id>req_[A-Za-z0-9]+)")?.id // empty' "$RESPONSE_JSON" 2>/dev/null || true)"
-              [ -n "${ERR_CODE:-}" ] && echo "openai_error_code=${ERR_CODE}"
-              [ -n "${ERR_MSG:-}" ] && echo "openai_error_message=${ERR_MSG}"
-              [ -n "${REQ_ID:-}" ] && echo "openai_request_id=${REQ_ID}"
-            fi
-          }
-
+          ENDPOINT="${ENDPOINT:-${OPENAI_BASE_URL:-https://api.openai.com}/v1/responses}"
           http_code="$(
-            curl --fail-with-body -sS \
-              --connect-timeout 30 \
-              --max-time "${CURL_TIMEOUT}" \
-              --retry "${CURL_RETRIES}" \
-              --retry-all-errors \
-              --retry-delay "${CURL_RETRY_DELAY}" \
-              -H "Authorization: Bearer ${OPENAI_API_KEY}" \
-              -H "Content-Type: application/json" \
-              -d @"$REQUEST_JSON" "$ENDPOINT" \
-              -w "%{http_code}" -o "$RESPONSE_JSON" || true
+            curl --fail-with-body -sS               --connect-timeout 30               --max-time "${CURL_TIMEOUT}"               --retry "${CURL_RETRIES}"               --retry-all-errors               --retry-delay "${CURL_RETRY_DELAY}"               -H "Authorization: Bearer ${OPENAI_API_KEY}"               -H "Content-Type: application/json"               -d @"$REQUEST_JSON" "$ENDPOINT"               -w "%{http_code}" -o "$RESPONSE_JSON" || true
           )"
-
-          # (最小) http_code をサニタイズ
           http_code="$(echo -n "$http_code" | tr -d '\r\n[:space:]')"
           echo "HTTP_STATUS=${http_code}"
 
-          # (最小) 500/502/503/504 で 1 回だけフォールバック
-          case "$http_code" in
-            500|502|503|504)
-              echo "::group::response.json (first 120 lines)"
-              head -n 120 "$RESPONSE_JSON" || true
-              echo "::endgroup::"
-              do_error_logging
+          if [ "$http_code" = "500" ] || [ "$http_code" = "502" ] || [ "$http_code" = "503" ] || [ "$http_code" = "504" ]; then
+            echo "::group::response.json (first 120 lines)"; head -n 120 "$RESPONSE_JSON" || true; echo "::endgroup::"
+            echo "::notice title=fallback::HTTP ${http_code} detected. Retrying once with max_output_tokens=12288"
+            jq '. + {max_output_tokens: 12288}' "$REQUEST_JSON" > ai/request.fallback.json
+            http_code_fallback="$(
+              curl --fail-with-body -sS                 --connect-timeout 30                 --max-time "${CURL_TIMEOUT}"                 --retry 0                 -H "Authorization: Bearer ${OPENAI_API_KEY}"                 -H "Content-Type: application/json"                 -d @ai/request.fallback.json "$ENDPOINT"                 -w "%{http_code}" -o "$RESPONSE_JSON" || true
+            )"
+            http_code_fallback="$(echo -n "$http_code_fallback" | tr -d '\r\n[:space:]')"
+            echo "HTTP_STATUS_FALLBACK=${http_code_fallback}"
+            http_code="${http_code_fallback}"
+          fi
 
-              echo "::notice title=fallback::HTTP ${http_code} detected. Retrying once with max_output_tokens=12288"
-              jq '. + {max_output_tokens: 12288}' "$REQUEST_JSON" > ai/request.fallback.json
-
-              http_code_fallback="$(
-                curl --fail-with-body -sS \
-                  --connect-timeout 30 \
-                  --max-time "${CURL_TIMEOUT}" \
-                  --retry 0 \
-                  -H "Authorization: Bearer ${OPENAI_API_KEY}" \
-                  -H "Content-Type: application/json" \
-                  -d @ai/request.fallback.json "$ENDPOINT" \
-                  -w "%{http_code}" -o "$RESPONSE_JSON" || true
-              )"
-              http_code_fallback="$(echo -n "$http_code_fallback" | tr -d '\r\n[:space:]')"
-              echo "HTTP_STATUS_FALLBACK=${http_code_fallback}"
-
-              if [ "${http_code_fallback}" -lt 200 ] || [ "${http_code_fallback}" -ge 400 ]; then
-                echo "::error title=OpenAI API returned ${http_code_fallback} on fallback::See response.json for details"
-                echo "::group::response.json (first 120 lines)"
-                head -n 120 "$RESPONSE_JSON" || true
-                echo "::endgroup::"
-                do_error_logging
-                exit 22
-              fi
-
-              # フォールバック成功
-              http_code="${http_code_fallback}"
-              ;;
-          esac
-
-          # 一般失敗（フォールバック後も 4xx/5xx）
           if [ "${http_code}" -lt 200 ] || [ "${http_code}" -ge 400 ]; then
             echo "::error title=OpenAI API returned ${http_code}::See response.json for details"
-            echo "::group::response.json (first 120 lines)"
-            head -n 120 "$RESPONSE_JSON" || true
-            echo "::endgroup::"
-            do_error_logging
+            echo "::group::response.json (first 120 lines)"; head -n 120 "$RESPONSE_JSON" || true; echo "::endgroup::"
             exit 22
           fi
 
-          echo "::group::response.json (first 80 lines)"
-          head -n 80 "$RESPONSE_JSON" || true
-          echo "::endgroup::"
+          echo "::group::response.json (first 80 lines)"; head -n 80 "$RESPONSE_JSON" || true; echo "::endgroup::"
 
-          # === 応答の完了チェック（不完全なら即失敗）===
           STATUS="$(jq -r '.status // empty' "$RESPONSE_JSON")"
           if [ "${STATUS}" != "completed" ]; then
             REASON="$(jq -r '.incomplete_details.reason // "unknown"' "$RESPONSE_JSON")"
             echo "::error title=OpenAI response incomplete::status=${STATUS}, reason=${REASON}"
-            echo "::group::response.json (first 200 lines)"
-            head -n 200 "$RESPONSE_JSON" || true
-            echo "::endgroup::"
+            echo "::group::response.json (first 200 lines)"; head -n 200 "$RESPONSE_JSON" || true; echo "::endgroup::"
             exit 22
           fi
 
@@ -294,42 +193,26 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p "$STAGING_DIR"
-
-          # 1) 取り出し：output_text があれば優先、無ければ content[].text を走査
           jq -e -r '
             .output_text
             // ( [ .output[]? .content[]? | select(.type=="output_text") | .text ] | .[0] )
             // ( [ .output[]? .content[]? | select(.type=="text")        | .text ] | .[0] )
           ' "$RESPONSE_JSON" > ai/out.raw.txt
-
-          # 2) JSON バリデーション
           jq -e . ai/out.raw.txt > "$OUT_JSON"
+          jq -e 'type=="object" and has("files") and (.files|type=="array") and (.files|length>0)' "$OUT_JSON" >/dev/null
 
-          # 3) スキーマ簡易検証
-          jq -e '
-            type=="object" and has("files") and (.files|type=="array") and (.files|length>0)
-          ' "$OUT_JSON" >/dev/null
-
-          # 4) 展開（ai/ 直下は書き込み禁止）
           i=0
           jq -c '.files[]' "$OUT_JSON" | while read -r row; do
             path=$(printf '%s' "$row" | jq -r '.path')
             content=$(printf '%s' "$row" | jq -r '.content')
-
             case "$path" in
-              ai/*|./ai/*)
-                echo "::warning title=skipped forbidden path::$path"
-                continue
-                ;;
+              ai/*|./ai/*) echo "::warning title=skipped forbidden path::$path"; continue;;
             esac
-
             mkdir -p "$(dirname "$path")" "$(dirname "$STAGING_DIR/$path")"
             printf '%s' "$content" > "$path"
             printf '%s' "$content" > "$STAGING_DIR/$path"
-            echo "wrote $path"
-            i=$((i+1))
+            echo "wrote $path"; i=$((i+1))
           done
-
           if [ "$i" -eq 0 ]; then
             echo "::error title=no files emitted::Model returned zero writable files"
             exit 1
