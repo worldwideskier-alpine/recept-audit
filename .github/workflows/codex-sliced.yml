@@ -43,9 +43,6 @@ jobs:
 
       TITLE: "Codex generation prompt"
 
-      # 依頼どおり：追加設定
-      MAX_TOKENS: 16000
-
     steps:
       - name: "checkout"
         uses: actions/checkout@v4
