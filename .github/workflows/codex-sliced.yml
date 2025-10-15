@@ -259,6 +259,6 @@ jobs:
       - name: "upload artifact (codex_out)"
         uses: actions/upload-artifact@v4
         with:
-          name: "codex_out"
+          name: "codex_out_${{ replace(replace(matrix.task, '/', '_'), '.', '_') }}"
           path: "${{ env.STAGING_DIR }}"
           if-no-files-found: "error"
