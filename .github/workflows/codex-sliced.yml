@@ -240,7 +240,7 @@ jobs:
           jq -e 'type=="object" and has("files") and (.files|type=="array") and (.files|length>0)' "$OUT_JSON" >/dev/null
 
           i=0
-          jq -c '.files[]' "$OUT_JSON" | while read -r row; do
+          while IFS= read -r row; do
             path=$(printf '%s' "$row" | jq -r '.path')
             content=$(printf '%s' "$row" | jq -r '.content')
             case "$path" in
@@ -250,7 +250,7 @@ jobs:
             printf '%s' "$content" > "$path"
             printf '%s' "$content" > "$STAGING_DIR/$path"
             echo "wrote $path"; i=$((i+1))
-          done
+          done < <(jq -c '.files[]' "$OUT_JSON")
           if [ "$i" -eq 0 ]; then
             echo "::error title=no files emitted::Model returned zero writable files"
             exit 1
