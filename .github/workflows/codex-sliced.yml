@@ -47,7 +47,7 @@ jobs:
           tr '\0' '\n' < files.z | sed '/^$/d' | sort -u > files.txt
           echo "Resolved tasks:"
           cat files.txt
-          MATRIX_JSON="$(jq -Rs '{task: (split("\n") | map(select(length>0)))}' < files.txt)"
+          MATRIX_JSON="$(jq -cRs '{task: (split("\n") | map(select(length>0)))}' < files.txt)"
           echo "matrix=${MATRIX_JSON}" >> "$GITHUB_OUTPUT"
 
   codex:
@@ -279,7 +279,7 @@ jobs:
             // ( [ .output[]? .content[]? | select(.type=="text")        | .text ] | .[0] )
           ' "$RESPONSE_JSON" > ai/out.raw.txt
           jq -e . ai/out.raw.txt > "$OUT_JSON"
-          jq -e 'type=="object" and has("files") and (.files|type=="array") and (.files|length>0)' "$OUT_JSON" >/dev/null
+          jq -e 'type=="object" and has("files") and (.files|type=="array") and (.files|length>0)' "$OUT_JSON" >/devnull
 
           i=0
           while IFS= read -r row; do
