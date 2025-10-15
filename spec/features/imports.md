@@ -1,3 +1,9 @@
+[GEN-TARGET]
+id: provider-db
+outputs: [src/App/Controllers/ProviderDbController.php]
+acceptance: [evidence/runtime/IMPORT_DB_OK.txt]
+[/GEN-TARGET]
+
 # features / imports（/provider/db と CLI の要件）
 
 ## /provider/db（唯一のアプリ内取込エンドポイント）

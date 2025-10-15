@@ -1,3 +1,9 @@
+[GEN-TARGET]
+id: env-health
+outputs: [health-lite.php]
+acceptance: [storage/logs/app.log]
+[/GEN-TARGET]
+
 # env / policies（方針・拘束事項）
 
 ## 1) ランタイム前提（MUST）

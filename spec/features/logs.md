@@ -1,3 +1,9 @@
+[GEN-TARGET]
+id: l2-logs
+outputs: [src/App/Support/Log.php]
+acceptance: [storage/logs/app.log]
+[/GEN-TARGET]
+
 # features / logs（L2：1行JSON）
 
 - 代表イベント：

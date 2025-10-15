@@ -1,0 +1,18 @@
+id: 50_ui_rbac
+title: UI/RBAC：Provider Dashboard, Tenants new, Admin Clerk new
+model: gpt-5-codex
+max_output_tokens: 7000
+include:
+- features/ui_rbac.md
+- features/policies.md
+- features/logs.md
+outputs:
+  must_create:
+  - src/App/Controllers/ProviderDashboardController.php
+  - src/App/Controllers/TenantsNewController.php
+  - src/App/Controllers/AdminClerkNewController.php
+  - templates/*.php
+acceptance:
+  evidence:
+  - evidence/runtime/UI_RBAC_OK.txt
+  tests_phase: phase_b

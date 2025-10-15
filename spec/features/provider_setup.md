@@ -1,3 +1,9 @@
+[GEN-TARGET]
+id: provider-setup
+outputs: [src/App/Controllers/ProviderSetupController.php]
+acceptance: [evidence/runtime/PROVIDER_SETUP_OK.txt]
+[/GEN-TARGET]
+
 # features / provider_setup（/provider/setup の厳格ポリシー）
 
 ## 要件（MUST）

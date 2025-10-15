@@ -1,3 +1,9 @@
+[GEN-TARGET]
+id: endpoints-env
+outputs: [.htaccess, app.php, env-lite.php]
+acceptance: [evidence/static/HTML_LS_GLOBAL_OK.txt]
+[/GEN-TARGET]
+
 # features / endpoints（URL動作・早期ハンドラ・BNORM）
 
 ## 早見表（主要）

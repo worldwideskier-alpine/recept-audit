@@ -1,0 +1,16 @@
+id: 20_provider_setup
+title: /provider/setup（初回のみ公開・POST作成→302）
+model: gpt-5-codex
+max_output_tokens: 6500
+include:
+- features/provider_setup.md
+- features/policies.md
+outputs:
+  must_create:
+  - src/App/Controllers/ProviderSetupController.php
+  must_touch:
+  - app.php
+acceptance:
+  evidence:
+  - evidence/runtime/PROVIDER_SETUP_OK.txt
+  tests_phase: phase_b

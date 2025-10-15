@@ -1,3 +1,9 @@
+[GEN-TARGET]
+id: cli-tools
+outputs: [cli/sync.php, cli/build_rules.php, cli/import_db.php]
+acceptance: [evidence/runtime/CLI_OK.txt]
+[/GEN-TARGET]
+
 # features / cli（CLI 要件）
 
 - `cli/sync.php`：cURL ベースの実ネット取得。`--cycle` は EmptyDB Auto-Fetch を実装。`SYNC_SEED_URLS` 未設定は exit=3。

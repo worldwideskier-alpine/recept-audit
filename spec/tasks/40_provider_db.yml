@@ -1,0 +1,15 @@
+id: 40_provider_db
+title: /provider/db（内包/外部packs、冪等・件数下限）
+model: gpt-5-codex
+max_output_tokens: 8000
+include:
+- features/imports.md
+outputs:
+  must_create:
+  - src/App/Controllers/ProviderDbController.php
+  must_touch:
+  - app.php
+acceptance:
+  evidence:
+  - evidence/runtime/IMPORT_DB_OK.txt
+  tests_phase: phase_b

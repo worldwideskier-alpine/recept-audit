@@ -1,0 +1,24 @@
+id: 00_boot
+title: 最小ブート（.htaccess, app骨格, env/health-lite）
+model: gpt-5-codex
+max_output_tokens: 6000
+include:
+- foundation/file-globs.yml
+- foundation/policies.md
+- features/endpoints.md
+- features/policies.md
+outputs:
+  must_create:
+  - .htaccess
+  - app.php
+  - env-lite.php
+  - health-lite.php
+  - src/Support/Res.php
+  - src/Support/Log.php
+  must_not_touch:
+  - spec/**
+acceptance:
+  evidence:
+  - evidence/static/HTML_LS_GLOBAL_OK.txt
+  - evidence/static/TOOLS_OK.txt
+  tests_phase: phase_s
