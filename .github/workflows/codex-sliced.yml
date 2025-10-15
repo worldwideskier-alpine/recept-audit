@@ -1,4 +1,4 @@
-name: "codex-sliced"
+name: "codex (sliced)"
 
 on:
   workflow_dispatch: {}
@@ -7,24 +7,21 @@ permissions:
   contents: read
 
 concurrency:
-  group: "codex"
+  group: "codex-sliced"
   cancel-in-progress: true
 
 jobs:
   generate:
-    name: "generate"
+    name: "generate (sliced)"
     runs-on: ubuntu-24.04
 
+    # ここは必要に応じて編集してください
     strategy:
       fail-fast: false
       matrix:
+        # タスク定義ファイル（例）。各 JSON は { "title": "...", "includes": ["path1","path2", ...] } を想定
         task:
-          - spec/tasks/00_boot.yml
-          - spec/tasks/10_health.yml
-          - spec/tasks/20_provider_setup.yml
-          - spec/tasks/30_imports_cli.yml
-          - spec/tasks/40_provider_db.yml
-          - spec/tasks/50_ui_rbac.yml
+          - "spec/tasks/app.core.json"
 
     env:
       OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
@@ -32,6 +29,8 @@ jobs:
       ENDPOINT: "https://api.openai.com/v1/responses"
 
       SPEC_ROOT: "spec"
+      SPEC_DIRS: "env foundation features tests"
+
       PROMPT_FILE: "ai/prompt.md"
       REQUEST_JSON: "ai/request.json"
       RESPONSE_JSON: "ai/response.json"
@@ -44,6 +43,9 @@ jobs:
 
       TITLE: "Codex generation prompt"
 
+      # 依頼どおり：追加設定
+      MAX_TOKENS: 16000
+
     steps:
       - name: "checkout"
         uses: actions/checkout@v4
@@ -55,7 +57,7 @@ jobs:
           sparse-checkout-cone-mode: true
           set-safe-directory: true
 
-      - name: "install jq/coreutils"
+      - name: "install jq/coreutils/python3"
         run: |
           set -euo pipefail
           sudo apt-get update -y
@@ -67,70 +69,71 @@ jobs:
           set -euo pipefail
           TASK_FILE="${{ matrix.task }}"
           echo "task_file=${TASK_FILE}" >> "$GITHUB_OUTPUT"
-          echo "---- TASK ----"
-          cat "$TASK_FILE" || true
-          echo "--------------"
 
-      - name: "assemble prompt from task includes"
+      - name: "assemble prompt.md from task includes (no heredoc)"
         run: |
           set -euo pipefail
-          mkdir -p ai
+          mkdir -p "ai"
           : > "$PROMPT_FILE"
 
-          python3 - "$SPEC_ROOT" "${{ steps.task.outputs.task_file }}" "$PROMPT_FILE" << 'PY'
-import sys, os, yaml, io, re, pathlib
-from pathlib import Path
+          # タスクファイル（JSON）
+          TASK_FILE="${{ steps.task.outputs.task_file }}"
 
-spec_root = Path(sys.argv[1])
-task_file = Path(sys.argv[2])
-prompt_file = Path(sys.argv[3])
+          # タイトル（タスクに title があれば上書き）
+          TITLE_VAL="$TITLE"
+          if [ -f "$TASK_FILE" ]; then
+            T="$(jq -r 'select(.title != null) | .title' "$TASK_FILE" 2>/dev/null || true)"
+            if [ -n "${T:-}" ] && [ "$T" != "null" ]; then
+              TITLE_VAL="$T"
+            fi
+          fi
 
-task = yaml.safe_load(task_file.read_text(encoding="utf-8"))
-includes = task.get("include", [])
-title = task.get("title","Task")
+          {
+            printf "# %s\n\n" "$TITLE_VAL"
+            printf "## STRICT RULES\n\n"
+            printf -- "- Return ONLY JSON (no prose) that matches {\"files\":[{\"path\":string,\"content\":string},...]}.\n"
+            printf -- "- Implement runnable APPLICATION CODE and TESTS.\n"
+            printf -- "- Emit at least one code file under \"/src\" or \"/app\".\n"
+            printf -- "- You may also emit build files: \"package.json\", \"tsconfig.json\", \"pyproject.toml\", \"requirements.txt\", \"composer.json\", \"go.mod\".\n"
+            printf -- "- Do NOT create policy/compliance/README/meta docs.\n"
+            printf -- "- NEVER write under the \"ai/\" directory.\n\n"
+            printf "## SPEC CONTENT\n"
+          } >> "$PROMPT_FILE"
 
-def norm(p):
-    return str(Path(p).as_posix())
+          add_file () {
+            local f="$1"
+            [ -f "$f" ] || return 0
+            printf "\n### %s\n\n" "$f" >> "$PROMPT_FILE"
+            # CRLF 正規化＋安全に最大 4000 行まで
+            sed -e 's/\r$//' "$f" | head -n 4000 >> "$PROMPT_FILE"
+          }
 
-with open(prompt_file, "w", encoding="utf-8") as out:
-    out.write(f"# {title}\n\n")
-    out.write("## STRICT RULES\n\n")
-    out.write("- Return ONLY JSON (no prose) that matches {\"files\":[{\"path\":string,\"content\":string},...]}.\n")
-    out.write("- Implement runnable APPLICATION CODE and TESTS when relevant.\n")
-    out.write("- Emit at least one code file under \"/src\" or \"/app\".\n")
-    out.write("- NEVER write under the \"ai/\" directory.\n\n")
-    out.write("## OUTPUT BOUNDARY\n\n")
-    out.write(yaml.safe_dump(task.get("outputs", {}), sort_keys=False, allow_unicode=True))
-    out.write("\n## ACCEPTANCE\n\n")
-    out.write(yaml.safe_dump(task.get("acceptance", {}), sort_keys=False, allow_unicode=True))
-    out.write("\n## SPEC CONTENT\n")
-
-    for inc in includes:
-        p = spec_root / inc
-        if not p.exists():
-            continue
-        out.write(f"\n### {norm(inc)}\n\n")
-        # Write first 4000 lines max
-        with open(p, "r", encoding="utf-8") as f:
-            for i, line in enumerate(f):
-                if i >= 4000:
-                    break
-                out.write(line)
-PY
-
-      - name: "read task options"
-        id: tcfg
-        run: |
-          set -euo pipefail
-          MAX_OUT="$(yq -r '.max_output_tokens // 6000' "${{ matrix.task }}")"
-          echo "max_out=${MAX_OUT}" >> "$GITHUB_OUTPUT"
-          MODEL="$(yq -r '.model // env.OPENAI_MODEL' "${{ matrix.task }}")"
-          echo "model=${MODEL}" >> "$GITHUB_OUTPUT"
+          # includes 指定があればそれを優先、無ければ従来の自動走査
+          if [ -f "$TASK_FILE" ] && jq -e '.includes and (.includes|type=="array") and (.includes|length>0)' "$TASK_FILE" >/dev/null 2>&1; then
+            jq -r '.includes[]' "$TASK_FILE" | while IFS= read -r f; do
+              add_file "$f"
+            done
+          else
+            tmp_list="$(mktemp)"
+            for d in $SPEC_DIRS; do
+              [ -d "${SPEC_ROOT}/${d}" ] || continue
+              find "${SPEC_ROOT}/${d}" -type f \
+                \( -name "*.md" -o -name "*.txt" -o -name "*.yaml" -o -name "*.yml" -o -name "*.json" \) >> "$tmp_list"
+            done
+            LC_ALL=C sort -o "$tmp_list" "$tmp_list" || true
+            while IFS= read -r f; do
+              add_file "$f"
+            done < "$tmp_list"
+            rm -f "$tmp_list"
+          fi
 
       - name: "build ai/request.json (Responses API: text.format=json_schema)"
         run: |
           set -euo pipefail
-          jq -n             --arg model "${{ steps.tcfg.outputs.model }}"             --rawfile prompt "$PROMPT_FILE"             --argjson max_out "${{ steps.tcfg.outputs.max_out }}" '
+          jq -n \
+            --arg model "$OPENAI_MODEL" \
+            --rawfile prompt "$PROMPT_FILE" \
+            --argjson max_out "${MAX_TOKENS:-0}" '
           {
             model: $model,
             text: {
@@ -166,7 +169,7 @@ PY
                 content: [
                   {
                     type: "input_text",
-                    text: "You are Codex. Output ONLY a JSON object with the exact shape {\\\"files\\\":[{\\\"path\\\":string,\\\"content\\\":string},...]}."
+                    text: "You are Codex. Output ONLY a JSON object with the exact shape {\\\"files\\\":[{\\\"path\\\":string,\\\"content\\\":string},...]}. No prose, no code fences. Write full, runnable code. No placeholders. Never write inside ai/."
                   }
                 ]
               },
@@ -175,24 +178,37 @@ PY
                 content: [
                   {
                     type: "input_text",
-                    text: ("Implement the SPEC slice as runnable application code and tests if applicable. Return files to write as JSON only.\n\n" + $prompt)
+                    text: ("Implement the SPEC as runnable application code and tests. Return files to write as JSON only.\n\n" + $prompt)
                   }
                 ]
               }
-            ],
-            max_output_tokens: $max_out,
-            temperature: 0.2
-          }' > "$REQUEST_JSON"
+            ]
+          }
+          | if $max_out > 0 then . + {max_output_tokens: $max_out} else . end
+          ' > "$REQUEST_JSON"
+
+          echo "::group::diagnostics: request.json (first 120 lines)"
+          head -n 120 "$REQUEST_JSON" || true
+          echo "::endgroup::"
 
       - name: "call OpenAI Responses API"
         run: |
           set -euo pipefail
           echo "::group::curl command line"
-          echo "curl --fail-with-body -sS --connect-timeout 30 --max-time ${CURL_TIMEOUT} --retry ${CURL_RETRIES} --retry-all-errors --retry-delay ${CURL_RETRY_DELAY} -H 'Authorization: ***' -H 'Content-Type: application/json' -d @"$REQUEST_JSON" "$ENDPOINT""
+          echo "curl --fail-with-body -sS --connect-timeout 30 --max-time ${CURL_TIMEOUT} --retry ${CURL_RETRIES} --retry-all-errors --retry-delay ${CURL_RETRY_DELAY} -H 'Authorization: ***' -H 'Content-Type: application/json' -d @\"$REQUEST_JSON\" \"$ENDPOINT\""
           echo "::endgroup::"
 
           http_code="$(
-            curl --fail-with-body -sS               --connect-timeout 30               --max-time "${CURL_TIMEOUT}"               --retry "${CURL_RETRIES}"               --retry-all-errors               --retry-delay "${CURL_RETRY_DELAY}"               -H "Authorization: Bearer ${OPENAI_API_KEY}"               -H "Content-Type: application/json"               -d @"$REQUEST_JSON" "$ENDPOINT"               -w "%{http_code}" -o "$RESPONSE_JSON" || true
+            curl --fail-with-body -sS \
+              --connect-timeout 30 \
+              --max-time "${CURL_TIMEOUT}" \
+              --retry "${CURL_RETRIES}" \
+              --retry-all-errors \
+              --retry-delay "${CURL_RETRY_DELAY}" \
+              -H "Authorization: Bearer ${OPENAI_API_KEY}" \
+              -H "Content-Type: application/json" \
+              -d @"$REQUEST_JSON" "$ENDPOINT" \
+              -w "%{http_code}" -o "$RESPONSE_JSON" || true
           )"
 
           echo "HTTP_STATUS=${http_code}"
@@ -212,14 +228,23 @@ PY
         run: |
           set -euo pipefail
           mkdir -p "$STAGING_DIR"
+
+          # 1) 取り出し：output_text があれば優先、無ければ content[].text を走査
           jq -e -r '
             .output_text
             // ( [ .output[]? .content[]? | select(.type=="output_text") | .text ] | .[0] )
             // ( [ .output[]? .content[]? | select(.type=="text")        | .text ] | .[0] )
           ' "$RESPONSE_JSON" > ai/out.raw.txt
-          jq -e . ai/out.raw.txt > "$OUT_JSON"
-          jq -e 'type=="object" and has("files") and (.files|type=="array") and (.files|length>0)' "$OUT_JSON" >/dev/null
 
+          # 2) JSON バリデーション
+          jq -e . ai/out.raw.txt > "$OUT_JSON"
+
+          # 3) スキーマ簡易検証
+          jq -e '
+            type=="object" and has("files") and (.files|type=="array") and (.files|length>0)
+          ' "$OUT_JSON" >/dev/null
+
+          # 4) 展開（ai/ 直下は書き込み禁止）
           i=0
           jq -c '.files[]' "$OUT_JSON" | while read -r row; do
             path=$(printf '%s' "$row" | jq -r '.path')
@@ -247,6 +272,6 @@ PY
       - name: "upload artifact (codex_out)"
         uses: actions/upload-artifact@v4
         with:
-          name: "codex_out_${{ matrix.task }}"
+          name: "codex_out"
           path: "${{ env.STAGING_DIR }}"
           if-no-files-found: "error"
