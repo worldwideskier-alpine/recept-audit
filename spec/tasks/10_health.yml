@@ -1,0 +1,21 @@
+id: 10_health
+title: DB最小ブート（/health + schema bootstrap）
+model: gpt-5-codex
+max_output_tokens: 8192
+include:
+  - env/sql/policies.md
+  - env/rtm.yml
+  - features/data_model.md
+  - features/schema.required.json
+outputs:
+  must_create:
+    - src/App/Controllers/HealthController.php
+    - src/App/Support/Schema.php
+    - schema.sql
+  must_touch:
+    - app.php
+acceptance:
+  evidence:
+    - evidence/runtime/HEALTH_BOOT_HEAD_OK.txt
+    - storage/logs/app.log
+  tests_phase: phase_b

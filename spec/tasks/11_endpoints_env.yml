@@ -1,0 +1,20 @@
+id: 11_endpoints_env
+title: Endpoints: /env（FC最上流・直返し、/env/同値）
+model: gpt-5-codex
+max_output_tokens: 8192
+include:
+  - features/endpoints.md
+  - features/policies.md
+outputs:
+  must_create:
+    - src/App/Controllers/EnvController.php
+  must_touch:
+    - app.php
+  must_not_touch:
+    - src/Support/**
+    - .htaccess
+    - schema.sql
+acceptance:
+  evidence:
+    - evidence/runtime/ENV_ENDPOINT_OK.txt
+  tests_phase: phase_b

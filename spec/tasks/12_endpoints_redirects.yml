@@ -1,0 +1,19 @@
+id: 12_endpoints_redirects
+title: Endpoints: redirects（/→/login, /provider→/provider/login）
+model: gpt-5-codex
+max_output_tokens: 8192
+include:
+  - features/endpoints.md
+  - features/policies.md
+outputs:
+  must_create:
+    - src/App/Controllers/RedirectsController.php
+  must_touch:
+    - app.php
+  must_not_touch:
+    - .htaccess
+    - src/Support/**
+acceptance:
+  evidence:
+    - evidence/runtime/REDIRECTS_OK.txt
+  tests_phase: phase_b
