@@ -1,0 +1,252 @@
+name: "codex-sliced"
+
+on:
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: "codex"
+  cancel-in-progress: true
+
+jobs:
+  generate:
+    name: "generate"
+    runs-on: ubuntu-24.04
+
+    strategy:
+      fail-fast: false
+      matrix:
+        task:
+          - spec/tasks/00_boot.yml
+          - spec/tasks/10_health.yml
+          - spec/tasks/20_provider_setup.yml
+          - spec/tasks/30_imports_cli.yml
+          - spec/tasks/40_provider_db.yml
+          - spec/tasks/50_ui_rbac.yml
+
+    env:
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+      OPENAI_MODEL: "gpt-5-codex"
+      ENDPOINT: "https://api.openai.com/v1/responses"
+
+      SPEC_ROOT: "spec"
+      PROMPT_FILE: "ai/prompt.md"
+      REQUEST_JSON: "ai/request.json"
+      RESPONSE_JSON: "ai/response.json"
+      OUT_JSON: "ai/out.files.json"
+      STAGING_DIR: "codex_out"
+
+      CURL_TIMEOUT: 1800
+      CURL_RETRIES: 5
+      CURL_RETRY_DELAY: 5
+
+      TITLE: "Codex generation prompt"
+
+    steps:
+      - name: "checkout"
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+          lfs: false
+          submodules: false
+          sparse-checkout-cone-mode: true
+          set-safe-directory: true
+
+      - name: "install jq/coreutils"
+        run: |
+          set -euo pipefail
+          sudo apt-get update -y
+          sudo apt-get install -y jq coreutils python3
+
+      - name: "prepare task vars"
+        id: task
+        run: |
+          set -euo pipefail
+          TASK_FILE="${{ matrix.task }}"
+          echo "task_file=${TASK_FILE}" >> "$GITHUB_OUTPUT"
+          echo "---- TASK ----"
+          cat "$TASK_FILE" || true
+          echo "--------------"
+
+      - name: "assemble prompt from task includes"
+        run: |
+          set -euo pipefail
+          mkdir -p ai
+          : > "$PROMPT_FILE"
+
+          python3 - "$SPEC_ROOT" "${{ steps.task.outputs.task_file }}" "$PROMPT_FILE" << 'PY'
+import sys, os, yaml, io, re, pathlib
+from pathlib import Path
+
+spec_root = Path(sys.argv[1])
+task_file = Path(sys.argv[2])
+prompt_file = Path(sys.argv[3])
+
+task = yaml.safe_load(task_file.read_text(encoding="utf-8"))
+includes = task.get("include", [])
+title = task.get("title","Task")
+
+def norm(p):
+    return str(Path(p).as_posix())
+
+with open(prompt_file, "w", encoding="utf-8") as out:
+    out.write(f"# {title}\n\n")
+    out.write("## STRICT RULES\n\n")
+    out.write("- Return ONLY JSON (no prose) that matches {\"files\":[{\"path\":string,\"content\":string},...]}.\n")
+    out.write("- Implement runnable APPLICATION CODE and TESTS when relevant.\n")
+    out.write("- Emit at least one code file under \"/src\" or \"/app\".\n")
+    out.write("- NEVER write under the \"ai/\" directory.\n\n")
+    out.write("## OUTPUT BOUNDARY\n\n")
+    out.write(yaml.safe_dump(task.get("outputs", {}), sort_keys=False, allow_unicode=True))
+    out.write("\n## ACCEPTANCE\n\n")
+    out.write(yaml.safe_dump(task.get("acceptance", {}), sort_keys=False, allow_unicode=True))
+    out.write("\n## SPEC CONTENT\n")
+
+    for inc in includes:
+        p = spec_root / inc
+        if not p.exists():
+            continue
+        out.write(f"\n### {norm(inc)}\n\n")
+        # Write first 4000 lines max
+        with open(p, "r", encoding="utf-8") as f:
+            for i, line in enumerate(f):
+                if i >= 4000:
+                    break
+                out.write(line)
+PY
+
+      - name: "read task options"
+        id: tcfg
+        run: |
+          set -euo pipefail
+          MAX_OUT="$(yq -r '.max_output_tokens // 6000' "${{ matrix.task }}")"
+          echo "max_out=${MAX_OUT}" >> "$GITHUB_OUTPUT"
+          MODEL="$(yq -r '.model // env.OPENAI_MODEL' "${{ matrix.task }}")"
+          echo "model=${MODEL}" >> "$GITHUB_OUTPUT"
+
+      - name: "build ai/request.json (Responses API: text.format=json_schema)"
+        run: |
+          set -euo pipefail
+          jq -n             --arg model "${{ steps.tcfg.outputs.model }}"             --rawfile prompt "$PROMPT_FILE"             --argjson max_out "${{ steps.tcfg.outputs.max_out }}" '
+          {
+            model: $model,
+            text: {
+              format: {
+                type: "json_schema",
+                name: "emit_files",
+                strict: true,
+                schema: {
+                  type: "object",
+                  additionalProperties: false,
+                  required: ["files"],
+                  properties: {
+                    files: {
+                      type: "array",
+                      minItems: 1,
+                      items: {
+                        type: "object",
+                        additionalProperties: false,
+                        required: ["path","content"],
+                        properties: {
+                          path:    { type: "string", minLength: 1 },
+                          content: { type: "string" }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            },
+            input: [
+              {
+                role: "system",
+                content: [
+                  {
+                    type: "input_text",
+                    text: "You are Codex. Output ONLY a JSON object with the exact shape {\\\"files\\\":[{\\\"path\\\":string,\\\"content\\\":string},...]}."
+                  }
+                ]
+              },
+              {
+                role: "user",
+                content: [
+                  {
+                    type: "input_text",
+                    text: ("Implement the SPEC slice as runnable application code and tests if applicable. Return files to write as JSON only.\n\n" + $prompt)
+                  }
+                ]
+              }
+            ],
+            max_output_tokens: $max_out,
+            temperature: 0.2
+          }' > "$REQUEST_JSON"
+
+      - name: "call OpenAI Responses API"
+        run: |
+          set -euo pipefail
+          echo "::group::curl command line"
+          echo "curl --fail-with-body -sS --connect-timeout 30 --max-time ${CURL_TIMEOUT} --retry ${CURL_RETRIES} --retry-all-errors --retry-delay ${CURL_RETRY_DELAY} -H 'Authorization: ***' -H 'Content-Type: application/json' -d @"$REQUEST_JSON" "$ENDPOINT""
+          echo "::endgroup::"
+
+          http_code="$(
+            curl --fail-with-body -sS               --connect-timeout 30               --max-time "${CURL_TIMEOUT}"               --retry "${CURL_RETRIES}"               --retry-all-errors               --retry-delay "${CURL_RETRY_DELAY}"               -H "Authorization: Bearer ${OPENAI_API_KEY}"               -H "Content-Type: application/json"               -d @"$REQUEST_JSON" "$ENDPOINT"               -w "%{http_code}" -o "$RESPONSE_JSON" || true
+          )"
+
+          echo "HTTP_STATUS=${http_code}"
+          if [ "${http_code}" -lt 200 ] || [ "${http_code}" -ge 400 ]; then
+            echo "::error title=OpenAI API returned ${http_code}::See response.json for details"
+            echo "::group::response.json (first 120 lines)"
+            head -n 120 "$RESPONSE_JSON" || true
+            echo "::endgroup::"
+            exit 22
+          fi
+
+          echo "::group::response.json (first 80 lines)"
+          head -n 80 "$RESPONSE_JSON" || true
+          echo "::endgroup::"
+
+      - name: "extract model JSON and write files"
+        run: |
+          set -euo pipefail
+          mkdir -p "$STAGING_DIR"
+          jq -e -r '
+            .output_text
+            // ( [ .output[]? .content[]? | select(.type=="output_text") | .text ] | .[0] )
+            // ( [ .output[]? .content[]? | select(.type=="text")        | .text ] | .[0] )
+          ' "$RESPONSE_JSON" > ai/out.raw.txt
+          jq -e . ai/out.raw.txt > "$OUT_JSON"
+          jq -e 'type=="object" and has("files") and (.files|type=="array") and (.files|length>0)' "$OUT_JSON" >/dev/null
+
+          i=0
+          jq -c '.files[]' "$OUT_JSON" | while read -r row; do
+            path=$(printf '%s' "$row" | jq -r '.path')
+            content=$(printf '%s' "$row" | jq -r '.content')
+
+            case "$path" in
+              ai/*|./ai/*)
+                echo "::warning title=skipped forbidden path::$path"
+                continue
+                ;;
+            esac
+
+            mkdir -p "$(dirname "$path")" "$(dirname "$STAGING_DIR/$path")"
+            printf '%s' "$content" > "$path"
+            printf '%s' "$content" > "$STAGING_DIR/$path"
+            echo "wrote $path"
+            i=$((i+1))
+          done
+
+          if [ "$i" -eq 0 ]; then
+            echo "::error title=no files emitted::Model returned zero writable files"
+            exit 1
+          fi
+
+      - name: "upload artifact (codex_out)"
+        uses: actions/upload-artifact@v4
+        with:
+          name: "codex_out_${{ matrix.task }}"
+          path: "${{ env.STAGING_DIR }}"
+          if-no-files-found: "error"
