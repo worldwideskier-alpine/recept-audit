@@ -39,8 +39,9 @@ jobs:
       OUT_JSON: "ai/out.files.json"
       STAGING_DIR: "codex_out"
 
-      CURL_TIMEOUT: 1800
-      CURL_RETRIES: 5
+      # (1) 時間短縮＆再試行回数の抑制
+      CURL_TIMEOUT: 900
+      CURL_RETRIES: 2
       CURL_RETRY_DELAY: 5
 
       TITLE: "Codex generation prompt"
@@ -197,6 +198,18 @@ jobs:
           echo "curl --fail-with-body -sS --connect-timeout 30 --max-time ${CURL_TIMEOUT} --retry ${CURL_RETRIES} --retry-all-errors --retry-delay ${CURL_RETRY_DELAY} -H 'Authorization: ***' -H 'Content-Type: application/json' -d @\"$REQUEST_JSON\" \"$ENDPOINT\""
           echo "::endgroup::"
 
+          do_error_logging () {
+            # (3) エラー詳細の抽出表示（code / message / request_id）
+            if [ -f "$RESPONSE_JSON" ]; then
+              ERR_CODE="$(jq -r '.error.code // empty' "$RESPONSE_JSON" 2>/dev/null || true)"
+              ERR_MSG="$(jq -r '.error.message // empty' "$RESPONSE_JSON" 2>/dev/null || true)"
+              REQ_ID="$(jq -r '(.error.message // "") | capture("request ID (?<id>req_[A-Za-z0-9]+)")?.id // empty' "$RESPONSE_JSON" 2>/dev/null || true)"
+              [ -n "${ERR_CODE:-}" ] && echo "openai_error_code=${ERR_CODE}"
+              [ -n "${ERR_MSG:-}" ] && echo "openai_error_message=${ERR_MSG}"
+              [ -n "${REQ_ID:-}" ] && echo "openai_request_id=${REQ_ID}"
+            fi
+          }
+
           http_code="$(
             curl --fail-with-body -sS \
               --connect-timeout 30 \
@@ -211,11 +224,49 @@ jobs:
           )"
 
           echo "HTTP_STATUS=${http_code}"
+
+          # (2) 500 のときだけフォールバック 1 回（max_output_tokens を付与して再投げ）
+          if [ "${http_code}" = "500" ]; then
+            echo "::group::response.json (first 120 lines)"
+            head -n 120 "$RESPONSE_JSON" || true
+            echo "::endgroup::"
+            do_error_logging
+
+            echo "::notice title=fallback::HTTP 500 detected. Retrying once with max_output_tokens=12288"
+            jq '. + {max_output_tokens: 12288}' "$REQUEST_JSON" > ai/request.fallback.json
+
+            http_code_fallback="$(
+              curl --fail-with-body -sS \
+                --connect-timeout 30 \
+                --max-time "${CURL_TIMEOUT}" \
+                --retry 0 \
+                -H "Authorization: Bearer ${OPENAI_API_KEY}" \
+                -H "Content-Type: application/json" \
+                -d @ai/request.fallback.json "$ENDPOINT" \
+                -w "%{http_code}" -o "$RESPONSE_JSON" || true
+            )"
+            echo "HTTP_STATUS_FALLBACK=${http_code_fallback}"
+
+            if [ "${http_code_fallback}" -lt 200 ] || [ "${http_code_fallback}" -ge 400 ]; then
+              echo "::error title=OpenAI API returned ${http_code_fallback} on fallback::See response.json for details"
+              echo "::group::response.json (first 120 lines)"
+              head -n 120 "$RESPONSE_JSON" || true
+              echo "::endgroup::"
+              do_error_logging
+              exit 22
+            fi
+
+            # フォールバック成功
+            http_code="${http_code_fallback}"
+          fi
+
+          # 一般失敗（500 以外の 4xx/5xx）
           if [ "${http_code}" -lt 200 ] || [ "${http_code}" -ge 400 ]; then
             echo "::error title=OpenAI API returned ${http_code}::See response.json for details"
             echo "::group::response.json (first 120 lines)"
             head -n 120 "$RESPONSE_JSON" || true
             echo "::endgroup::"
+            do_error_logging
             exit 22
           fi
 
