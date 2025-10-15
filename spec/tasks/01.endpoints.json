@@ -1,0 +1,9 @@
+{
+  "title": "Endpoints & Env (FC/BNORM, /env, /health)",
+  "includes": [
+    "spec/features/endpoints.md",
+    "spec/features/policies.md",
+    "spec/env/policies.md",
+    "spec/features/schema.required.json"
+  ]
+}

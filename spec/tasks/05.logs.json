@@ -1,0 +1,7 @@
+{
+  "title": "L2 Logs Support",
+  "includes": [
+    "spec/features/logs.md",
+    "spec/env/policies.md"
+  ]
+}

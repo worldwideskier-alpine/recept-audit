@@ -1,0 +1,46 @@
+# env / rtm.yml — 要件トレーサビリティ（tests への橋渡し）
+env_db_dialect_001:
+  desc: "db_engine=mysql8 を COMPLIANCE.json で確認"
+  evidence: "COMPLIANCE.json"
+env_db_ddl_policy_mysql_001:
+  desc: "IF NOT EXISTS 付き INDEX 禁止（grep）＋ E2E で index 存在確認"
+  evidence: "schema.sql; app/Support/Schema.php"
+env_db_upsert_mysql_001:
+  desc: "VALUES() を Upsert で使用しない（静的）"
+  evidence: "app/Support"
+env_db_charset_001:
+  desc: "照合フォールバック時に charset_fallback を L2ログへ"
+  evidence: "app/Support/DB.php; storage/logs/app.log"
+env_health_minboot_mysql_001:
+  desc: "/health=最小ブート（スキーマのみ）"
+  evidence: "app.php; schema.sql"
+env_health_log_mysql_001:
+  desc: "/health 成否ログ（health_min_boot_pass/fail）"
+  evidence: "storage/logs/app.log"
+env_schema_log_mysql_001:
+  desc: "schema_exec_failed / schema_bootstrap_ok / schema_index_* を記録"
+  evidence: "app/Support/Schema.php; storage/logs/app.log"
+env_nostore_all_001:
+  desc: "全3xx含め no-store・301禁止"
+  evidence: ".htaccess; app.php"
+env_apache_multiviews_lock_001:
+  desc: "Options -MultiViews を .htaccess へ明示"
+  evidence: ".htaccess"
+env_apache_htaccess_bnorm_001:
+  desc: "RewriteRule ^ app.php / RewriteEngine On / RewriteBase 固定禁止"
+  evidence: ".htaccess"
+env_apache_allowoverride_001:
+  desc: "AllowOverride FileInfo 以上を vhost で設定"
+  evidence: "httpd.conf (vhost) 設定"
+env_code_db_api_style_lock_001:
+  desc: "`App::Support::DB` 静的ファサードを必ず提供"
+  evidence: "app/Support/DB.php; tools/run_checks.sh; php -r 検査証跡"
+env_code_msc_self_lock_001:
+  desc: "Support自己完結（先頭〜80行で require_once）"
+  evidence: "app/Support/**; tools/run_checks.sh; evidence/static/MSC_LOG_DEP_OK.txt"
+env_code_health_no_classerr_001:
+  desc: "/health 実行で Class not found を出さない"
+  evidence: "app.php; storage/logs/app.log; evidence/runtime/HEALTH_NO_CLASSERR_OK.txt"
+env_code_redir_bnorm_lock_002:
+  desc: "Location 直書き禁止・href()必須"
+  evidence: "app/Support/Res.php; evidence/static/REDIR_ABS_PATH_OK.txt; REDIR_BNORM_USE_OK.txt"

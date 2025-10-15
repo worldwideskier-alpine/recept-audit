@@ -1,0 +1,8 @@
+{
+  "title": "CLI Tools (sync/build_rules/import_db)",
+  "includes": [
+    "spec/features/cli.md",
+    "spec/features/imports.md",
+    "spec/env/policies.md"
+  ]
+}

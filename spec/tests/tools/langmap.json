@@ -1,0 +1,10 @@
+{
+  "php":    {"ext": ["php"],        "templates": ["app/Pages","templates","resources/views","public"]},
+  "html":   {"ext": ["html","htm"], "templates": ["public","templates"]},
+  "twig":   {"ext": ["twig"]},
+  "blade":  {"ext": ["blade.php"]},
+  "ejs":    {"ext": ["ejs"]},
+  "hbs":    {"ext": ["hbs","handlebars"]},
+  "vue":    {"ext": ["vue"]},
+  "jsx":    {"ext": ["jsx","tsx"]}
+}

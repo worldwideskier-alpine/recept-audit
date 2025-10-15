@@ -1,0 +1,9 @@
+{
+  "title": "Provider Setup (/provider/setup)",
+  "includes": [
+    "spec/features/provider_setup.md",
+    "spec/features/policies.md",
+    "spec/env/policies.md",
+    "spec/features/data_model.md"
+  ]
+}
