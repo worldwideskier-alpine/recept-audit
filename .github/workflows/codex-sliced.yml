@@ -15,13 +15,15 @@ jobs:
     name: "generate (sliced)"
     runs-on: ubuntu-24.04
 
-    # ここは必要に応じて編集してください
     strategy:
       fail-fast: false
       matrix:
-        # タスク定義ファイル（例）。各 JSON は { "title": "...", "includes": ["path1","path2", ...] } を想定
         task:
-          - "spec/tasks/app.core.json"
+          - "spec/tasks/01.endpoints.json"
+          - "spec/tasks/02.provider-setup.json"
+          - "spec/tasks/03.provider-db.json"
+          - "spec/tasks/04.cli.json"
+          - "spec/tasks/05.logs.json"
 
     env:
       OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
@@ -40,6 +42,9 @@ jobs:
       CURL_TIMEOUT: 1800
       CURL_RETRIES: 5
       CURL_RETRY_DELAY: 5
+
+      # keep output reasonable for each slice
+      MAX_TOKENS: "8192"
 
       TITLE: "Codex generation prompt"
 
