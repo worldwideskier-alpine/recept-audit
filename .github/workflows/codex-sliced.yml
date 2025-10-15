@@ -45,7 +45,9 @@ jobs:
       CURL_RETRIES: 2
       CURL_RETRY_DELAY: 15
       TITLE: "Codex generation prompt"
-      MAX_TOKENS: "8192"
+      MAX_TOKENS: "24576"          # ← 対処1: 出力量を増やす
+      REASONING_EFFORT: "low"      # ← 対処2: 推論トークン抑制
+      TEMPERATURE: "0"             # ← 対処2: 生成のばらつき抑制
 
     steps:
       - name: "checkout"
@@ -110,9 +112,13 @@ jobs:
           jq -n \
             --arg model "$OPENAI_MODEL" \
             --rawfile prompt "$PROMPT_FILE" \
-            --argjson max_out "${MAX_TOKENS:-8192}" '
+            --argjson max_out "${MAX_TOKENS:-24576}" \
+            --arg effort "${REASONING_EFFORT:-low}" \
+            --argjson temperature "${TEMPERATURE:-0}" '
           {
             model: $model,
+            temperature: $temperature,
+            reasoning: { effort: $effort },
             text: {
               format: {
                 type: "json_schema",
@@ -192,6 +198,28 @@ jobs:
           fi
 
           echo "::group::response.json (first 80 lines)"; head -n 80 "$RESPONSE_JSON" || true; echo "::endgroup::"
+
+          STATUS="$(jq -r '.status // empty' "$RESPONSE_JSON")"
+          REASON="$(jq -r '.incomplete_details.reason // empty' "$RESPONSE_JSON")"
+
+          # ← 対処3: max_output_tokens で不完全なら再要求（予算増＋推論抑制）
+          if [ "${STATUS}" != "completed" ] && [ "${REASON}" = "max_output_tokens" ]; then
+            echo "::notice title=fallback::incomplete(max_output_tokens). Retrying with higher budget & low reasoning"
+            jq '. + {max_output_tokens: 32768, reasoning:{effort:"low"}, temperature:0}' \
+              "$REQUEST_JSON" > ai/request.bump.json
+            http_code_bump="$(
+              curl --fail-with-body -sS \
+                --connect-timeout 30 \
+                --max-time "${CURL_TIMEOUT}" \
+                --retry 0 \
+                -H "Authorization: Bearer ${OPENAI_API_KEY}" \
+                -H "Content-Type: application/json" \
+                -d @ai/request.bump.json "$ENDPOINT" \
+                -w "%{http_code}" -o "$RESPONSE_JSON" || true
+            )"
+            http_code_bump="$(echo -n "$http_code_bump" | tr -d '\r\n[:space:]')"
+            echo "HTTP_STATUS_BUMP=${http_code_bump}"
+          fi
 
           STATUS="$(jq -r '.status // empty' "$RESPONSE_JSON")"
           if [ "${STATUS}" != "completed" ]; then
