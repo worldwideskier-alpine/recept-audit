@@ -47,7 +47,7 @@ jobs:
       TITLE: "Codex generation prompt"
       MAX_TOKENS: "24576"          # ← 対処1: 出力量を増やす
       REASONING_EFFORT: "low"      # ← 対処2: 推論トークン抑制
-      TEMPERATURE: "0"             # ← 対処2: 生成のばらつき抑制
+      # TEMPERATURE 行は削除（非対応）
 
     steps:
       - name: "checkout"
@@ -113,11 +113,9 @@ jobs:
             --arg model "$OPENAI_MODEL" \
             --rawfile prompt "$PROMPT_FILE" \
             --argjson max_out "${MAX_TOKENS:-24576}" \
-            --arg effort "${REASONING_EFFORT:-low}" \
-            --argjson temperature "${TEMPERATURE:-0}" '
+            --arg effort "${REASONING_EFFORT:-low}" '
           {
             model: $model,
-            temperature: $temperature,
             reasoning: { effort: $effort },
             text: {
               format: {
@@ -205,7 +203,7 @@ jobs:
           # ← 対処3: max_output_tokens で不完全なら再要求（予算増＋推論抑制）
           if [ "${STATUS}" != "completed" ] && [ "${REASON}" = "max_output_tokens" ]; then
             echo "::notice title=fallback::incomplete(max_output_tokens). Retrying with higher budget & low reasoning"
-            jq '. + {max_output_tokens: 32768, reasoning:{effort:"low"}, temperature:0}' \
+            jq '. + {max_output_tokens: 32768, reasoning:{effort:"low"}}' \
               "$REQUEST_JSON" > ai/request.bump.json
             http_code_bump="$(
               curl --fail-with-body -sS \
