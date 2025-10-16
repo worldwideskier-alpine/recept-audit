@@ -279,7 +279,7 @@ jobs:
             // ( [ .output[]? .content[]? | select(.type=="text")        | .text ] | .[0] )
           ' "$RESPONSE_JSON" > ai/out.raw.txt
           jq -e . ai/out.raw.txt > "$OUT_JSON"
-          jq -e 'type=="object" and has("files") and (.files|type=="array") and (.files|length>0)' "$OUT_JSON" >/devnull
+          jq -e 'type=="object" and has("files") and (.files|type=="array") and (.files|length>0)' "$OUT_JSON" >/dev/null
 
           i=0
           while IFS= read -r row; do
