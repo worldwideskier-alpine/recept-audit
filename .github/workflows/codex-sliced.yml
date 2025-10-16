@@ -139,7 +139,7 @@ jobs:
           # 追加: 分割出力ポリシー（モデル側の約束事）
           printf -- "- Output at MOST 20 files per response. If more files remain, set has_more=true and provide next_cursor; do NOT repeat previously emitted files.\n" >> "$PROMPT_FILE"
           printf -- "- When continuing, you will receive a line like 'CONTINUE_FROM_CURSOR: <cursor>'. Resume deterministically (order by path asc) and stop when done with has_more=false.\n" >> "$PROMPT_FILE"
-          printf -- "- Always include next_cursor; set \\\"\\\" when has_more=false.\n\n" >> "$PROMPT_FILE"
+          printf -- "- Always include next_cursor; set \\\"\\\\\\\\\\\\\\\" when has_more=false.\n\n" >> "$PROMPT_FILE"
 
           printf "## SPEC CONTENT\n" >> "$PROMPT_FILE"
 
@@ -172,7 +172,7 @@ jobs:
                 schema: {
                   type: "object",
                   additionalProperties: false,
-                  required: ["files","has_more","next_cursor"],
+                  required: ["files","has_more"],
                   properties: {
                     files: {
                       type: "array",
@@ -188,15 +188,15 @@ jobs:
                         }
                       }
                     },
-                    has_more:    { type: "boolean" },
-                    next_cursor: { type: "string", minLength: 0 }
+                    has_more:   { type: "boolean" },
+                    next_cursor:{ type: "string", minLength: 0 }
                   }
                 }
               }
             },
             input: [
-              { role: "system", content: [ { type: "input_text", text: "You are Codex. Output ONLY a JSON object with the exact shape {\\\\\\\"files\\\\\\\":[{\\\\\\\"path\\\\\\\":string,\\\\\\\"content\\\\\\\":string},...],\\\\\\\"has_more\\\\\\\":boolean,\\\\\\\"next_cursor\\\\\\\":string}. No prose, no code fences. Write full, runnable code. No placeholders. Never write inside ai/. Emit at most 20 files per response; if more remain, set has_more=true and provide next_cursor. Always include next_cursor; set \\\"\\\" when has_more=false. Never repeat previously emitted files." } ] },
-              { role: "user",   content: [ { type: "input_text", text: ("Implement the SPEC as runnable application code and tests. Return files to write as JSON only.\\n\\n" + $prompt) } ] }
+              { role: "system", content: [ { type: "input_text", text: "You are Codex. Output ONLY a JSON object with the exact shape {\\\\\\\"files\\\\\\\":[{\\\\\\\"path\\\\\\\":string,\\\\\\\"content\\\\\\\":string},...],\\\\\\\"has_more\\\\\\\":boolean,\\\\\\\"next_cursor\\\\\\\"?:string}. No prose, no code fences. Write full, runnable code. No placeholders. Never write inside ai/. Emit at most 20 files per response; if more remain, set has_more=true and provide next_cursor. Never repeat previously emitted files." } ] },
+              { role: "user",   content: [ { type: "input_text", text: ("Implement the SPEC as runnable application code and tests. Return files to write as JSON only.\n\n" + $prompt) } ] }
             ],
             max_output_tokens: $max_out
           }' > "$REQUEST_JSON"
@@ -274,9 +274,12 @@ jobs:
           STATUS="$(jq -r '.status // empty' "$RESPONSE_JSON")"
           if [ "${STATUS}" != "completed" ]; then
             REASON="$(jq -r '.incomplete_details.reason // "unknown"' "$RESPONSE_JSON")"
-            echo "::error title=OpenAI response incomplete::status=${STATUS}, reason=${REASON}"
-            echo "::group::response.json (first 200 lines)"; head -n 200 "$RESPONSE_JSON" || true; echo "::endgroup::"
-            exit 22
+            # 対処B: max_output_tokens の場合は分割集約へ続行（2スロット目の症状・成功率低下の緩和）
+            if [ "${REASON}" != "max_output_tokens" ]; then
+              echo "::error title=OpenAI response incomplete::status=${STATUS}, reason=${REASON}"
+              echo "::group::response.json (first 200 lines)"; head -n 200 "$RESPONSE_JSON" || true; echo "::endgroup::"
+              exit 22
+            fi
           fi
 
           # ここから「分割出力」の集約処理
@@ -340,9 +343,12 @@ jobs:
             STATUS_CONT="$(jq -r '.status // empty' "$RESPONSE_JSON")"
             if [ "${STATUS_CONT}" != "completed" ]; then
               REASON_CONT="$(jq -r '.incomplete_details.reason // "unknown"' "$RESPONSE_JSON")"
-              echo "::error title=OpenAI response incomplete (continuation)::status=${STATUS_CONT}, reason=${REASON_CONT}"
-              echo "::group::response.json (first 200 lines)"; head -n 200 "$RESPONSE_JSON" || true; echo "::endgroup::"
-              exit 22
+              # 対処B: 継続呼び出しでも max_output_tokens は許容し、続行
+              if [ "${REASON_CONT}" != "max_output_tokens" ]; then
+                echo "::error title=OpenAI response incomplete (continuation)::status=${STATUS_CONT}, reason=${REASON_CONT}"
+                echo "::group::response.json (first 200 lines)"; head -n 200 "$RESPONSE_JSON" || true; echo "::endgroup::"
+                exit 22
+              fi
             fi
 
             extract_chunk
@@ -379,7 +385,8 @@ jobs:
               // ( [ .output[]? .content[]? | select(.type=="text")        | .text ] | .[0] )
             ' "$RESPONSE_JSON" > ai/out.raw.txt
             jq -e . ai/out.raw.txt > "$OUT_JSON"
-            jq -e 'type=="object" and has("files") and (.files|type=="array") and (.files|length>0)' "$OUT_JSON" >/devnull
+            # 対処C: /dev/null へ正しくリダイレクト（typo 修正）
+            jq -e 'type=="object" and has("files") and (.files|type=="array") and (.files|length>0)' "$OUT_JSON" >/dev/null
           fi
 
           i=0
