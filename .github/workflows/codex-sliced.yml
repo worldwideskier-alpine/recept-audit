@@ -134,8 +134,8 @@ jobs:
           printf "## STRICT RULES\n\n" >> "$PROMPT_FILE"
           printf -- "- Return ONLY JSON (no prose) that matches {\\\"files\\\":[{\\\"path\\\":string,\\\"content\\\":string},...]}.\n" >> "$PROMPT_FILE"
           printf -- "- Implement runnable APPLICATION CODE and TESTS.\n" >> "$PROMPT_FILE"
-          printf -- "- Emit at least one code file under \\\"/src\\" or \\\"/app\\".\n" >> "$PROMPT_FILE"
-          printf -- "- NEVER write under the \\\"ai/\\" directory.\n" >> "$PROMPT_FILE"
+          printf -- "- Emit at least one code file under \\\"/src\\\" or \\\"/app\\\".\n" >> "$PROMPT_FILE"
+          printf -- "- NEVER write under the \\\"ai/\\\" directory.\n" >> "$PROMPT_FILE"
           # 追加: 分割出力ポリシー（モデル側の約束事）
           printf -- "- Output at MOST 20 files per response. If more files remain, set has_more=true and provide next_cursor; do NOT repeat previously emitted files.\n" >> "$PROMPT_FILE"
           printf -- "- When continuing, you will receive a line like 'CONTINUE_FROM_CURSOR: <cursor>'. Resume deterministically (order by path asc) and stop when done with has_more=false.\n" >> "$PROMPT_FILE"
@@ -172,7 +172,7 @@ jobs:
                 schema: {
                   type: "object",
                   additionalProperties: false,
-                  required: ["files","has_more","next_cursor"],
+                  required: ["files","has_more"],
                   properties: {
                     files: {
                       type: "array",
@@ -195,7 +195,7 @@ jobs:
               }
             },
             input: [
-              { role: "system", content: [ { type: "input_text", text: "You are Codex. Output ONLY a JSON object with the exact shape {\\\\\\\"files\\\\\\\":[{\\\\\\\"path\\\\\\\":string,\\\\\\\"content\\\\\\\":string},...],\\\\\\\"has_more\\\\\\\":boolean,\\\\\\\"next_cursor\\\\\\\":string}. No prose, no code fences. Write full, runnable code. No placeholders. Never write inside ai/. Emit at most 20 files per response; if more remain, set has_more=true and provide next_cursor. Never repeat previously emitted files." } ] },
+              { role: "system", content: [ { type: "input_text", text: "You are Codex. Output ONLY a JSON object with the exact shape {\\\\\\\"files\\\\\\\":[{\\\\\\\"path\\\\\\\":string,\\\\\\\"content\\\\\\\":string},...],\\\\\\\"has_more\\\\\\\":boolean,\\\\\\\"next_cursor\\\\\\\"?:string}. No prose, no code fences. Write full, runnable code. No placeholders. Never write inside ai/. Emit at most 20 files per response; if more remain, set has_more=true and provide next_cursor. Never repeat previously emitted files." } ] },
               { role: "user",   content: [ { type: "input_text", text: ("Implement the SPEC as runnable application code and tests. Return files to write as JSON only.\n\n" + $prompt) } ] }
             ],
             max_output_tokens: $max_out
@@ -412,4 +412,3 @@ jobs:
           name: "${{ steps.art.outputs.name }}"
           path: "${{ env.STAGING_DIR }}"
           if-no-files-found: "error"
-
