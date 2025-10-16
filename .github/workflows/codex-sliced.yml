@@ -135,7 +135,11 @@ jobs:
           printf -- "- Return ONLY JSON (no prose) that matches {\\\"files\\\":[{\\\"path\\\":string,\\\"content\\\":string},...]}.\n" >> "$PROMPT_FILE"
           printf -- "- Implement runnable APPLICATION CODE and TESTS.\n" >> "$PROMPT_FILE"
           printf -- "- Emit at least one code file under \\\"/src\\\" or \\\"/app\\\".\n" >> "$PROMPT_FILE"
-          printf -- "- NEVER write under the \\\"ai/\\\" directory.\n\n" >> "$PROMPT_FILE"
+          printf -- "- NEVER write under the \\\"ai/\\\" directory.\n" >> "$PROMPT_FILE"
+          # 追加: 分割出力ポリシー（モデル側の約束事）
+          printf -- "- Output at MOST 20 files per response. If more files remain, set has_more=true and provide next_cursor; do NOT repeat previously emitted files.\n" >> "$PROMPT_FILE"
+          printf -- "- When continuing, you will receive a line like 'CONTINUE_FROM_CURSOR: <cursor>'. Resume deterministically (order by path asc) and stop when done with has_more=false.\n\n" >> "$PROMPT_FILE"
+
           printf "## SPEC CONTENT\n" >> "$PROMPT_FILE"
 
           # includes only
@@ -167,11 +171,12 @@ jobs:
                 schema: {
                   type: "object",
                   additionalProperties: false,
-                  required: ["files"],
+                  required: ["files","has_more"],
                   properties: {
                     files: {
                       type: "array",
-                      minItems: 1,
+                      minItems: 0,
+                      maxItems: 20,
                       items: {
                         type: "object",
                         additionalProperties: false,
@@ -181,22 +186,26 @@ jobs:
                           content: { type: "string" }
                         }
                       }
-                    }
+                    },
+                    has_more:   { type: "boolean" },
+                    next_cursor:{ type: "string" }
                   }
                 }
               }
             },
             input: [
-              { role: "system", content: [ { type: "input_text", text: "You are Codex. Output ONLY a JSON object with the exact shape {\\\\\\\"files\\\\\\\":[{\\\\\\\"path\\\\\\\":string,\\\\\\\"content\\\\\\\":string},...]}. No prose, no code fences. Write full, runnable code. No placeholders. Never write inside ai/." } ] },
+              { role: "system", content: [ { type: "input_text", text: "You are Codex. Output ONLY a JSON object with the exact shape {\\\\\\\"files\\\\\\\":[{\\\\\\\"path\\\\\\\":string,\\\\\\\"content\\\\\\\":string},...],\\\\\\\"has_more\\\\\\\":boolean,\\\\\\\"next_cursor\\\\\\\"?:string}. No prose, no code fences. Write full, runnable code. No placeholders. Never write inside ai/. Emit at most 20 files per response; if more remain, set has_more=true and provide next_cursor. Never repeat previously emitted files." } ] },
               { role: "user",   content: [ { type: "input_text", text: ("Implement the SPEC as runnable application code and tests. Return files to write as JSON only.\\n\\n" + $prompt) } ] }
             ],
             max_output_tokens: $max_out
           }' > "$REQUEST_JSON"
 
-      - name: "call OpenAI Responses API"
+      - name: "call OpenAI Responses API (with output chunking)"
         run: |
           set -euo pipefail
           ENDPOINT="${ENDPOINT:-${OPENAI_BASE_URL:-https://api.openai.com}/v1/responses}"
+
+          # 初回リクエスト実行（既存の堅牢な処理を温存）
           http_code="$(
             curl --fail-with-body -sS \
               --connect-timeout 30 \
@@ -242,7 +251,7 @@ jobs:
           STATUS="$(jq -r '.status // empty' "$RESPONSE_JSON")"
           REASON="$(jq -r '.incomplete_details.reason // empty' "$RESPONSE_JSON")"
 
-          # ← 対処3: max_output_tokens で不完全なら再要求（予算増＋推論抑制）
+          # 既存の max_output_tokens 対応（温存）
           if [ "${STATUS}" != "completed" ] && [ "${REASON}" = "max_output_tokens" ]; then
             echo "::notice title=fallback::incomplete(max_output_tokens). Retrying with higher budget & low reasoning"
             jq '. + {max_output_tokens: 32768, reasoning:{effort:"low"}}' \
@@ -269,17 +278,108 @@ jobs:
             exit 22
           fi
 
+          # ここから「分割出力」の集約処理
+          echo '{"files":[]}' > "$OUT_JSON"
+
+          extract_chunk () {
+            # 出力テキスト(JSON文字列)を取り出して検証
+            jq -e -r '
+              .output_text
+              // ( [ .output[]? .content[]? | select(.type=="output_text") | .text ] | .[0] )
+              // ( [ .output[]? .content[]? | select(.type=="text")        | .text ] | .[0] )
+            ' "$RESPONSE_JSON" > ai/chunk.raw.txt
+            jq -e . ai/chunk.raw.txt > ai/chunk.json
+
+            # files を累積
+            jq -s '{files: (.[0].files + .[1].files)}' "$OUT_JSON" ai/chunk.json > ai/.merge.json
+            mv ai/.merge.json "$OUT_JSON"
+
+            # has_more / next_cursor を返す
+            HAS_MORE="$(jq -r '(.has_more // false) | tostring' ai/chunk.json)"
+            CURSOR="$(jq -r '.next_cursor // empty' ai/chunk.json)"
+            echo "$HAS_MORE" > ai/.has_more
+            echo "$CURSOR"   > ai/.cursor
+          }
+
+          extract_chunk
+
+          # 追加ページを取得（最大30ループの安全弁）
+          LIMIT=30
+          n=0
+          while [ "$(cat ai/.has_more)" = "true" ] && [ $n -lt $LIMIT ]; do
+            n=$((n+1))
+            cursor="$(cat ai/.cursor)"
+
+            # 続き要求（元の request.json に追記するだけで既存仕様を温存）
+            jq --arg cursor "$cursor" '
+              .input += [ { role:"user", content:[{ type:"input_text", text: ("CONTINUE_FROM_CURSOR: " + $cursor) }] } ]
+            ' "$REQUEST_JSON" > ai/request.cont.json
+
+            http_code_cont="$(
+              curl --fail-with-body -sS \
+                --connect-timeout 30 \
+                --max-time "${CURL_TIMEOUT}" \
+                --retry "${CURL_RETRIES}" \
+                --retry-all-errors \
+                --retry-delay "${CURL_RETRY_DELAY}" \
+                -H "Authorization: Bearer ${OPENAI_API_KEY}" \
+                -H "Content-Type: application/json" \
+                -d @ai/request.cont.json "$ENDPOINT" \
+                -w "%{http_code}" -o "$RESPONSE_JSON" || true
+            )"
+            http_code_cont="$(echo -n "$http_code_cont" | tr -d '\r\n[:space:]')"
+            echo "HTTP_STATUS_CONT=${http_code_cont}"
+
+            if [ "${http_code_cont}" -lt 200 ] || [ "${http_code_cont}" -ge 400 ]; then
+              echo "::error title=OpenAI API returned ${http_code_cont} (continuation)::See response.json for details"
+              echo "::group::response.json (first 120 lines)"; head -n 120 "$RESPONSE_JSON" || true; echo "::endgroup::"
+              exit 22
+            fi
+
+            STATUS_CONT="$(jq -r '.status // empty' "$RESPONSE_JSON")"
+            if [ "${STATUS_CONT}" != "completed" ]; then
+              REASON_CONT="$(jq -r '.incomplete_details.reason // "unknown"' "$RESPONSE_JSON")"
+              echo "::error title=OpenAI response incomplete (continuation)::status=${STATUS_CONT}, reason=${REASON_CONT}"
+              echo "::group::response.json (first 200 lines)"; head -n 200 "$RESPONSE_JSON" || true; echo "::endgroup::"
+              exit 22
+            fi
+
+            extract_chunk
+          done
+
+          # 重複 path は最後のものを採用
+          jq '
+            .files
+            | group_by(.path)
+            | map(.[-1])
+            | {files: .}
+          ' "$OUT_JSON" > ai/.dedup.json && mv ai/.dedup.json "$OUT_JSON"
+
+          # 最終チェック
+          jq -e 'type=="object" and has("files") and (.files|type=="array")' "$OUT_JSON" >/dev/null
+          if [ "$(jq '.files | length' "$OUT_JSON")" -eq 0 ]; then
+            echo "::error title=no files emitted after pagination::Model returned zero writable files"
+            exit 1
+          fi
+
       - name: "extract model JSON and write files"
         run: |
           set -euo pipefail
           mkdir -p "$STAGING_DIR"
-          jq -e -r '
-            .output_text
-            // ( [ .output[]? .content[]? | select(.type=="output_text") | .text ] | .[0] )
-            // ( [ .output[]? .content[]? | select(.type=="text")        | .text ] | .[0] )
-          ' "$RESPONSE_JSON" > ai/out.raw.txt
-          jq -e . ai/out.raw.txt > "$OUT_JSON"
-          jq -e 'type=="object" and has("files") and (.files|type=="array") and (.files|length>0)' "$OUT_JSON" >/dev/null
+
+          # すでに集約済み OUT_JSON があればそれを優先（分割出力対応）
+          if jq -e 'type=="object" and has("files") and (.files|type=="array") and (.files|length>=0)' "$OUT_JSON" >/dev/null 2>&1; then
+            echo "Using aggregated OUT_JSON (paginated)."
+          else
+            # 従来の単発パース（後方互換）
+            jq -e -r '
+              .output_text
+              // ( [ .output[]? .content[]? | select(.type=="output_text") | .text ] | .[0] )
+              // ( [ .output[]? .content[]? | select(.type=="text")        | .text ] | .[0] )
+            ' "$RESPONSE_JSON" > ai/out.raw.txt
+            jq -e . ai/out.raw.txt > "$OUT_JSON"
+            jq -e 'type=="object" and has("files") and (.files|type=="array") and (.files|length>0)' "$OUT_JSON" >/dev/null
+          fi
 
           i=0
           while IFS= read -r row; do
@@ -294,7 +394,7 @@ jobs:
             echo "wrote $path"; i=$((i+1))
           done < <(jq -c '.files[]' "$OUT_JSON")
           if [ "$i" -eq 0 ]; then
-            echo "::error title=no files emitted::Model returned zero writable files"
+            echo "::error title=no files written::Model returned zero writable files"
             exit 1
           fi
 
