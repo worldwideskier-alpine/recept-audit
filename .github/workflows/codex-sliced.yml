@@ -139,7 +139,7 @@ jobs:
           # 追加: 分割出力ポリシー（モデル側の約束事）
           printf -- "- Output at MOST 20 files per response. If more files remain, set has_more=true and provide next_cursor; do NOT repeat previously emitted files.\n" >> "$PROMPT_FILE"
           printf -- "- When continuing, you will receive a line like 'CONTINUE_FROM_CURSOR: <cursor>'. Resume deterministically (order by path asc) and stop when done with has_more=false.\n" >> "$PROMPT_FILE"
-          printf -- "- Always include next_cursor; set \\\"\\\\\\\\\\\\\\\" when has_more=false.\n\n" >> "$PROMPT_FILE"
+          printf -- "- Always include next_cursor; set \\\"\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\" when has_more=false.\n\n" >> "$PROMPT_FILE"
 
           printf "## SPEC CONTENT\n" >> "$PROMPT_FILE"
 
@@ -172,7 +172,7 @@ jobs:
                 schema: {
                   type: "object",
                   additionalProperties: false,
-                  required: ["files","has_more"],
+                  required: ["files","has_more","next_cursor"],
                   properties: {
                     files: {
                       type: "array",
