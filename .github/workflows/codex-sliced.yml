@@ -1,4 +1,3 @@
-```yaml
 name: "Codex (sliced)"
 on:
   workflow_dispatch:
@@ -413,4 +412,4 @@ jobs:
           name: "${{ steps.art.outputs.name }}"
           path: "${{ env.STAGING_DIR }}"
           if-no-files-found: "error"
-```
+
